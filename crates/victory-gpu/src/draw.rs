@@ -4853,17 +4853,24 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport() } else { None };
-            if let Some(viewport) = frontend {
-                viewports(list, &[viewport]);
+            let frontend = if count == 3 && instances == 1 { self.frontend_place() } else { None };
+            if let Some((viewport, scissor)) = &frontend {
+                viewports(list, &[*viewport]);
+                if let Some(rect) = scissor {
+                    scissors(list, &[*rect]);
+                }
             }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            if frontend.is_some() {
+            if let Some((_, scissor)) = &frontend {
                 viewports(list, &self.viewports);
+                // interface_band only answers with a scissor when the title set one
+                if scissor.is_some() {
+                    scissors(list, &self.scissors);
+                }
             }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4908,8 +4915,8 @@ impl State {
     /// it patches the image for it): the frontend's last triangle is drawn
     /// in output pixels, but some screens project it against the legacy
     /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
-    /// the projection lands on the 2560x1440 target. The scissor and target
-    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// the projection lands on the output-sized target. The scissor and target
+    /// stay output-sized. From DexNom's fork (`State::native_frontend_viewport`,
     /// GPL-3.0-or-later).
     fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4921,7 +4928,10 @@ impl State {
         let [viewport] = self.viewports.as_slice() else {
             return None;
         };
-        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        // the output size, not a literal: a wide output (VICTORY_DISPLAY_WIDE)
+        // makes the title's viewport that wide too
+        let (out_w, out_h) = crate::dxgi::display_size();
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, out_w as f32, out_h as f32) {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
@@ -4954,6 +4964,118 @@ impl State {
         static FIRST: std::sync::Once = std::sync::Once::new();
         FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
         Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
+    }
+
+    /// With a 1440p-class output (`VICTORY_NATIVE_1440P=1`) wider than the
+    /// interface's ratio (`VICTORY_UI_LETTERBOX`, parsed once by
+    /// `compose::ui_band`): where the title's interface composite (one
+    /// triangle into the presented texture, `streamline::INTERFACE_COMPOSITE`)
+    /// goes. Answers the band's left edge, its width and the scissor for this
+    /// draw (the title's first rect cut to the band), or `None` for any other
+    /// draw and whenever the switches are off. Called for one-triangle draws.
+    fn interface_band(&self) -> Option<(u32, u32, RECT)> {
+        static BAND: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+        let (left, band) = (*BAND.get_or_init(|| {
+            if std::env::var("VICTORY_NATIVE_1440P").as_deref() != Ok("1") {
+                return None;
+            }
+            let (w, h) = crate::dxgi::display_size();
+            crate::compose::ui_band(w, h)
+        }))?;
+        if self.depth != 0 {
+            return None;
+        }
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        if !crate::streamline::INTERFACE_COMPOSITE
+            .iter()
+            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == *hash))
+        {
+            return None;
+        }
+        let (w, h) = crate::dxgi::display_size();
+        // the composite is ours; if its viewport is not the whole output the
+        // interface stays stretched, and the log says why once
+        let placed = match (self.viewports.as_slice(), self.scissors.first()) {
+            ([viewport], Some(title))
+                if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height)
+                    == (0.0, 0.0, w as f32, h as f32) =>
+            {
+                Some(title)
+            }
+            _ => None,
+        };
+        let Some(title) = placed else {
+            static WHY: std::sync::Once = std::sync::Once::new();
+            WHY.call_once(|| {
+                let first = self.viewports.first();
+                tracing::warn!(
+                    viewports = self.viewports.len(),
+                    scissors = self.scissors.len(),
+                    x = first.map(|v| v.TopLeftX),
+                    y = first.map(|v| v.TopLeftY),
+                    width = first.map(|v| v.Width),
+                    height = first.map(|v| v.Height),
+                    output = ?(w, h),
+                    "the interface composite is not placed in the middle: its viewport is not the whole output, or the title set no scissor"
+                )
+            });
+            return None;
+        };
+        // the title's own rect, cut to the band; an empty result draws nothing,
+        // as the title's scissor would have had it
+        let scissor = RECT {
+            left: title.left.max(left as i32),
+            top: title.top.max(0),
+            right: title.right.min((left + band) as i32),
+            bottom: title.bottom.min(h as i32),
+        };
+        // a title rect wholly outside the band would come out inverted, which
+        // d3d12 leaves undefined; collapse it to empty instead
+        let scissor = RECT { right: scissor.right.max(scissor.left), bottom: scissor.bottom.max(scissor.top), ..scissor };
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                left,
+                band,
+                output = ?(w, h),
+                title_scissor = ?[title.left, title.top, title.right, title.bottom],
+                "the interface composite is drawn in the middle of the wide picture"
+            )
+        });
+        Some((left, band, scissor))
+    }
+
+    /// The viewport (and, in the middle band, the scissor) for the title's
+    /// one-triangle frontend draw: the legacy-canvas viewport of
+    /// `native_frontend_viewport`, narrowed into the band of `interface_band`
+    /// when that applies. The triangle spans its whole viewport in clip space
+    /// and carries its own uv, so shrinking the viewport to the band puts the
+    /// whole 16:9 interface in the band, whichever canvas (the legacy
+    /// 3840x2160 one or the output) the projection used; for the canvas
+    /// viewport the factor band / output width keeps the mapping, scaled into
+    /// the band. The scissor keeps the oversized triangle out of the bars,
+    /// which keep the world.
+    fn frontend_place(&self) -> Option<(D3D12_VIEWPORT, Option<RECT>)> {
+        let hacked = self.native_frontend_viewport();
+        let Some((left, band, scissor)) = self.interface_band() else {
+            return hacked.map(|v| (v, None));
+        };
+        let (w, _) = crate::dxgi::display_size();
+        // interface_band saw exactly one viewport, so indexing is safe
+        let (base, width) = match hacked {
+            // the legacy projection clips everything past x = 3840, so on a
+            // wider output the canvas viewport would show only the left part
+            // of the interface; the plain viewport is used and the band
+            // spans the triangle's whole clip range
+            Some(_) if w > 3840 => {
+                static WIDE: std::sync::Once = std::sync::Once::new();
+                WIDE.call_once(|| tracing::info!(w, "the legacy 4K projection on a wider output: drawn without the canvas viewport"));
+                (self.viewports[0], band as f32)
+            }
+            Some(canvas) => (canvas, canvas.Width * band as f32 / w as f32),
+            None => (self.viewports[0], band as f32),
+        };
+        Some((D3D12_VIEWPORT { TopLeftX: left as f32, Width: width, ..base }, Some(scissor)))
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first

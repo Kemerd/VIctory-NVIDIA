@@ -217,6 +217,13 @@ What is known to be wrong:
   about a second passes after a change before they come.
 - **The first run of every new build stutters** while the driver compiles
   pipelines (foxhound's README, *Warming up*, says how to make them ahead).
+- **32:9 (-Res wide, VICTORY_DISPLAY_WIDE) has not been run on the title.** It
+  is written (the image is patched for the wide output, the interface composite
+  is placed in the middle, DLSS and frame generation take the wide sizes from
+  the title) and compiled, not seen. What a first run has to show is listed in
+  docs/dlss.md's 32:9 notes. If the world looks stretched, the title kept a
+  16:9 camera: try VICTORY_ASPECT=5120x1440 with it (it widens projections in
+  our copy only, so the title's own culling stays narrow).
 - "SAVE AND RESTART NOW" can leave the old game's process behind without a
   window; it goes when the PC restarts.
 - What foxhound lists as wrong (the heat-haze pass left out, hitches in
@@ -259,9 +266,13 @@ fork has always had; its options:
 | `-Fps 60` | a frame rate cap (30 is the title's own) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
+| `-Res wide` | Series X at 5120x1440 (32:9): the title's own camera, culling and motion vectors made for the wide picture, the interface kept 16:9 in the middle; another wide size: `-Res 1440 -More @{VICTORY_DISPLAY_WIDE='3440x1440'}` |
 | `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
+
+The first wide start patches and writes its own copy of the image
+(`images\native-1440p-5120x1440-...`), like the other pictures.
 
 What the F1 menu saved (`victory-settings.txt`) goes over these at every start;
 delete that file to go back to them. Full screen: start the game, then run

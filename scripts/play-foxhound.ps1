@@ -6,6 +6,7 @@
 #   .\scripts\play-foxhound.ps1 -Exe ... -Dlss balanced -FrameGen
 #   .\scripts\play-foxhound.ps1 -Exe ... -SeriesS             Series S profile (1280x720 inside, faster, softer)
 #   .\scripts\play-foxhound.ps1 -Exe ... -Build diag          diagnostics build (slower; captures, timelines)
+#   .\scripts\play-foxhound.ps1 -Exe ... -Res wide            5120x1440 (32:9): the scene and the title's camera made for it, the interface kept 16:9 in the middle
 #   .\scripts\play-foxhound.ps1 -Exe ... -More @{VICTORY_AMBIENT_SPECULAR='0'}   add or override switches
 #
 # In the game, F1 opens a settings menu (arrow keys pick and change, Enter does it). What it saves goes to
@@ -19,8 +20,10 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'release',
     [switch]$SeriesS,
     # 1440: output and scene 2560x1440 (Series X, the image is patched); 1080to1440: scene 1920x1080 upscaled by
-    # the title; 4k: the stock Series X output (3840x2160).
-    [ValidateSet('1440', '1080to1440', '4k')][string]$Res = '1440',
+    # the title; 4k: the stock Series X output (3840x2160); wide: output and scene 5120x1440 (VICTORY_DISPLAY_WIDE;
+    # Series X only, the image is patched, never run on the title before this was added); another wide size:
+    # -Res 1440 -More @{VICTORY_DISPLAY_WIDE='3440x1440'}
+    [ValidateSet('1440', '1080to1440', '4k', 'wide')][string]$Res = '1440',
     # DLSS Super Resolution in place of the title's upscaling; needs NVIDIA Streamline (README).
     [ValidateSet('off', 'dlaa', 'quality', 'balanced', 'performance')][string]$Dlss = 'quality',
     # DLSS Frame Generation (RTX 40 or later, hardware-accelerated GPU scheduling on); needs DLSS.
@@ -48,7 +51,7 @@ if (Test-Path -LiteralPath $menuFile) {
 }
 $fpsWanted = $Fps
 if ($menu.Contains('VICTORY_MENU_CONSOLE')) { $SeriesS = $menu['VICTORY_MENU_CONSOLE'] -eq 'series-s' }
-if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k') { $Res = $menu['VICTORY_MENU_RES'] }
+if ($menu['VICTORY_MENU_RES'] -in '1440', '1080to1440', '4k', 'wide') { $Res = $menu['VICTORY_MENU_RES'] }
 if ($menu['VICTORY_MENU_DLSS'] -in 'off', 'dlaa', 'quality', 'balanced', 'performance') { $Dlss = $menu['VICTORY_MENU_DLSS'] }
 $timesWanted = $FrameGenX
 if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
@@ -87,6 +90,8 @@ $settings = @{
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
+    # the runner then also asks for the interface to stay 16:9 in the middle (VICTORY_UI_LETTERBOX)
+    elseif ($Res -eq 'wide') { $settings.VICTORY_NATIVE_1440P = '1'; $settings.VICTORY_DISPLAY_WIDE = '5120x1440' }
 }
 if ($Dlss -ne 'off') {
     # NVIDIA's files: where VICTORY_STREAMLINE_DIR says, else where Get-NVIDIA-DLSS.cmd puts them.

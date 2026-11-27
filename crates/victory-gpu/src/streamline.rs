@@ -1688,8 +1688,9 @@ pub fn upscaler_destroyed(context: usize) {
 /// in every frame listing of 2026-11-26 (stock 3840x2160 output: once a
 /// frame, after the scene's composite into the same texture) and bound from
 /// frame 3 on in the 1440p runs with DLSS; `draw::State::native_frontend_viewport`
-/// (DexNom's) names the same draw.
-const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
+/// (DexNom's) names the same draw. draw.rs places the same draw in the middle
+/// of a wide picture (`State::interface_band`), so both read the one pair.
+pub(crate) const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
 
 /// Whether draws are looked at for the colour without the interface: frame
 /// generation runs on our swap chain and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
