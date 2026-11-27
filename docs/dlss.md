@@ -1,6 +1,6 @@
 # DLSS and DLSS Frame Generation (NVIDIA Streamline)
 
-Two switches, both off by default:
+Three switches, all off by default:
 
 - `VICTORY_DLSS=1`: DLSS Super Resolution does the title's FidelityFX upscaling
   (its `ffxDispatch`), from the same colour, depth, motion vectors, exposure and
@@ -8,6 +8,9 @@ Two switches, both off by default:
   list.
 - `VICTORY_FRAMEGEN=1`: DLSS Frame Generation (2x) on our present, from the depth
   and motion vectors of the last upscaling submitted before the present.
+- `VICTORY_DLSS_RR=1` (with `VICTORY_DLSS=1`): DLSS Ray Reconstruction's plugin
+  is loaded, checked and reported; it does not draw yet (see "Ray
+  Reconstruction").
 
 Nothing NVIDIA ships is in this repository. The library is loaded at run time
 from a folder you name; if anything is missing (the folder, a signature, a
@@ -25,7 +28,10 @@ own upscaling and our plain present run as before.
    - `sl.common.dll`, `sl.dlss.dll`, `sl.dlss_g.dll`, `sl.reflex.dll`,
      `sl.pcl.dll` (Streamline's plugins; it checks their NVIDIA signatures),
    - `nvngx_dlss.dll` (DLSS Super Resolution, 310.x), `nvngx_dlssg.dll` (DLSS
-     Frame Generation).
+     Frame Generation),
+   - `sl.dlss_d.dll` and `nvngx_dlssd.dll` (Ray Reconstruction, only with
+     `VICTORY_DLSS_RR=1`; `scripts\get-nvidia-sdks.ps1 -RayReconstruction`
+     fetches them, 46 MB).
    A newer `nvngx_dlss.dll` (the DLSS SDK, <https://github.com/NVIDIA/DLSS>,
    `lib\Windows_x86_64\rel`) can replace the one in that folder.
 2. `VICTORY_STREAMLINE_DIR=<that bin\x64 folder>`; the default is
@@ -56,6 +62,8 @@ later), hardware-accelerated GPU scheduling on (frame generation needs it).
 |---|---|---|---|
 | `VICTORY_DLSS` | `1` | off | DLSS in place of the title's FidelityFX upscaling |
 | `VICTORY_FRAMEGEN` | `1` | off | DLSS Frame Generation on our present; needs `VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1` (the line of submissions) |
+| `VICTORY_DLSS_RR` | `1` | off | DLSS Ray Reconstruction's plugin is loaded, checked and reported, and does not draw; needs `VICTORY_DLSS=1` (without it a warning and no change); F1 item "RAY RECONSTRUCTION (LOADS ONLY)", applied at the next start |
+| `VICTORY_RR_TARGETS` | `1`, or a comma list of upscaling numbers | off | diagnostics: logs the textures the title's passes write around the upscaling, lines start `RR targets:`; `1` samples the 1st, 300th and 3000th upscaling (so `1` cannot mean only the first; `1,2` can), a list such as `1200,5000` those; needs `VICTORY_DLSS=1`, not the Ray Reconstruction plugin; no F1 item (it costs a lock and a hash per draw and dispatch while on) |
 | `VICTORY_DLSS_MODE` | `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | `quality` (`dlaa` with frame generation alone) | the scene's size: 1, 2/3, 0.58, 1/2, 1/3 of the output; the DLSS mode follows the sizes the title then passes |
 | `VICTORY_DLSS_PRESET` | `default`, `j`, `k`, `l`, `m` (`e`, `f` deprecated) | `default` | the DLSS model, for every mode |
 | `VICTORY_STREAMLINE_DIR` | a folder | see above | where `sl.interposer.dll` and the rest are |
@@ -268,6 +276,75 @@ Series S sizes only (1280x720 or 1920x1080 in, 1920x1080 out): at a 1440p
 output its upscaler is not made (an error in the log says so) and the title
 fails at its first upscaling. Use both switches there.
 
+## Ray Reconstruction
+
+`VICTORY_DLSS_RR=1` (with `VICTORY_DLSS=1`; without it a warning and the
+switch stays off) loads and reports DLSS Ray Reconstruction. It does not draw:
+DLSS Super Resolution takes every upscaling exactly as without the switch.
+
+**What runs.** Streamline loads the Ray Reconstruction plugin (feature 1001,
+`sl.dlss_d.dll` and `nvngx_dlssd.dll`, from `VICTORY_STREAMLINE_DIR` beside
+DLSS) and is asked whether this GPU supports it. The plugin's own list of
+required buffer tags is read (`slGetFeatureRequirements`) and logged, so the
+required set is what the plugin says and not what we guess. Its version is
+logged. At the first upscaling, and again whenever the DLSS mode or the sizes
+change, Ray Reconstruction's optimal render size and its smallest and largest
+for the title's output are logged beside Super Resolution's. Once, one line says
+that it is loaded and answering and not drawing.
+
+**Why it does not draw.** Per its programming guide in the SDK
+(`ProgrammingGuideDLSS_RR.md`), Ray Reconstruction takes, besides the colour,
+depth, motion vectors and output Super Resolution has:
+
+- the diffuse albedo (linear, three channels),
+- the specular albedo (three channels; the guide gives `EnvBRDFApprox2` to make
+  it from the material),
+- the normals (F16 or F32, view or world space) with the roughness, in the
+  normals' alpha channel (`normalRoughnessMode` packed) or in a texture of its
+  own,
+- optionally the specular hit distance together with the world-to-view and
+  view-to-world matrices, or specular motion vectors,
+- and the colour must be HDR.
+
+The FidelityFX dispatch carries the colour, depth, motion vectors and output
+only (exposure, reactive and transparency masks are null in every run). The
+rest would have to come from the title's own passes.
+
+**What the tree knows and does not.** The title seems to have a deferred
+G-buffer: the character shaders are named `PS_Deferred...` (`draw.rs`) and its
+lighting reads the depth-stencil's stencil plane (`capture.rs`). Which target is
+which, in which encoding (how normals and roughness are packed, whether the
+albedo is sRGB or linear, view or world space) and where the specular colour
+lives is not known. The title passes no camera matrices (see "How it works"),
+so the world-to-view matrix in Ray Reconstruction's options would be left
+invalid, not made up. A guide that is guessed would make a picture that looks
+plausible and is wrong, so none is given.
+
+**Whether it can be the denoiser is open.** Ray Reconstruction replaces a
+denoiser that works on a noisy ray-traced image. The title's rays feed screen
+probes (`CS_ScreenProbes_TemporalResolve`), an irradiance cache, shadows and
+half-size reflections (`CS_ResolveScreenSpace`, `CS_RayMiss`), and all of it is
+resolved inside the title before the colour reaches FidelityFX
+(`docs/fork-ray-tracing.md`). If no pass writes a render-sized noisy image,
+Ray Reconstruction could only be a guided upscaler fed an already resolved
+colour, and whether the title's resolve passes could be left out is not known.
+`VICTORY_RR_TARGETS` exists to answer it from a run.
+
+**What a later change needs once a run has named the targets.**
+
+- A registry the draw path fills for the guides.
+- Compute passes of ours (the `ambient.rs` pattern, on the card) that decode the
+  title's G-buffer into Ray Reconstruction's formats.
+- `slDLSSDSetOptions` and `slEvaluateFeature` for `FEATURE_DLSS_RR` in place of
+  Super Resolution's, for the same viewport and frame token (Super Resolution's
+  options are still set, per the guide).
+- `slFreeResources(FEATURE_DLSS_RR, viewport)` when the title's upscaler is
+  destroyed.
+- Ray Reconstruction has no dynamic resolution: a change of render size
+  initialises it again.
+
+None of this is written. Each item needs a fact a run has to show first.
+
 ## Log lines
 
 At start: `Streamline: DLSS Super Resolution is supported on this GPU`
@@ -283,6 +360,17 @@ size, formats; again when they change). Every second: `DLSS per frame: …
 upscalings by DLSS, … failed, … left to the title's FidelityFX` and `DLSS Frame
 Generation: … presents with it on, … off, … frames shown by it (status …)`.
 `FidelityFX: the title's own upscaling runs: <why>` names each reason once.
+
+Ray Reconstruction (`VICTORY_DLSS_RR`): at start `Streamline: DLSS Ray
+Reconstruction is supported on this GPU`, or `Streamline: DLSS Ray
+Reconstruction says it needs these buffer tags` (the plugin's own required
+list); at the device `Streamline: DLSS Ray Reconstruction loaded streamline=…
+ngx=…`; at the first upscaling and at each change of mode or sizes `DLSS Ray
+Reconstruction: optimal render size for this output` (beside Super Resolution's
+line); once, the line that it is loaded and answering and not drawing.
+`VICTORY_RR_TARGETS`: lines that start `RR targets:` at the chosen upscalings, a
+header with the four known textures, one line per pass, and a summary of the
+render-size textures.
 
 Frame generation: `DLSS Frame Generation switched frame=… on=… code=…` at each
 change; `DLSS Frame Generation: first frame with depth and motion vectors
@@ -477,8 +565,40 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
    0x887a0005. With `VICTORY_STREAMLINE_LOG=<folder>` Streamline's own log has
    the plugin's last words.
 
+## The first run with VICTORY_RR_TARGETS
+
+Not run yet. Through the launcher, in the world: `-More @{ VICTORY_DLSS = '1';
+VICTORY_DLSS_RR = '1'; VICTORY_RR_TARGETS = '1' }` (with the usual DLSS
+switches), and once more with `VICTORY_RT_NATIVE = '1'` added. Read the
+`RR targets:` lines:
+
+1. The header: the four textures the upscaling is given (colour, depth, motion
+   vectors, output), with address, size and format.
+2. Passes marked `[binds the upscaling's depth]` (a depth view bound, not a
+   proven write, so forward and sky passes show too): the render targets bound
+   together with that depth are the G-buffer set; four or more is the filter. Note their formats and sizes.
+3. Which pass writes `[colour]`, and which passes sit between the G-buffer and
+   it, by program name.
+4. Whether any trace, resolve or denoise-like pass (by name) writes a texture of
+   the render size, or only smaller ones (probe grids, half size). That says
+   whether Ray Reconstruction could replace a denoiser here.
+5. The summary line of render-size textures.
+
+Also read `Streamline: DLSS Ray Reconstruction says it needs these buffer tags`
+(the plugin's own required list) and the line for Ray Reconstruction's optimal
+size at the output size in use: a 32:9 output would show whether it takes that
+shape.
+
+Then in a diagnostics build (`--profile diag --features diagnostics`),
+`VICTORY_CAPTURE=<folder> VICTORY_CAPTURE_FRAMES=<n> VICTORY_DUMP_TARGETS=1`
+saves the same textures as pictures named by the same addresses, to read the
+encodings. The pictures stay outside the repository (`docs/asset-policy.md`).
+
 ## Limits
 
+- Ray Reconstruction (`VICTORY_DLSS_RR`) loads and reports only. It takes no
+  upscale, adds no video memory beyond the plugin's own load, and is set at the
+  start only (the F1 item applies at the next start).
 - Motion vectors: blocks of wrong motion inside character silhouettes (likely
   the heat-haze pass `731a39171b568298`) show as smearing with DLSS and as
   warped shapes in generated frames.
