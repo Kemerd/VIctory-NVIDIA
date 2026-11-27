@@ -3448,6 +3448,28 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    /// P0 of an attribute the program also interpolates (other channels of
+    /// one row): the element is constant, the interpolation weighs its vertices.
+    #[test]
+    fn p0_beside_an_interpolation_of_the_same_row() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC812_0102, // v_interp_mov_f32 v4, p0, attr0.y
+            v_add_f32(2, 2, 4),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let (features, inputs) = parts(&shader);
+        assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
     /// P10 of an attribute the program interpolates is P1 - P0.
     #[test]
     fn p10_of_an_interpolated_attribute() {
