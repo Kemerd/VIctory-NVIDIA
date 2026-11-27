@@ -661,6 +661,20 @@ impl Queue {
         Some(p)
     }
 
+    /// For a thread of [`slow_extras`]: the first slow pipeline still
+    /// unclaimed, only while nothing is requested and no pass over the
+    /// screen waits. It does not count in `slow_now` and is not marked
+    /// `was_slow`: the workers' own limit and places stay as they are.
+    fn take_slow(&mut self) -> Option<Arc<Pending>> {
+        if !self.requested.is_empty() || !self.screen.is_empty() {
+            return None;
+        }
+        // (One promoted since it was queued is skipped, as in `pop`.)
+        let p = std::iter::from_fn(|| self.slow.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)?;
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        Some(p)
+    }
+
     /// When the oldest requested pipeline no worker has taken was queued
     /// ([`FRONT_MS`]).
     fn front_ms(&self) -> u64 {
@@ -703,10 +717,69 @@ fn next(screens_only: bool) -> Arc<Pending> {
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
             FRONT_MS.store(queue.front_ms(), Ordering::Relaxed);
+            // Nothing asked for is left: the extra threads may take slow
+            // ones now ([`slow_extras`]).
+            if EXTRAS.load(Ordering::Relaxed) > 0
+                && queue.requested.is_empty()
+                && queue.screen.is_empty()
+                && !queue.slow.is_empty()
+            {
+                AVAILABLE.notify_all();
+            }
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// For a thread of [`slow_extras`]: the next slow pipeline, waited for.
+fn next_slow() -> Arc<Pending> {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(p) = queue.take_slow() {
+            return p;
+        }
+        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// The threads of [`slow_extras`] that were started.
+static EXTRAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// More threads that make early pipelines known to take long, only while
+/// nothing is requested (`VICTORY_PIPELINE_SLOW_WORKERS=<n>`, 0 by
+/// default): at most `processors - workers - 4`, none where the PC's memory
+/// is short or [`slow_limit`] puts nothing on the slow list. They take
+/// nothing a draw asks for and do not count in the workers' slow limit, so
+/// the workers keep their places for requested work.
+///
+/// It helps when the slow list is known but its pipelines are not cheap in
+/// this run yet: after the shaders were translated again, a driver change,
+/// or a run that ended before they were made. Runs that showed the queue
+/// at the world's first frame (2026-11-26): -221426, -222450, -223904 and
+/// -224808, 485 and 526 queued in the last two, where four workers took
+/// slow ones while twelve stood idle through menu and loading; runs with
+/// settled caches showed none (-220729, -225818, -230328, -231606), and
+/// there the extra threads stay idle. Expected from the measured 3.5-4 a
+/// second with sixteen threads: the queue at the world's first frame falls
+/// to between 0 and about 150; not verified in a run. The risk to measure
+/// in a pair of runs on an unsettled cache: in the world up to `n` slow
+/// compiles run beside the workers at the same priority; if requested
+/// pipelines come later with the switch ("dropped N without a host
+/// pipeline", the time to "host pipelines all made"), the extras need a
+/// further gate before this is recommended.
+fn slow_extras(workers: usize, processors: usize) -> usize {
+    if crate::residency::limited_host_ram() || slow_limit() == usize::MAX {
+        return 0;
+    }
+    let asked = std::env::var("VICTORY_PIPELINE_SLOW_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+    extras_for(asked, workers, processors)
+}
+
+/// `asked` extra threads, capped at the processors left after `workers`
+/// and four more.
+fn extras_for(asked: usize, workers: usize, processors: usize) -> usize {
+    asked.min(processors.saturating_sub(workers + 4))
 }
 
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
@@ -773,6 +846,42 @@ fn workers() -> bool {
             } else {
                 running = true;
             }
+        }
+        // Read once, here ([`slow_extras`]); none with it unset.
+        let extras = if running { slow_extras(workers, std::thread::available_parallelism().map_or(2, |n| n.get())) } else { 0 };
+        for i in 0..extras {
+            let spawned = std::thread::Builder::new().name(format!("victory-pipelines-slow-{i}")).spawn(|| {
+                let lowest = std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                // SAFETY: a plain call on our own thread.
+                unsafe {
+                    use windows::Win32::System::Threading::*;
+                    let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                    let _ = SetThreadPriority(GetCurrentThread(), priority);
+                }
+                loop {
+                    let p = next_slow();
+                    p.make();
+                    // As the workers do: "(N being made)" comes back to zero
+                    // and the cache is saved.
+                    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        drained();
+                    } else {
+                        super::library::save(false);
+                    }
+                }
+            });
+            match spawned {
+                Ok(_) => {
+                    EXTRAS.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => tracing::warn!(error = %e, "no extra pipeline thread for slow ones"),
+            }
+        }
+        if extras > 0 {
+            tracing::info!(
+                extras = EXTRAS.load(Ordering::Relaxed),
+                "threads that make slow pipelines while nothing is requested (VICTORY_PIPELINE_SLOW_WORKERS)"
+            );
         }
         running
     })
@@ -904,6 +1013,47 @@ mod tests {
         queue.slow_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &longer));
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// An extra thread takes a slow pipeline only while nothing is requested
+    /// and no pass over the screen waits, skips one promoted since, and
+    /// leaves the workers' slow count alone; the extras are capped at the
+    /// processors left.
+    #[test]
+    fn extra_threads_take_slow_ones_only_when_nothing_is_asked_for() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (long, promoted, longer, asked) = (new(), new(), new(), new());
+        let mut queue = Queue::new();
+        for p in [&long, &promoted, &longer] {
+            assert_eq!(queue.push_as(p, EARLY, true), Some(true));
+        }
+        assert_eq!(queue.push_as(&asked, REQUESTED, false), Some(true));
+        assert!(queue.take_slow().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false, 0).unwrap(), &asked));
+        let screen = {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = true;
+            Arc::new(p)
+        };
+        if screens_first() {
+            assert_eq!(queue.push(&screen, REQUESTED), Some(true));
+            assert!(queue.take_slow().is_none());
+            assert!(Arc::ptr_eq(&queue.pop(true, 0).unwrap(), &screen));
+        }
+        assert!(Arc::ptr_eq(&queue.take_slow().unwrap(), &long));
+        assert_eq!(long.queue_state.load(Ordering::Relaxed), MAKING);
+        assert!(!long.was_slow.load(Ordering::Relaxed));
+        assert_eq!(queue.slow_now, 0);
+        // A draw asked for this one meanwhile, and a worker has it.
+        assert_eq!(queue.push_as(&promoted, REQUESTED, true), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(false, 0).unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.take_slow().unwrap(), &longer));
+        assert!(queue.take_slow().is_none());
+        assert_eq!(queue.slow_now, 0);
+        assert_eq!(extras_for(12, 16, 32), 12);
+        assert_eq!(extras_for(20, 16, 32), 12);
+        assert_eq!(extras_for(4, 16, 8), 0);
+        assert_eq!(extras_for(0, 2, 32), 0);
     }
 
     /// A wait is given up before it begins only when it cannot end within
