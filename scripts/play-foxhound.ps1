@@ -101,6 +101,9 @@ if ($Fast) {
     $settings.VICTORY_MEMORY_DIRTY = '1'; $settings.VICTORY_MEMORY_BUFFER_FAULTS = '1'
     # The submitting thread
     $settings.VICTORY_REFRESH_PROBE_US = '300'; $settings.VICTORY_DECLARE_ACROSS_LISTS = '1'
+    $settings.VICTORY_REFRESH_PROBE_TEXTURES = '1'
+    # Where its time goes (stats lines only)
+    $settings.VICTORY_REFRESH_SPLIT = '1'; $settings.VICTORY_WAIT_SPLIT = '1'; $settings.VICTORY_DSTORAGE_STATS = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
