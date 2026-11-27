@@ -29,10 +29,11 @@
 //! - `VICTORY_DLSS_RR=1` (needs `VICTORY_DLSS=1`): loads DLSS Ray
 //!   Reconstruction's plugin beside DLSS, checks support, logs the buffer
 //!   tags the plugin says it needs, its version and its optimal render size
-//!   for the title's output next to Super Resolution's. It does not draw:
-//!   Super Resolution still takes every upscale, because the guide buffers
-//!   (diffuse albedo, specular albedo, normals, roughness) of the title are
-//!   not identified.
+//!   for the title's output next to Super Resolution's. It draws in place of
+//!   Super Resolution wherever the title's G-buffer is found and converted
+//!   that frame ([`guides`]); Super Resolution takes every other upscale.
+//!   How the title's G-buffer is read is set by three switches described in
+//!   [`guides`].
 //! - `VICTORY_RR_TARGETS=1` (or a list of upscaling numbers): diagnostics
 //!   that log the textures the title's passes write around the upscale
 //!   ([`targets`]).
@@ -51,6 +52,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub(crate) mod abi;
+pub(crate) mod guides;
 pub mod plan;
 mod reflex;
 pub(crate) mod targets;
@@ -106,7 +108,7 @@ pub struct Asked {
     /// frame's simulation, the markers at their times); `None`: as without
     /// the switch.
     pub reflex: Option<Reflex>,
-    /// `VICTORY_DLSS_RR=1`: DLSS Ray Reconstruction's plugin is loaded beside DLSS (it needs `VICTORY_DLSS=1`); it loads and reports, it does not draw yet.
+    /// `VICTORY_DLSS_RR=1`: DLSS Ray Reconstruction's plugin is loaded beside DLSS (it needs `VICTORY_DLSS=1`); it draws in place of Super Resolution wherever the title's G-buffer is found and converted that frame, and Super Resolution takes every other upscale.
     pub rr: bool,
 }
 
@@ -262,6 +264,7 @@ struct Functions {
     dlss_optimal: Option<abi::SlDlssGetOptimalSettings>,
     dlss_set_options: Option<abi::SlDlssSetOptions>,
     dlssd_optimal: Option<abi::SlDlssdGetOptimalSettings>,
+    dlssd_set_options: Option<abi::SlDlssdSetOptions>,
     dlssg_set_options: Option<abi::SlDlssgSetOptions>,
     dlssg_get_state: Option<abi::SlDlssgGetState>,
     reflex_set_options: Option<abi::SlReflexSetOptions>,
@@ -273,7 +276,7 @@ struct Functions {
 
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static DLSS_READY: AtomicBool = AtomicBool::new(false);
-/// The RR plugin answers (its functions were found at the device). It never means RR draws.
+/// The RR plugin answers (its optimal-size and options functions were found at the device). Whether RR draws a given upscaling is decided per frame in [`evaluate`].
 static RR_READY: AtomicBool = AtomicBool::new(false);
 static FG_READY: AtomicBool = AtomicBool::new(false);
 /// Reflex by itself runs (`VICTORY_REFLEX`, its functions found, its options
@@ -348,11 +351,15 @@ struct Calls {
     framegen_on: bool,
     framegen_times: u32,
     simulating: Option<u32>,
+    /// The feature the last upscaling was evaluated with: the other one's
+    /// history is stale when it changes.
+    last_feature: Option<u32>,
 }
 
 static CALLS: Mutex<Calls> = Mutex::new(Calls {
     optimal: Vec::new(),
     last: None,
+    last_feature: None,
     framegen_on: false,
     framegen_times: 0,
     simulating: None,
@@ -372,6 +379,29 @@ static FG_ON: AtomicU64 = AtomicU64::new(0);
 static FG_OFF: AtomicU64 = AtomicU64::new(0);
 static FG_SHOWN: AtomicU64 = AtomicU64::new(0);
 static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+/// Ray Reconstruction: upscalings it drew since the last line, upscalings it
+/// would have drawn that Super Resolution took, and whether a library failure
+/// switched it off for the run.
+static RR_EVALUATED: AtomicU64 = AtomicU64::new(0);
+static RR_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static RR_OFF: AtomicBool = AtomicBool::new(false);
+/// The reasons Super Resolution took an upscaling already logged.
+static RR_REASONS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+/// Ray Reconstruction's evaluations in all, for the log.
+static RR_EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// Super Resolution takes this upscaling instead of Ray Reconstruction:
+/// counted, and logged once per distinct reason.
+fn rr_fallback(why: &'static str) {
+    RR_FALLBACK.fetch_add(1, Relaxed);
+    // the lock is held for a scan of a few strings and a push, no more
+    let mut seen = RR_REASONS.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&why) {
+        seen.push(why);
+        drop(seen);
+        tracing::info!("DLSS Ray Reconstruction: Super Resolution takes this upscaling: {why}");
+    }
+}
 static FG_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Presents with frame generation on, and frames it showed, in all.
 static FG_ON_ALL: AtomicU64 = AtomicU64::new(0);
@@ -526,7 +556,7 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         "Streamline loaded (manual hooking, no downloads)"
     );
     if asked.rr {
-        tracing::info!(rr, "Streamline: DLSS Ray Reconstruction is asked for (VICTORY_DLSS_RR); it loads and reports, it does not draw yet");
+        tracing::info!(rr, "Streamline: DLSS Ray Reconstruction is asked for (VICTORY_DLSS_RR); it draws in place of Super Resolution wherever the title's G-buffer is found and converted that frame, and Super Resolution takes every other upscale");
     }
     let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen, reflex, rr });
     Ok(Available { dlss, framegen })
@@ -765,6 +795,7 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
     }
     if plan.rr {
         functions.dlssd_optimal = f!(abi::FEATURE_DLSS_RR, c"slDLSSDGetOptimalSettings", abi::SlDlssdGetOptimalSettings);
+        functions.dlssd_set_options = f!(abi::FEATURE_DLSS_RR, c"slDLSSDSetOptions", abi::SlDlssdSetOptions);
         log_version(sl, abi::FEATURE_DLSS_RR, "DLSS Ray Reconstruction");
     }
     let mut queue = None;
@@ -848,7 +879,10 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
         }
     }
     let _ = FUNCTIONS.set(functions);
-    RR_READY.store(plan.rr && FUNCTIONS.get().is_some_and(|f| f.dlssd_optimal.is_some()), Release);
+    RR_READY.store(plan.rr && FUNCTIONS.get().is_some_and(|f| f.dlssd_optimal.is_some() && f.dlssd_set_options.is_some()), Release);
+    if RR_READY.load(Acquire) {
+        guides::prepare();
+    }
     // (After the functions: a title thread that sees this finds them.)
     if reflex_ready {
         REFLEX_READY.store(true, Release);
@@ -1420,6 +1454,9 @@ pub fn upscale(up: &Upscale) -> Taken {
     if dlss && let Err(why) = validate(up) {
         return Taken::No(why);
     }
+    // ray reconstruction: remember the motion target of this upscaling and
+    // what the draws since the last one wrote (a no-op while it is off)
+    guides::upscaling(up);
     let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
     let up = *up;
     let asked = crate::list::external(
@@ -1573,35 +1610,98 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
         }
         textures[i] = Some((texture, legal));
     }
-    let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id) {
+    // ray reconstruction takes this upscaling when its guide buffers are made
+    // (the conversion pass is recorded into `host` here, ahead of the
+    // evaluation); every reason it cannot leaves it to super resolution
+    let guides = if RR_READY.load(Acquire) && !RR_OFF.load(Relaxed) {
+        match textures[DEPTH].as_ref() {
+            Some(d) => guides::make(host, up, d).map_err(rr_fallback).ok(),
+            None => {
+                rr_fallback("no depth");
+                None
+            }
+        }
+    } else {
+        // once ray reconstruction is off for the run, super resolution takes
+        // every upscaling in its place, and that is still counted
+        if RR_READY.load(Acquire) {
+            RR_FALLBACK.fetch_add(1, Relaxed);
+        }
+        None
+    };
+    // with guides made, the pass's bindings are in the title's list: whatever
+    // happens after, the work reports true so the list's state is replayed
+    // (a false would leave our heap, root signature and pipeline bound under
+    // the title's cached ones)
+    let failed = |why: &str| {
+        fail(why);
+        guides.is_some()
+    };
+    let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id, guides.as_ref()) {
         Ok(recorded) => recorded,
-        Err(why) => return fail(&why),
+        Err(Failure { why, rr: true }) if guides.is_some() => {
+            // a ray reconstruction call failed: it stays off for the run and
+            // super resolution records this upscaling instead
+            RR_OFF.store(true, Relaxed);
+            tracing::warn!(id, "DLSS Ray Reconstruction failed and is off for this run: {why}; Super Resolution takes every upscaling");
+            match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id, None) {
+                Ok(recorded) => recorded,
+                Err(failure) => return failed(&failure.why),
+            }
+        }
+        Err(failure) => return failed(&failure.why),
     };
     crate::external::output_written(up.resources[OUTPUT].0);
     EVALUATED.fetch_add(1, Relaxed);
     let all = EVALUATED_ALL.fetch_add(1, Relaxed) + 1;
+    let drawn_by_rr = recorded.feature == abi::FEATURE_DLSS_RR;
+    if drawn_by_rr {
+        RR_EVALUATED.fetch_add(1, Relaxed);
+    }
+    let rr_all = if drawn_by_rr { RR_EVALUATED_ALL.fetch_add(1, Relaxed) + 1 } else { RR_EVALUATED_ALL.load(Relaxed) };
     if all == 1 || recorded.changed {
-        tracing::info!(
-            render = ?camera.render,
-            output = ?camera.output,
-            mode = plan::sl_mode_name(recorded.mode),
-            asked = plan.asked.mode.name(),
-            preset = plan.asked.preset,
-            optimal = ?recorded.optimal,
-            hdr = camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0,
-            depth_inverted = camera.depth_inverted(),
-            auto_exposure = textures[EXPOSURE].is_none(),
-            reactive = textures[REACTIVE].is_some(),
-            display_motion_vectors = camera.display_motion_vectors(),
-            jitter = ?recorded.jitter,
-            mvec_scale = ?recorded.mvec_scale,
-            near = camera.near,
-            far = camera.far,
-            fov = camera.fov_y,
-            formats = ?formats(&textures),
-            evaluations = all,
-            "DLSS: upscaling recorded in place of the title's FidelityFX"
-        );
+        if let (true, Some(g)) = (drawn_by_rr, guides.as_ref()) {
+            let guide_formats = [&g.normal_roughness, &g.albedo, &g.specular_albedo].map(|(t, _)| {
+                // SAFETY: a live texture of ours.
+                unsafe { t.GetDesc() }.Format.0
+            });
+            tracing::info!(
+                mode = plan::sl_mode_name(recorded.mode),
+                render = ?camera.render,
+                output = ?camera.output,
+                tags = ?recorded.tags,
+                normal_roughness = "packed",
+                // ray reconstruction ignores the auto exposure switch; with
+                // no exposure texture it has only the pre-exposure
+                auto_exposure = textures[EXPOSURE].is_none(),
+                matrices = "identity (view-space normals)",
+                ?guide_formats,
+                evaluations = rr_all,
+                "DLSS Ray Reconstruction: upscaling recorded in place of the title's FidelityFX"
+            );
+        } else {
+            tracing::info!(
+                render = ?camera.render,
+                output = ?camera.output,
+                mode = plan::sl_mode_name(recorded.mode),
+                asked = plan.asked.mode.name(),
+                preset = plan.asked.preset,
+                optimal = ?recorded.optimal,
+                hdr = camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0,
+                depth_inverted = camera.depth_inverted(),
+                auto_exposure = textures[EXPOSURE].is_none(),
+                reactive = textures[REACTIVE].is_some(),
+                display_motion_vectors = camera.display_motion_vectors(),
+                jitter = ?recorded.jitter,
+                mvec_scale = ?recorded.mvec_scale,
+                near = camera.near,
+                far = camera.far,
+                fov = camera.fov_y,
+                formats = ?formats(&textures),
+                evaluations = all,
+                "DLSS: upscaling recorded in place of the title's FidelityFX"
+            );
+        }
         if RR_READY.load(Acquire) {
             rr_report(camera.output, recorded.mode, recorded.optimal);
         }
@@ -1624,6 +1724,32 @@ fn formats(textures: &Textures) -> Vec<i32> {
         .collect()
 }
 
+/// Why [`record`] recorded nothing, and whether a Ray Reconstruction call
+/// (its options, or its evaluation) is what failed: only those switch it off,
+/// a failure of anything Super Resolution shares says nothing about it.
+struct Failure {
+    why: String,
+    rr: bool,
+}
+
+impl From<String> for Failure {
+    fn from(why: String) -> Self {
+        Failure { why, rr: false }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(why: &str) -> Self {
+        Failure { why: why.into(), rr: false }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
 /// What [`record`] recorded.
 struct Recorded {
     mode: u32,
@@ -1632,13 +1758,27 @@ struct Recorded {
     changed: bool,
     jitter: [f32; 2],
     mvec_scale: [f32; 2],
+    /// The feature evaluated: `FEATURE_DLSS`, or `FEATURE_DLSS_RR` with guides.
+    feature: u32,
+    /// The buffer kinds tagged for it.
+    tags: Vec<u32>,
 }
 
 /// The DLSS evaluation of `textures` recorded into the open command list
 /// `list`: the mode whose render size holds the title's, the options, the
 /// frame's constants (frame `id` of the upscaling's viewport), the textures
-/// as local tags. The textures are left in the states given.
-fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exposure: f32, id: u64) -> Result<Recorded, String> {
+/// as local tags. The textures are left in the states given. With `guides`
+/// (the title's G-buffer converted to ray reconstruction's formats, on the
+/// card) the evaluation is ray reconstruction's, on the same viewport and at
+/// the same place; without them it is super resolution's.
+fn record(
+    list: *mut c_void,
+    textures: &Textures,
+    camera: &plan::Camera,
+    pre_exposure: f32,
+    id: u64,
+    guides: Option<&guides::Guides>,
+) -> Result<Recorded, Failure> {
     let (Some(plan), Some(sl), Some(functions)) = (PLAN.get(), SL.get(), FUNCTIONS.get()) else {
         return Err("Streamline is not ready".into());
     };
@@ -1678,12 +1818,49 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     // SAFETY: filled options for our viewport.
     let code = unsafe { set_options(&viewport, &options) };
     if code != 0 {
-        return Err(format!("slDLSSSetOptions: {} ({code})", abi::result_name(code)));
+        return Err(format!("slDLSSSetOptions: {} ({code})", abi::result_name(code)).into());
     }
-    let changed = calls.last != Some((mode, camera.render, output));
+    let feature = if guides.is_some() { abi::FEATURE_DLSS_RR } else { abi::FEATURE_DLSS };
+    if guides.is_some() {
+        // the guide: ray reconstruction's options come in addition to
+        // super resolution's. The guide pass writes view-space normals, so
+        // both matrices are the identity.
+        let Some(set_rr_options) = functions.dlssd_set_options else {
+            return Err("no DLSS Ray Reconstruction functions".into());
+        };
+        let mut o = abi::DlssdOptions::new(mode, output);
+        o.pre_exposure = options.pre_exposure;
+        o.normal_roughness_mode = abi::DLSSD_PACKED;
+        o.world_to_camera_view = plan::IDENTITY;
+        o.camera_view_to_world = plan::IDENTITY;
+        // SAFETY: filled options for our viewport.
+        let code = unsafe { set_rr_options(&viewport, &o) };
+        if code != 0 {
+            return Err(Failure { why: format!("slDLSSDSetOptions: {} ({code})", abi::result_name(code)), rr: true });
+        }
+    } else if calls.last_feature == Some(abi::FEATURE_DLSS_RR) {
+        // super resolution after ray reconstruction: the library keeps its
+        // mode until told off, and it overrides super resolution while on. a
+        // failed call is only said; the evaluation shows whether it mattered
+        if let Some(set_rr_options) = functions.dlssd_set_options {
+            let o = abi::DlssdOptions::new(abi::DLSS_OFF, output);
+            // SAFETY: filled options for our viewport.
+            let code = unsafe { set_rr_options(&viewport, &o) };
+            if code != 0 {
+                tracing::warn!("DLSS: slDLSSDSetOptions off: {} ({code})", abi::result_name(code));
+            }
+        }
+    }
+    // the other feature's history is stale after a switch between the two
+    let switched = calls.last_feature.is_some_and(|f| f != feature);
+    calls.last_feature = Some(feature);
+    let changed = switched || calls.last != Some((mode, camera.render, output));
     calls.last = Some((mode, camera.render, output));
     // (Its fields first: the token is made when all is ready for it.)
-    let constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
+    let mut constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
+    if switched {
+        constants.reset = abi::TRUE;
+    }
     // With Reflex by itself the token stays in our keeping from here until
     // the evaluation below has returned ([`Token`]): the constants and the
     // evaluation must name the same frame, and other threads would make
@@ -1694,7 +1871,7 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     // SAFETY: constants for this frame and viewport.
     let code = unsafe { (sl.set_constants)(&constants, token.token, &viewport) };
     if code != 0 {
-        return Err(format!("slSetConstants: {} ({code})", abi::result_name(code)));
+        return Err(format!("slSetConstants: {} ({code})", abi::result_name(code)).into());
     }
     let kinds = [
         (COLOUR, abi::BUFFER_SCALING_INPUT_COLOR, camera.render),
@@ -1710,6 +1887,17 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
             textures[i].as_ref().map(|(t, state)| (abi::Resource::texture(t.as_raw(), *state), kind, size))
         })
         .collect();
+    if let Some(g) = guides {
+        // made on the card this frame at the render size, left readable
+        for ((t, state), kind) in [
+            (&g.normal_roughness, abi::BUFFER_NORMAL_ROUGHNESS),
+            (&g.albedo, abi::BUFFER_ALBEDO),
+            (&g.specular_albedo, abi::BUFFER_SPECULAR_ALBEDO),
+        ] {
+            resources.push((abi::Resource::texture(t.as_raw(), *state), kind, camera.render));
+        }
+    }
+    let kinds_tagged: Vec<u32> = resources.iter().map(|r| r.1).collect();
     let mut tags: Vec<abi::ResourceTag> = resources
         .iter_mut()
         .map(|(r, kind, size)| abi::ResourceTag::new(r, *kind, abi::VALID_UNTIL_EVALUATE, abi::Extent::sized(*size)))
@@ -1717,21 +1905,29 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let mut inputs: Vec<*const abi::BaseStructure> = vec![std::ptr::from_ref(&viewport.base)];
     inputs.extend(tags.iter_mut().map(|t| std::ptr::from_ref(&t.base)));
     // SAFETY: an open command list; inputs that live through the call.
-    let code = unsafe { (sl.evaluate_feature)(abi::FEATURE_DLSS, token.token, inputs.as_ptr(), inputs.len() as u32, list) };
+    let code = unsafe { (sl.evaluate_feature)(feature, token.token, inputs.as_ptr(), inputs.len() as u32, list) };
     // The last call that reads the token has returned.
     drop(token);
     if code != 0 {
-        return Err(format!("slEvaluateFeature: {} ({code})", abi::result_name(code)));
+        return Err(Failure { why: format!("slEvaluateFeature: {} ({code})", abi::result_name(code)), rr: feature == abi::FEATURE_DLSS_RR });
     }
     if let Some(began) = began {
         spent(T_UPSCALE, began);
     }
-    Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
+    Ok(Recorded {
+        mode,
+        optimal: optimal_of_mode(mode),
+        changed,
+        jitter: constants.jitter_offset,
+        mvec_scale: constants.mvec_scale,
+        feature,
+        tags: kinds_tagged,
+    })
 }
 
 /// What DLSS Ray Reconstruction would render at for this output, logged
-/// beside Super Resolution's. Nothing is evaluated: its guide buffers are
-/// not identified, so this only asks the plugin a question.
+/// beside Super Resolution's. Nothing is evaluated here, this only asks the
+/// plugin a question.
 fn rr_report(output: [u32; 2], mode: u32, sr_optimal: Option<[u32; 2]>) {
     let Some(optimal_of) = FUNCTIONS.get().and_then(|f| f.dlssd_optimal) else { return };
     // The header marks the function not thread safe; `record` let go of the
@@ -1743,7 +1939,7 @@ fn rr_report(output: [u32; 2], mode: u32, sr_optimal: Option<[u32; 2]>) {
     let code = unsafe { optimal_of(&options, &mut settings) };
     if code == 0 {
         // only an answered query shows the plugin answering
-        once!(info, "DLSS Ray Reconstruction: loaded and answering, not drawing: it needs the diffuse albedo, specular albedo, normals and roughness of the title's own passes, and none of those targets is identified yet, so DLSS Super Resolution still does every upscale (VICTORY_RR_TARGETS=1 logs the candidates)");
+        once!(info, "DLSS Ray Reconstruction: loaded and answering; it draws in place of Super Resolution once the G-buffer line below appears (VICTORY_RR_TARGETS=1 logs the candidates)");
         tracing::info!(
             mode = plan::sl_mode_name(mode),
             ?output,
@@ -1775,7 +1971,14 @@ pub fn upscaler_destroyed(context: usize) {
     // SAFETY: our viewport; nothing that names it is in flight.
     let code = unsafe { (sl.free_resources)(abi::FEATURE_DLSS, &viewport) };
     calls.last = None;
+    calls.last_feature = None;
     tracing::info!(code, result = abi::result_name(code), "DLSS: the title's upscaler was destroyed; DLSS let go of its resources");
+    if RR_READY.load(Acquire) {
+        // ray reconstruction keeps its own resources for the viewport
+        // SAFETY: our viewport; nothing that names it is in flight.
+        let code = unsafe { (sl.free_resources)(abi::FEATURE_DLSS_RR, &viewport) };
+        tracing::info!(code, result = abi::result_name(code), "DLSS Ray Reconstruction: let go of its resources");
+    }
 }
 
 /// The title's interface composite where the interface is no plane of the
@@ -2581,7 +2784,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
                     return lines;
                 }
             };
-            let recorded = record(list.list.as_raw(), &textures, &camera, 1.0, id);
+            let recorded = record(list.list.as_raw(), &textures, &camera, 1.0, id, None);
             list.close();
             host.execute_sync_internal(&list);
             // SAFETY: a plain query.
@@ -2710,11 +2913,21 @@ fn texture(
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     let Some(plan) = PLAN.get() else { return };
-    let [done, failed, forwarded, on, off, shown] =
-        [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN].map(|c| c.swap(0, Relaxed));
+    let [done, failed, forwarded, on, off, shown, rr_done, rr_fallbacks] =
+        [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN, &RR_EVALUATED, &RR_FALLBACK].map(|c| c.swap(0, Relaxed));
     if plan.dlss || forwarded > 0 {
+        // the ray reconstruction counts ride on this line, built only when it is on
+        let rr = if plan.rr {
+            format!(
+                "; {:.2} by Ray Reconstruction, {:.2} by Super Resolution in its place",
+                rr_done as f64 / frames,
+                rr_fallbacks as f64 / frames
+            )
+        } else {
+            String::new()
+        };
         tracing::info!(
-            "DLSS per frame: {:.2} upscalings by DLSS, {:.2} failed, {:.2} left to the title's FidelityFX ({} by DLSS so far)",
+            "DLSS per frame: {:.2} upscalings by DLSS, {:.2} failed, {:.2} left to the title's FidelityFX ({} by DLSS so far){rr}",
             done as f64 / frames,
             failed as f64 / frames,
             forwarded as f64 / frames,

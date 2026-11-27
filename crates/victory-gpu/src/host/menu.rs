@@ -83,9 +83,9 @@ const ITEMS: &[Item] = &[
     // key and the runner's default stands (16x9 is what the runner exports, so it shows the same); 0 is read by compose::ui_aspect as no letterbox.
     Item { var: "VICTORY_UI_LETTERBOX", label: "INTERFACE ON A WIDE PICTURE", values: &[("", "16:9 IN THE MIDDLE"), ("0", "STRETCHED"), ("16x9", "16:9 IN THE MIDDLE")], live: false },
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
-    // DLSS Ray Reconstruction (`streamline`, `VICTORY_DLSS_RR`): its plugin loads and reports beside DLSS; it does not draw yet
-    // (the title's guide buffers are not identified), so Super Resolution still does the upscaling. Needs DLSS on.
-    Item { var: "VICTORY_DLSS_RR", label: "RAY RECONSTRUCTION (LOADS ONLY)", values: UNSET_ON, live: false },
+    // DLSS Ray Reconstruction (`streamline`, `VICTORY_DLSS_RR`): draws in place of Super Resolution wherever the title's
+    // G-buffer is found and converted, and Super Resolution takes every other upscale. Needs DLSS on.
+    Item { var: "VICTORY_DLSS_RR", label: "RAY RECONSTRUCTION (UNTESTED)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },

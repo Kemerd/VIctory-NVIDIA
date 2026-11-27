@@ -166,8 +166,8 @@ fn fnv1a(writes: &[(usize, How)]) -> u64 {
 }
 
 /// Size and DXGI format of a title texture's host copy, if it has one (a
-/// buffer, or a texture not made yet, has none).
-fn describe(resource: usize) -> Option<([u32; 2], i32)> {
+/// buffer, or a texture not made yet, has none). guides.rs uses it too.
+pub(super) fn describe(resource: usize) -> Option<([u32; 2], i32)> {
     let made = crate::resource::made_copy(resource as This)?;
     // SAFETY: the host copy is held by the `Arc` for the call.
     let desc = unsafe { made.texture.GetDesc() };

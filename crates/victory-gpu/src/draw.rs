@@ -1875,6 +1875,8 @@ impl State {
         let l = &list.list;
         // the pass the next views belong to, for the diagnostics that name the title's render targets (VICTORY_RR_TARGETS)
         crate::streamline::targets::pass(list, p, compute, self.depth, &self.targets);
+        // the g-buffer dlss ray reconstruction reads is found by the draw that also writes the motion vectors (VICTORY_DLSS_RR); unset, this returns after one load
+        crate::streamline::guides::pass(compute, &self.targets);
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {

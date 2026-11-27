@@ -9,8 +9,8 @@ Three switches, all off by default:
 - `VICTORY_FRAMEGEN=1`: DLSS Frame Generation (2x) on our present, from the depth
   and motion vectors of the last upscaling submitted before the present.
 - `VICTORY_DLSS_RR=1` (with `VICTORY_DLSS=1`): DLSS Ray Reconstruction's plugin
-  is loaded, checked and reported; it does not draw yet (see "Ray
-  Reconstruction").
+  is loaded, and it draws in place of Super Resolution wherever the title's
+  G-buffer is found and converted (see "Ray Reconstruction"; untested).
 
 Nothing NVIDIA ships is in this repository. The library is loaded at run time
 from a folder you name; if anything is missing (the folder, a signature, a
@@ -62,7 +62,10 @@ later), hardware-accelerated GPU scheduling on (frame generation needs it).
 |---|---|---|---|
 | `VICTORY_DLSS` | `1` | off | DLSS in place of the title's FidelityFX upscaling |
 | `VICTORY_FRAMEGEN` | `1` | off | DLSS Frame Generation on our present; needs `VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1` (the line of submissions) |
-| `VICTORY_DLSS_RR` | `1` | off | DLSS Ray Reconstruction's plugin is loaded, checked and reported, and does not draw; needs `VICTORY_DLSS=1` (without it a warning and no change); F1 item "RAY RECONSTRUCTION (LOADS ONLY)", applied at the next start |
+| `VICTORY_DLSS_RR` | `1` | off | DLSS Ray Reconstruction's plugin is loaded and checked, and it draws in place of Super Resolution wherever the title's G-buffer is found and converted that frame (Super Resolution takes every other upscale); the reading of the G-buffer is not confirmed (see "Ray Reconstruction"); needs `VICTORY_DLSS=1` (without it a warning and no change); F1 item "RAY RECONSTRUCTION (UNTESTED)", applied at the next start |
+| `VICTORY_RR_NORMALS` | `view-xyz`, `octahedral`, `world-xyz` | `view-xyz` | how the title's normals target is read: rgb as xyz * 0.5 + 0.5 in view space with +z toward the eye, rg as an octahedral vector in the same space, or world space (accepted, but Ray Reconstruction then stays off: the layer has no view matrix); read once; needs `VICTORY_DLSS_RR`; no F1 item |
+| `VICTORY_RR_GBUFFER` | `<albedo>,<normals>,<roughness>,<metalness>` | `0,1,2.r,2.g` | which of the four G-buffer targets (0 to 3, in bound order) holds what; roughness and metalness are `<i>.<c>` with `c` one of `r g b a`, roughness may be `gloss:<i>.<c>` (roughness is one minus it), metalness may be `none` (reflectance 0.04 everywhere); read once; needs `VICTORY_DLSS_RR`; no F1 item |
+| `VICTORY_RR_ALBEDO` | `srgb`, `linear` | `srgb` | whether the albedo is sRGB encoded and decoded by our pass; ignored when the albedo target's own format is sRGB, whose view decodes it; read once; needs `VICTORY_DLSS_RR`; no F1 item |
 | `VICTORY_RR_TARGETS` | `1`, or a comma list of upscaling numbers | off | diagnostics: logs the textures the title's passes write around the upscaling, lines start `RR targets:`; `1` samples the 1st, 300th and 3000th upscaling (so `1` cannot mean only the first; `1,2` can), a list such as `1200,5000` those; needs `VICTORY_DLSS=1`, not the Ray Reconstruction plugin; no F1 item (it costs a lock and a hash per draw and dispatch while on) |
 | `VICTORY_DLSS_MODE` | `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | `quality` (`dlaa` with frame generation alone) | the scene's size: 1, 2/3, 0.58, 1/2, 1/3 of the output; the DLSS mode follows the sizes the title then passes |
 | `VICTORY_DLSS_PRESET` | `default`, `j`, `k`, `l`, `m` (`e`, `f` deprecated) | `default` | the DLSS model, for every mode |
@@ -294,46 +297,73 @@ fails at its first upscaling. Use both switches there.
 ## Ray Reconstruction
 
 `VICTORY_DLSS_RR=1` (with `VICTORY_DLSS=1`; without it a warning and the
-switch stays off) loads and reports DLSS Ray Reconstruction. It does not draw:
-DLSS Super Resolution takes every upscaling exactly as without the switch.
+switch stays off) loads DLSS Ray Reconstruction and lets it draw in place of
+Super Resolution wherever the title's G-buffer is found and converted that
+frame. It has not been seen running: the reading of the G-buffer below is from
+formats and bind order only. With the switch unset every path is as without it.
 
 **What runs.** Streamline loads the Ray Reconstruction plugin (feature 1001,
 `sl.dlss_d.dll` and `nvngx_dlssd.dll`, from `VICTORY_STREAMLINE_DIR` beside
 DLSS) and is asked whether this GPU supports it. The plugin's own list of
-required buffer tags is read (`slGetFeatureRequirements`) and logged, so the
-required set is what the plugin says and not what we guess. Its version is
-logged. At the first upscaling, and again whenever the DLSS mode or the sizes
-change, Ray Reconstruction's optimal render size and its smallest and largest
-for the title's output are logged beside Super Resolution's. Once, one line says
-that it is loaded and answering and not drawing.
+required buffer tags is read (`slGetFeatureRequirements`) and logged. Its
+version is logged. At the first upscaling, and again whenever the DLSS mode or
+the sizes change, Ray Reconstruction's optimal render size and its smallest and
+largest for the title's output are logged beside Super Resolution's.
 
-**Why it does not draw.** Per its programming guide in the SDK
-(`ProgrammingGuideDLSS_RR.md`), Ray Reconstruction takes, besides the colour,
-depth, motion vectors and output Super Resolution has:
+**What Ray Reconstruction takes.** Per its programming guide in the SDK
+(`ProgrammingGuideDLSS_RR.md`), besides the colour, depth, motion vectors and
+output Super Resolution has: the diffuse albedo (linear, three channels), the
+specular albedo (three channels; the guide gives `EnvBRDFApprox2` to make it
+from the material), the normals (F16 or F32, view or world space) with the
+roughness in their alpha channel (`normalRoughnessMode` packed), and the colour
+must be HDR. The title keeps 8-bit encoded targets and no specular albedo, and
+passes no camera matrices (see "How it works").
 
-- the diffuse albedo (linear, three channels),
-- the specular albedo (three channels; the guide gives `EnvBRDFApprox2` to make
-  it from the material),
-- the normals (F16 or F32, view or world space) with the roughness, in the
-  normals' alpha channel (`normalRoughnessMode` packed) or in a texture of its
-  own,
-- optionally the specular hit distance together with the world-to-view and
-  view-to-world matrices, or specular motion vectors,
-- and the colour must be HDR.
+**How the G-buffer is found.** By what it writes, with no hash and no name. The
+title's deferred material draws are the draws that also write the motion
+vectors DLSS is given. The first four other render targets of such a draw, in
+bound order, are taken as the G-buffer when all four are the render size and
+the first is an 8-bit colour format (typeless, unorm or sRGB) and the other
+three unorm; run 17's target log showed that layout. A frame in which no such
+draw was seen since the last upscaling (a menu, a load) has no G-buffer.
 
-The FidelityFX dispatch carries the colour, depth, motion vectors and output
-only (exposure, reactive and transparency masks are null in every run). The
-rest would have to come from the title's own passes.
+**How it is read, and the defaults.** Three switches, read once, say what the
+four targets hold (table above). The defaults are the reading of formats and
+bind order, not a confirmed one: albedo in target 0 (sRGB encoded), normals in
+target 1 as xyz * 0.5 + 0.5 in view space with +z toward the eye, roughness in
+the red channel and metalness in the green channel of target 2. `prepare` logs
+the reading in use. The pictures a diagnostics run saves (`VICTORY_CAPTURE`
+with `VICTORY_DUMP_TARGETS`) show which values fit; they carry only the three
+colour channels, so a role held in an alpha channel cannot be seen in them.
+World-space normals are refused, since Ray Reconstruction and the specular
+albedo's N.V need the view rotation and the layer has none.
 
-**What the tree knows and does not.** The title seems to have a deferred
-G-buffer: the character shaders are named `PS_Deferred...` (`draw.rs`) and its
-lighting reads the depth-stencil's stencil plane (`capture.rs`). Which target is
-which, in which encoding (how normals and roughness are packed, whether the
-albedo is sRGB or linear, view or world space) and where the specular colour
-lives is not known. The title passes no camera matrices (see "How it works"),
-so the world-to-view matrix in Ray Reconstruction's options would be left
-invalid, not made up. A guide that is guessed would make a picture that looks
-plausible and is wrong, so none is given.
+**What the pass does.** A compute pass of ours, recorded into the title's list
+ahead of the evaluation, writes three textures on the card: normals with the
+roughness in w (R16G16B16A16_FLOAT), the diffuse albedo (R11G11B10_FLOAT, linear,
+times one minus the metalness, since the guide asks for the diffuse part) and
+the specular albedo (R11G11B10_FLOAT, from `EnvBRDFApprox2` with F0 between 0.04
+and the albedo by metalness, and N.V from the camera's inverse projection). The
+call sequence is `slDLSSSetOptions`, `slDLSSDSetOptions` (packed, identity
+matrices, so view-space normals), `slSetConstants` (reset forced on a switch
+between the two features), then `slEvaluateFeature(FEATURE_DLSS_RR)` with the
+tags of Super Resolution plus the three guides. `slFreeResources` for the
+feature runs when the title's upscaler is destroyed.
+
+**Why Super Resolution takes an upscaling.** Each reason is logged once:
+no draw wrote the G-buffer since the last upscaling, none is known yet, its
+size is not the render size, the colour is not HDR, the depth is not in a state
+or format a compute shader can read, a target cannot be read by a shader, the
+camera has no usable field of view, the pass or the textures are not built yet
+(both are made on worker threads), the normals are world space, or a switch
+value is not understood. If a Ray Reconstruction call itself fails, it is off
+for the rest of the run and Super Resolution takes every upscaling.
+
+**Bytes.** Only the targets the reading names are loaded (three with the
+default, 12 bytes a pixel) plus the depth, and three textures of ours are
+written (16 bytes a pixel), all in default heaps on the card: about 25 MB read
+and 26 MB written a frame at 1706x960, about 26 MB of video memory. Nothing
+crosses the bus and nothing is read back. The cost is not measured.
 
 **Whether it can be the denoiser is open.** Ray Reconstruction replaces a
 denoiser that works on a noisy ray-traced image. The title's rays feed screen
@@ -345,20 +375,9 @@ Ray Reconstruction could only be a guided upscaler fed an already resolved
 colour, and whether the title's resolve passes could be left out is not known.
 `VICTORY_RR_TARGETS` exists to answer it from a run.
 
-**What a later change needs once a run has named the targets.**
-
-- A registry the draw path fills for the guides.
-- Compute passes of ours (the `ambient.rs` pattern, on the card) that decode the
-  title's G-buffer into Ray Reconstruction's formats.
-- `slDLSSDSetOptions` and `slEvaluateFeature` for `FEATURE_DLSS_RR` in place of
-  Super Resolution's, for the same viewport and frame token (Super Resolution's
-  options are still set, per the guide).
-- `slFreeResources(FEATURE_DLSS_RR, viewport)` when the title's upscaler is
-  destroyed.
-- Ray Reconstruction has no dynamic resolution: a change of render size
-  initialises it again.
-
-None of this is written. Each item needs a fact a run has to show first.
+Ray Reconstruction has no dynamic resolution: a change of render size
+initialises it again. The title passes zero jitter in run 17, which limits what
+any DLSS mode can reconstruct.
 
 ## Log lines
 
@@ -382,7 +401,16 @@ Reconstruction says it needs these buffer tags` (the plugin's own required
 list); at the device `Streamline: DLSS Ray Reconstruction loaded streamline=…
 ngx=…`; at the first upscaling and at each change of mode or sizes `DLSS Ray
 Reconstruction: optimal render size for this output` (beside Super Resolution's
-line); once, the line that it is loaded and answering and not drawing.
+line); once, the line that it is loaded and answering. When it draws: `the
+G-buffer is read as: …` (once, the switches' reading), `the guide pass is
+built`, `the G-buffer is the render targets of the draws that also write the
+motion vectors, in bound order: …` (again when the set changes), `the guide
+textures are made (WxH)`, `upscaling recorded in place of the title's
+FidelityFX` (tags, normal and roughness mode, matrices, guide formats,
+evaluations), `Super Resolution takes this upscaling: <why>` (once per reason),
+and on the `DLSS per frame` line `x by Ray Reconstruction, y by Super Resolution
+in its place`. Streamline's own log (`VICTORY_STREAMLINE_LOG`) should show the
+feature made at the render size for the output with no missing-tag warnings.
 `VICTORY_RR_TARGETS`: lines that start `RR targets:` at the chosen upscalings, a
 header with the four known textures, one line per pass, and a summary of the
 render-size textures.
@@ -611,9 +639,10 @@ encodings. The pictures stay outside the repository (`docs/asset-policy.md`).
 
 ## Limits
 
-- Ray Reconstruction (`VICTORY_DLSS_RR`) loads and reports only. It takes no
-  upscale, adds no video memory beyond the plugin's own load, and is set at the
-  start only (the F1 item applies at the next start).
+- Ray Reconstruction (`VICTORY_DLSS_RR`) is untested and its reading of the
+  G-buffer is a guess until a run's pictures confirm it. It adds about 26 MB of
+  video memory beyond the plugin's own load, and is set at the start only (the
+  F1 item applies at the next start).
 - Motion vectors: blocks of wrong motion inside character silhouettes (likely
   the heat-haze pass `731a39171b568298`) show as smearing with DLSS and as
   warped shapes in generated frames.
