@@ -106,6 +106,18 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+/// The budget of pages given a place from the faults in a run:
+/// [`FAULTS_ALL`], or what `VICTORY_MEMORY_FAULT_PAGES` says (to learn
+/// whether the pages shaders go on finding empty once it is spent are data
+/// they need: run rt-8 had some 250 a frame of them at title addresses
+/// outside every structure the builder's calls named).
+fn faults_all() -> usize {
+    static ALL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_FAULT_PAGES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
+    })
+}
+
 /// Pages given a place in one frame for structures the builder's calls
 /// named that shaders found empty (64 MiB: several top levels of 12 MB).
 const NAMED: u64 = 1024;
@@ -230,8 +242,10 @@ struct Stats {
     /// Of the pages shaders found empty: those below 4 GiB (not memory of
     /// the title's the directory covers: an offset on a base that read 0),
     /// those inside a structure the builder's calls named, and those of the
-    /// rest that were given a place from the budgets.
-    fault_kinds: [u64; 3],
+    /// rest that were given a place from the budgets; then those left
+    /// without one because the budget for the run was spent, because the
+    /// frame's was, and because the memory is not the title's.
+    fault_kinds: [u64; 6],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -766,11 +780,17 @@ impl Memory {
                 self.stats.fault_kinds[1] += 1;
                 continue;
             }
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.map(page) {
+            if self.faulted >= faults_all() {
+                self.stats.fault_kinds[3] += 1;
+            } else if made >= FAULTS {
+                self.stats.fault_kinds[4] += 1;
+            } else if self.map(page) {
                 made += 1;
                 self.faulted += 1;
                 self.stats.fault_kinds[2] += 1;
                 self.bring(page, page + 1);
+            } else {
+                self.stats.fault_kinds[5] += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
@@ -869,7 +889,8 @@ impl Memory {
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; of the pages that had no copy, \
              per frame: {:.1} below 4 GiB (an offset on a base that read 0), {:.1} in structures the builder's calls named (given a place, all of each), \
-             {:.1} others given a place from the budgets",
+             {:.1} others given a place from the budgets, {:.1} left without one with the run's budget spent (VICTORY_MEMORY_FAULT_PAGES), \
+             {:.1} with the frame's spent, {:.1} that are not the title's memory",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -895,6 +916,9 @@ impl Memory {
             s.fault_kinds[0] as f64 / frames,
             s.fault_kinds[1] as f64 / frames,
             s.fault_kinds[2] as f64 / frames,
+            s.fault_kinds[3] as f64 / frames,
+            s.fault_kinds[4] as f64 / frames,
+            s.fault_kinds[5] as f64 / frames,
         );
         // Where the threads' time went (all threads' together, a frame).
         let ms = |micros: u64| micros as f64 / 1000.0 / frames;
