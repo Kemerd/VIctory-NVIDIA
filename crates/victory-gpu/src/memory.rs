@@ -268,7 +268,8 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
+        // (Fresh: nothing wrote it, and it starts as zeros on both sides.)
+        let directory = crate::shadow::by_address(entries as u64, bytes, true)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
         let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
@@ -404,7 +405,8 @@ impl Memory {
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
         if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
-            if let Some(shadow) = crate::shadow::by_address(start, PAGE)
+            // (Title memory: its bytes are the title's, never fresh.)
+            if let Some(shadow) = crate::shadow::by_address(start, PAGE, false)
                 && let Some(n) = self.number(shadow)
             {
                 self.windows += 1;
@@ -462,7 +464,8 @@ impl Memory {
         let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize) else {
             return failed(self, "no address space for it", crate::upload::last_error());
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        // (Fresh: nothing wrote it, and it starts as zeros on both sides.)
+        let Some(n) = crate::shadow::by_address(at as u64, ARENA, true).and_then(|s| self.number(s)) else {
             // (Its memory is of no use without its copy.)
             crate::upload::release(at);
             return failed(self, "no copy of it on the host", 0);

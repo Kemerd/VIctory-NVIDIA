@@ -3210,6 +3210,17 @@ impl Shadow {
         }
     }
 
+    /// Notes every page as taken at [`FRESH_TAKEN`], before the copy is
+    /// shared: a copy of fresh zeroed memory whose two sides begin as zeros
+    /// ([`by_address`]). Its first refresh then takes only pages the write
+    /// watch names, cut to their written parts and compared by dwords
+    /// against the zeros of the CPU's side, as every later refresh does.
+    fn start_fresh(&mut self) {
+        for at in self.copied.get_mut().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            *at = FRESH_TAKEN;
+        }
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4667,9 +4678,28 @@ impl Shadow {
     /// A copy at `data` of title memory `[start, start + len)`, with a card
     /// side if `card`. It is never let go: there is no buffer to release.
     pub(crate) fn unbacked(start: u64, data: *mut u8, len: u64, card: bool) -> Arc<Shadow> {
+        Shadow::unbacked_as(start, data, len, card, None)
+    }
+
+    /// As [`Shadow::unbacked`] with a card side, made as [`by_address`]
+    /// makes a copy of fresh memory with `VICTORY_MEMORY_FRESH=1` (only
+    /// dwords that changed go up, every page noted as taken) if `fresh`,
+    /// or without the switch if not.
+    pub(crate) fn unbacked_by_address(start: u64, data: *mut u8, len: u64, fresh: bool) -> Arc<Shadow> {
+        Shadow::unbacked_as(start, data, len, true, Some(fresh))
+    }
+
+    /// `by_address`: made as [`by_address`] makes a copy, fresh or not.
+    fn unbacked_as(start: u64, data: *mut u8, len: u64, card: bool, by_address: Option<bool>) -> Arc<Shadow> {
         // SAFETY: an interface pointer nothing calls.
         let none = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
         let mut shadow = Shadow::new(none(), data, 0, start, len);
+        if let Some(fresh) = by_address {
+            shadow.changes_only.store(true, Ordering::Relaxed);
+            if fresh {
+                shadow.start_fresh();
+            }
+        }
         if card {
             shadow.card = Some(Card {
                 staging: none(),
@@ -5460,6 +5490,49 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
         .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
 }
 
+/// Whether a copy by address of memory of ours that is fresh and zeroed
+/// (an arena of [`crate::memory`]'s and its directory) starts with every
+/// page noted as taken ([`Shadow::start_fresh`]), so that its first refresh
+/// takes only the pages written since it was made, not all of it
+/// (`VICTORY_MEMORY_FRESH=1`, off by default).
+///
+/// Without it the first refresh of a new arena finds all 1,024 pages never
+/// taken and sends 64 MiB of zeros up: read from the arena, written to the
+/// CPU's side, copied into the submission's send memory and over the bus
+/// (16 MiB for the directory, once a run). With it those four hops carry
+/// only the pages the module wrote; a page it holds is sent whole the first
+/// time anyway (`resend` in `Memory::bring`, `land` and `place`).
+///
+/// It acts only where arenas are made, that is with the title's ray tracing
+/// on (`VICTORY_RT_NATIVE=1`); a run without it has one arena and the
+/// directory for the whole run. It saves bytes and time of the submitting
+/// thread in the seconds arenas are made (13 or 14 in the first ten seconds
+/// after memory by address began in the runs of 2026-11-26, then up to 25),
+/// not frame time of the 300-450 ms streaming frames, and about 100 MB of
+/// RAM never touched at 25 arenas.
+fn fresh_memory() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_FRESH").is_some_and(|v| v == "1"))
+}
+
+/// The asking every page of a copy of fresh memory is noted as taken at
+/// ([`Shadow::start_fresh`]). What it rests on:
+///
+/// - no write to such memory can be noted under asking 1: askings are
+///   numbered from 1 at the start of the run, the title's memory has been
+///   asked about many times before the first arena is made, and a page of
+///   an arena or of the directory is stored to only after
+///   `Memory::possible` asked the watch (or at a submission whose asking
+///   stands); so every write ever made to it is noted 2 or higher and is
+///   found as a write after the page was taken;
+/// - both sides of the copy begin as zeros: the CPU's side and the card's
+///   are fresh committed buffers made without the not-zeroed flag (as the
+///   compare against never-taken pages already assumes, see
+///   [`Shadow::take`]), and the memory is a fresh reservation;
+/// - the memory's only writers are `crate::memory`'s own stores, which the
+///   kernel's write watch or `crate::watch::wrote` reports.
+const FRESH_TAKEN: u64 = 1;
+
 /// A copy of the memory `[start, start + len)` (an arena of
 /// [`crate::memory`]'s, its directory, title memory around a small buffer)
 /// for the programs that find memory by address, on the card: the structures
@@ -5468,7 +5541,15 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// What shaders write there by address is not brought back, so the copy is
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
-pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+///
+/// `fresh`: the memory at `start` is a fresh write-watched reservation of
+/// ours that nothing wrote before this call, and both buffers made here are
+/// fresh committed resources made without the not-zeroed flag; with
+/// [`fresh_memory`] its pages start as taken ([`FRESH_TAKEN`]). Pooling
+/// `shared_buffer` or `uav_buffer` later would void that, as it would the
+/// compare against never-taken pages. Windows of title memory itself hold
+/// the title's bytes and are never fresh.
+pub(crate) fn by_address(start: u64, len: u64, fresh: bool) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
@@ -5524,6 +5605,9 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
+    if fresh && fresh_memory() {
+        shadow.start_fresh();
+    }
     shadow.card = Some(Card {
         staging,
         before: Mutex::default(),
