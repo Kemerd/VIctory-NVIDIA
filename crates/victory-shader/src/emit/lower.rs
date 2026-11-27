@@ -1402,6 +1402,31 @@ thread_local! {
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether `native` was made from loose pieces ([`Lower::made_from_pieces`]),
+/// asked before a [`Lower`] exists.
+fn from_pieces(native: &NativeProgram) -> bool {
+    let range = crate::native::VERTEX_BUFFERS >> 8;
+    native
+        .layout
+        .iter()
+        .any(|p| matches!(p.root, RootType::Other(code) if code >> 8 == range))
+}
+
+/// A `v_cndmask_b32` whose mask is no lane mask the structuring tracks: a
+/// number the code holds (`s_cselect` of all lanes or none, a bit pattern).
+/// The select takes this lane's own bit of it ([`Lower::valu_op`]), which
+/// needs the console's lane numbers. [`reads_mask_as_data`] leaves selects
+/// out on purpose (their masks are mostly tracked ones), so a program whose
+/// only such use is this one would be lowered with host lanes.
+fn selects_by_number(st: &Structured, i: &Inst) -> bool {
+    let Fields::Valu(v) = &i.fields else {
+        return false;
+    };
+    i.name() == "v_cndmask_b32"
+        && matches!(v.src.get(2), Some(&Operand::Scalar { code, .. })
+            if i.read(Reg::S(code)).is_some_and(|m| !st.masks.contains_key(&m)))
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     // A scalar select uses the condition of the whole guest wave, even
     // when the preceding mask operation has no scalar-dword consumers.
@@ -1650,6 +1675,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
+            let pieces = from_pieces(x.native);
             console_lanes = insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
@@ -1659,6 +1685,9 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    // (only for a program made from pieces: the console
+                    // compiler's programs are decided as they were before)
+                    || pieces && selects_by_number(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -12708,12 +12737,7 @@ impl<'a> Lower<'a> {
     /// translation is taken only where this holds, so a title's shaders
     /// translate as they did before the pieces existed.
     fn made_from_pieces(&self) -> bool {
-        let range = crate::native::VERTEX_BUFFERS >> 8;
-        self.x
-            .native
-            .layout
-            .iter()
-            .any(|p| matches!(p.root, RootType::Other(code) if code >> 8 == range))
+        from_pieces(self.x.native)
     }
 
     /// Whether layout entry `param` is the table of vertex buffer

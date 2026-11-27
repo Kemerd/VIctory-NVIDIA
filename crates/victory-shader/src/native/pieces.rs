@@ -113,7 +113,7 @@ use std::ops::Range;
 use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{FourCC, u16_at, u32_at};
 use crate::native::{
-    self, ComputeIo, HwStage, NativeProgram, PsInput, RecordRules, RootParam, RootType, StageIo,
+    self, COMPUTE_PIECES, ComputeIo, HwStage, NativeProgram, PsInput, RecordRules, RootParam, RootType, StageIo,
     PIXEL_PIECES, Usage, VERTEX_BUFFERS, VsFetch, VsOutput,
 };
 
@@ -1335,10 +1335,24 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
     }
     native::size_constants(&mut r.layout, user_sgprs)?;
     let io = match stage {
-        COMPUTE => StageIo::Cs(ComputeIo {
-            rsrc2: words[0],
-            threads: [words[1], words[2], words[3]],
-        }),
+        COMPUTE => {
+            // Like a pixel program's entry below: it owns no user SGPR and
+            // only says the program was made from pieces, which is what
+            // lets the translation take the forms the pieces need (a
+            // title's container never has one).
+            r.layout.push(RootParam {
+                root: RootType::Other(COMPUTE_PIECES),
+                table_offset_dwords: 0,
+                sgprs: 0,
+                base_register: 0,
+                user_data: 0,
+                slot: u8::MAX,
+            });
+            StageIo::Cs(ComputeIo {
+                rsrc2: words[0],
+                threads: [words[1], words[2], words[3]],
+            })
+        }
         VERTEX => {
             // s0 and s1 are the vertex buffer table's address, s2 the base
             // vertex: no root parameter may claim them.
@@ -1590,7 +1604,16 @@ mod tests {
             p.layout,
             [
                 param(RootType::Table, 4, 0, 7),
-                param(RootType::Constants, 5, 1, 9)
+                param(RootType::Constants, 5, 1, 9),
+                // (the mark of a program made from pieces, no user SGPR)
+                RootParam {
+                    root: RootType::Other(COMPUTE_PIECES),
+                    table_offset_dwords: 0,
+                    sgprs: 0,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: u8::MAX,
+                },
             ]
         );
         assert_eq!(
