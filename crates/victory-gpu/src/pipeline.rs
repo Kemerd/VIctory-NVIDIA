@@ -102,7 +102,14 @@ pub(crate) fn kept() -> [u64; 7] {
 
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
-    let full = blake3::hash(bytes);
+    shader_of(stage, std::borrow::Cow::Borrowed(bytes))
+}
+
+/// The shared container for `bytes`, which are kept as they are when they
+/// come owned and no pipeline had them yet (a container put together from
+/// loose pieces, [`pieces`]: read from title memory once, into this).
+fn shader_of(stage: &'static str, bytes: std::borrow::Cow<[u8]>) -> Arc<Shader> {
+    let full = blake3::hash(&bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
@@ -113,9 +120,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient: (stage == "compute").then(|| crate::ambient::role(&bytes)).flatten(),
+                container: bytes.into_owned(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
@@ -189,20 +196,19 @@ impl Shader {
 impl Shader {
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
-        use victory_shader::{Container, FourCC};
+        use victory_shader::Container;
         let c = Container::parse(&self.container).ok()?;
-        let part = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
-        victory_shader::native_programs(part.data).ok()
+        victory_shader::native_programs(c.native_part()?.data).ok()
     }
 }
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let programs = match c.native_part() {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
@@ -783,6 +789,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod pieces;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

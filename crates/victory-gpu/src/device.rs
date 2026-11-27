@@ -356,6 +356,12 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// methods can be written.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
+///
+/// With `VICTORY_PIPELINE_PIECES=1` the pipeline is made from the pieces
+/// the description names (`pipeline::pieces`, which has the layouts), on
+/// this thread, the title's: a call reads and hashes its pieces and leaves
+/// translation to the workers. A description that cannot be made answers
+/// as above.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -371,6 +377,42 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     }
     #[cfg(windows)]
     dump_unknown_pipeline(SLOT, calls, desc);
+    // `VICTORY_PIPELINE_PIECES=1` (read once, off by default): make the
+    // pipeline from the loose pieces the description names
+    // (`pipeline::pieces`): a compute pipeline for 0x218, a graphics
+    // pipeline for 0x1c8. A description that is not understood well enough
+    // to draw right is refused there with its reason, which is logged once
+    // per distinct reason, and the call then answers as it does with the
+    // switch unset. Unset, nothing below this comment is different from
+    // before the switch existed.
+    #[cfg(windows)]
+    {
+        use std::sync::{Mutex, OnceLock};
+        static PIECES: OnceLock<bool> = OnceLock::new();
+        if *PIECES.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES").is_ok_and(|v| v == "1")) {
+            let made = match SLOT {
+                0x218 => crate::pipeline::pieces::compute(desc, _iid, out),
+                _ => crate::pipeline::pieces::graphics(desc, _iid, out),
+            };
+            match made {
+                Ok(answer) => return answer,
+                Err(why) => {
+                    // (a handful of reasons at most: each is a string of
+                    // the parsers', so the list stays short)
+                    static REFUSED: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+                    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+                    if !refused.contains(&why) {
+                        refused.push(why);
+                        tracing::warn!(
+                            slot = format_args!("{:#x}", SLOT),
+                            calls,
+                            "a pipeline is not made from its pieces: {why} (logged once for this reason)"
+                        );
+                    }
+                }
+            }
+        }
+    }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
