@@ -126,6 +126,87 @@ const SWEEP: usize = 128;
 /// Frames after an arena could not be had before another is asked for.
 const ARENA_AGAIN: u64 = 30;
 
+/// Whether what [`Memory::land`] stores at a submission reaches that
+/// submission's sends (`VICTORY_MEMORY_LAND_SENT=1`, off by default).
+///
+/// Where the bytes are: title memory -> the arena (our memory, the copy's
+/// "title memory") -> the copy's CPU side -> the submission's send memory
+/// -> the card. With `VICTORY_JOIN_PARTS` above 1 the submission refreshes
+/// every copy in front of its steps (`refresh_front` in `crate::host`),
+/// and a later refresh of the same span in that submission is dropped.
+/// `land` runs as a step, after that refresh: what it stores into an arena
+/// (a packed structure streamed in between recording and submission, a
+/// directory entry of a page placed then) is in the arena, not in the CPU
+/// side the sends are taken from, so the submission sends the old bytes
+/// and the right ones follow with the next refresh, after the builder's
+/// dispatch read the old ones. With the switch the pages `land` stored are
+/// noted here ([`landed`]) and the submission refreshes them once more
+/// after its steps and before its sends, as it did before refreshes ran in
+/// front. No hop is added: the refresh the next submission would have done
+/// moves into this one. Only with the title's ray tracing; it is a matter
+/// of order, not of frame time. If "stored at submissions" on the line
+/// stays 0 over a streaming run, the case does not happen.
+fn land_sent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_LAND_SENT").is_some_and(|v| v == "1"))
+}
+
+/// With [`land_sent`]: the copies and whole pages of them stored at
+/// submissions, for the submission to refresh after its steps. Apart from
+/// the mutex: the submitting thread drains it without taking that.
+static LANDED: Mutex<Vec<(Arc<Shadow>, usize, usize)>> = Mutex::new(Vec::new());
+static LANDED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Since the last report: bytes stored at submissions by `land`, `place`
+/// and `gone`, and bytes of stale pages the submissions then read into the
+/// CPU side for them (pages read, not bytes that differed).
+static LANDED_BYTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `[from, to)` rounded out to whole pages and cut to the copy's span
+/// `[first, first + len)`: a page refreshed whole is noted as taken, one
+/// refreshed in part is read again by the next refresh.
+fn whole_pages(from: usize, to: usize, first: usize, len: usize) -> Option<(usize, usize)> {
+    let page = PAGE as usize;
+    let (a, b) = ((from / page * page).max(first), to.div_ceil(page).saturating_mul(page).min(first + len));
+    (from < to && a < b).then_some((a, b))
+}
+
+/// Runs by copy (`key`), those of one copy that overlap or touch as one.
+fn joined<T: Clone>(mut runs: Vec<(usize, T, usize, usize)>) -> Vec<(T, usize, usize)> {
+    runs.sort_by_key(|r| (r.0, r.2));
+    let mut out: Vec<(usize, T, usize, usize)> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match out.last_mut() {
+            Some(last) if last.0 == run.0 && run.2 <= last.3 => last.3 = last.3.max(run.3),
+            _ => out.push(run),
+        }
+    }
+    out.into_iter().map(|(_, t, a, b)| (t, a, b)).collect()
+}
+
+/// Notes `[from, to)` of `copy` as stored at a submission ([`land_sent`]).
+fn note_landed(copy: &Arc<Shadow>, from: usize, to: usize) {
+    let (first, len) = copy.span();
+    let Some((a, b)) = whole_pages(from, to, first as usize, len as usize) else { return };
+    LANDED.lock().unwrap_or_else(|e| e.into_inner()).push((copy.clone(), a, b));
+    LANDED_ANY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// On the submitting thread, after a submission's steps: the pages of
+/// copies stored at it ([`land_sent`]), whole pages, joined by copy. Empty
+/// without the switch; takes no lock while nothing was noted.
+pub(crate) fn landed() -> Vec<(Arc<Shadow>, usize, usize)> {
+    if !land_sent() || !LANDED_ANY.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    let noted = std::mem::take(&mut *LANDED.lock().unwrap_or_else(|e| e.into_inner()));
+    joined(noted.into_iter().map(|(copy, a, b)| (Arc::as_ptr(&copy) as usize, copy, a, b)).collect())
+}
+
+/// The bytes a submission read into a CPU side for [`landed`]'s pages.
+pub(crate) fn landed_read(bytes: usize) {
+    LANDED_BYTES[1].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Whether the next arena is made ahead, by a thread of its own
 /// (`VICTORY_MEMORY_ARENAS_AHEAD=1`, off by default; with it unset no
 /// thread is started and [`Memory::another`] makes every arena as before).
@@ -625,6 +706,15 @@ impl Memory {
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
+                // At a submission the place may be given again by `place`
+                // in the same `land`: the card's directory learns of the
+                // zero with this submission ([`land_sent`]). (Gone between
+                // submissions, the note costs the next one a page's look.)
+                if land_sent() {
+                    let entry = self.entry(page) as usize;
+                    crate::watch::wrote(entry, 8);
+                    note_landed(&self.directory.1, entry, entry + 8);
+                }
             }
         }
         self.stats.gone += 1;
@@ -830,6 +920,13 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        // The entry goes up with this submission, with the page's bytes
+        // ([`land_sent`]).
+        if land_sent() {
+            let entry = self.entry(page) as usize;
+            note_landed(&self.directory.1, entry, entry + 8);
+            LANDED_BYTES[0].fetch_add(8, std::sync::atomic::Ordering::Relaxed);
+        }
         self.take(page, 0, PAGE as usize, true);
         true
     }
@@ -851,10 +948,22 @@ impl Memory {
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
                 crate::watch::wrote(held.at + at, n);
+                if land_sent() {
+                    note_landed(shadow, held.at + at, held.at + at + n);
+                    LANDED_BYTES[0].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             at += n;
         }
         if whole {
+            // Told and noted whether the bytes differed or not: a list
+            // thread's `bring` may have stored them after the refresh in
+            // front of the steps, and then nothing above tells of them while
+            // the CPU side still holds the old ones ([`land_sent`]).
+            if land_sent() && from < to {
+                crate::watch::wrote(held.at + from, to - from);
+                note_landed(shadow, held.at + from, held.at + to);
+            }
             shadow.resend(base + from, base + to);
         }
     }
@@ -1077,6 +1186,14 @@ impl Memory {
             s.sized[1] as f64 / frames,
             s.no_arena,
         );
+        if land_sent() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let [stored, read] = [0, 1].map(|i| LANDED_BYTES[i].swap(0, Relaxed) as f64 / 1e6 / frames);
+            tracing::info!(
+                "title memory by address, per frame (VICTORY_MEMORY_LAND_SENT=1): {stored:.2} MB stored at submissions by \
+                 landing, {read:.2} MB of stale pages read into the CPU side behind it for the same submission's sends"
+            );
+        }
         if arenas_ahead() {
             use std::sync::atomic::Ordering::Relaxed;
             let [made, micros, failed] = [0, 1, 2].map(|i| AHEAD_STATS[i].swap(0, Relaxed));
@@ -1726,6 +1843,21 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What is noted for a submission is whole pages of the copy, cut to its
+    /// span, and runs of one copy that meet are joined.
+    #[test]
+    fn landed_pages_are_whole_and_joined_by_copy() {
+        let page = PAGE as usize;
+        let first = 16 * page;
+        assert_eq!(whole_pages(first + 10, first + 20, first, 4 * page), Some((first, first + page)));
+        assert_eq!(whole_pages(first - 10, first + page + 1, first, 4 * page), Some((first, first + 2 * page)));
+        assert_eq!(whole_pages(first + 3 * page + 1, first + 9 * page, first, 4 * page), Some((first + 3 * page, first + 4 * page)));
+        assert_eq!(whole_pages(first + 8, first + 8, first, 4 * page), None);
+        assert_eq!(whole_pages(first + 5 * page, first + 6 * page, first, 4 * page), None);
+        let runs = vec![(2, 'b', 0, 10), (1, 'a', 20, 30), (1, 'a', 0, 10), (1, 'a', 10, 15), (2, 'b', 5, 40)];
+        assert_eq!(joined(runs), vec![('a', 0, 15), ('a', 20, 30), ('b', 0, 40)]);
+    }
 
     /// An arena is wanted ahead while fewer than twice the spare pages are
     /// free, and only with room for all of its pages and for its number.
