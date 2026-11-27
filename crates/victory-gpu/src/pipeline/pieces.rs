@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(s.depth.DepthFunc, D3D12_COMPARISON_FUNC_ALWAYS);
         // A factor outside the table, and masks that differ by face.
         let mut odd = packet.clone();
-        put(&mut odd, 0xd0, over | 13);
+        put(&mut odd, 0xd0, over | 11);
         assert!(state_of(&Graphics::parse(&odd, &state_piece(), false).unwrap()).is_err());
         let mut faces = packet.clone();
         put(&mut faces, 0xc4, 1 << 24);
