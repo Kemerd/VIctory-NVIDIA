@@ -348,6 +348,8 @@ struct Lower<'a> {
     block: Vec<Option<usize>>,
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
+    /// The masks the program asked for (not the parts of them, nor what joins bring in).
+    mask_roots: HashSet<Bool>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
@@ -2105,6 +2107,7 @@ impl<'a> Lower<'a> {
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
+            mask_roots: HashSet::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
@@ -4516,6 +4519,11 @@ impl<'a> Lower<'a> {
     // ---- lane booleans ----
 
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
+        self.mask_roots.insert(b);
+        self.boolean_in(b, at)
+    }
+
+    fn boolean_in(&mut self, b: Bool, at: usize) -> Result<V, Why> {
         if b == Bool::TRUE || b == Bool::FALSE {
             return Ok(self.s.m.bool(b == Bool::TRUE));
         }
@@ -4532,16 +4540,16 @@ impl<'a> Lower<'a> {
                 m.bin(at, Bin::Xor, a, t)
             }
             (Bool::FALSE, h) => {
-                let h = self.boolean(h, at)?;
+                let h = self.boolean_in(h, at)?;
                 self.s.m.bin(at, Bin::And, a, h)
             }
             (l, Bool::TRUE) => {
-                let l = self.boolean(l, at)?;
+                let l = self.boolean_in(l, at)?;
                 self.s.m.bin(at, Bin::Or, a, l)
             }
             (l, h) => {
-                let l = self.boolean(l, at)?;
-                let h = self.boolean(h, at)?;
+                let l = self.boolean_in(l, at)?;
+                let h = self.boolean_in(h, at)?;
                 self.s.m.select(at, a, h, l)
             }
         };
@@ -13963,6 +13971,7 @@ impl<'a> Lower<'a> {
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
         let st = self.x.st;
+        let mut blind = Vec::new();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -13974,7 +13983,17 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
+                // What a join brings is not itself a root: it is seen where the join is read.
+                let x = match self.boolean_in(args[n], qb) {
+                    Ok(x) => x,
+                    // Not a mask in this lowering; fine if no lane that takes the edge can
+                    // tell (checked below, once everything the program asks for is known).
+                    Err(w) if st.phi_lanes_has(phi.value, n) => {
+                        blind.push(((phi.value, n), offset, w));
+                        self.s.m.bool(false)
+                    }
+                    Err(w) => return Err(unsupported(offset, w)),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -14099,6 +14118,12 @@ impl<'a> Lower<'a> {
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
+        }
+        if let Some(&(_, offset, why)) = blind.first() {
+            let asked: Vec<_> = blind.iter().map(|b| b.0).collect();
+            if !st.unseen(&self.mask_roots, &asked) {
+                return Err(unsupported(offset, why));
+            }
         }
         Ok(())
     }
@@ -14381,6 +14406,37 @@ mod tests {
             vec![buffer],
         )
         .map(|_| ())
+    }
+
+    /// A mask register that holds a number (s0, a root constant) on the edge a branch takes when
+    /// no lane is left, and a compare on the other: where the join is only read with the EXEC
+    /// those lanes had, no lane can tell what it held there.
+    #[test]
+    fn a_number_where_a_mask_joins_on_an_edge_no_lane_reads_lowers() {
+        let body = |read: u32, after_restore: bool| {
+            let mut w = vec![
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE94_0300, // s_mov_b32 s20, s0
+                0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+                0xBF88_0002, // s_cbranch_execz -> join
+                0xD4C2_0014,
+                0x0002_0080, // v_cmp_eq_u32 s20, 0, v0
+            ];
+            if after_restore {
+                w.push(0x887E_157E); // s_or_b32 exec_lo, exec_lo, s21
+            }
+            // v_cndmask_b32 v0, v1, v2, s<read>
+            w.extend([0xD501_0000, 257 | 258 << 9 | read << 18]);
+            w
+        };
+        // The join read through `s_and s22, s20, exec_lo`, before EXEC is restored.
+        let mut masked = body(22, false);
+        masked.splice(6..6, [0x8716_7E14]); // s_and_b32 s22, s20, exec_lo
+        lowers_valu(&masked).expect("a read masked by the EXEC of the skipped lanes");
+        // The join read as it is once EXEC is back: the skipped lanes see it.
+        let raw = body(20, true);
+        let refusal = lowers_valu(&raw).expect_err("a read the skipped lanes make").to_string();
+        assert!(refusal.contains("an opaque lane mask"), "{refusal}");
     }
 
     #[test]
