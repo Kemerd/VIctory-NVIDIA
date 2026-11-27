@@ -1160,8 +1160,9 @@ impl Graphics {
         };
         sizes(code, metadata, GRAPHICS_METADATA.1)?;
         // Each parameter read, once, then the system values the packet
-        // enables: the position (bits 8-11) where the vertex program has
-        // it, the front face (bit 12) after it.
+        // enables: the position (bits 8-11, or 15 for the fixed-point one,
+        // which the lowering takes from it) where the vertex program has it,
+        // the front face (bit 12) after it.
         // (an input that is a constant reads no parameter)
         let mut read: Vec<u32> = pixel
             .controls
@@ -2145,6 +2146,32 @@ mod tests {
             rows(&vs_bytes, FourCC::ISG1),
             [(0, 0, 3, 0), (0, 0, 3, 1), (0, 0, 3, 2)]
         );
+    }
+
+    #[test]
+    fn the_fixed_point_position_declares_the_position() {
+        let mut packet = graphics_packet(true, 3, &[(0, false), (2, true), (1, false)]);
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let isg = |packet: &[u8]| {
+            let g = Graphics::parse(packet, &state_piece(&ELEMENTS), true).unwrap();
+            let bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+            let c = crate::Container::parse(&bytes).unwrap();
+            let part = c.part(FourCC::ISG1).unwrap().data;
+            // (system value, register) of each row
+            (0..u32_at(part, 0).unwrap() as usize)
+                .map(|i| {
+                    let at = 8 + 32 * i;
+                    (u32_at(part, at + 12).unwrap(), u32_at(part, at + 20).unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(isg(&packet), [(0, 0), (0, 1), (0, 2)]);
+        // POS_FIXED_PT alone: the position row after the parameters, as for POS_X.
+        put(&mut packet, G_PS_INPUT_ADDR, 0x8002);
+        assert_eq!(isg(&packet), [(0, 0), (0, 1), (0, 2), (1, 3)]);
+        put(&mut packet, G_PS_INPUT_ADDR, 0x0102);
+        assert_eq!(isg(&packet), [(0, 0), (0, 1), (0, 2), (1, 3)]);
     }
 
     #[test]
