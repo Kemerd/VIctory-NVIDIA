@@ -8746,10 +8746,23 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            let r = match v.dpp {
+                // src0 read from another lane, as for the other VALU operations. The types
+                // that take their sources by `fsrc` and `src`; a lane the row or bank mask
+                // (or the row's edge) leaves out has no defined bit to give.
+                Some(d) if rest.ends_with("_f32") || rest.ends_with("_u32") || rest.ends_with("_i32") => {
+                    self.dpp(inst, d).and_then(|(x, enable)| {
+                        if enable.is_some() || matches!(d, Dpp::Row { row_mask, bank_mask, .. } if row_mask != 0xF || bank_mask != 0xF) {
+                            return Err("a compare with DPP lanes left out");
+                        }
+                        self.src0 = Some(x);
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        r
+                    })
+                }
+                Some(_) => Err("a compare with DPP"),
+                None => self.compare(inst, rest),
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {

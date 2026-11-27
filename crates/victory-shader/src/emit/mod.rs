@@ -1991,6 +1991,27 @@ mod tests {
         }
     }
 
+    /// A compare whose first operand is read from another lane of its quad (DPP `quad_perm`,
+    /// the pixel layout's own groups) compares what that lane holds: a select on its bit
+    /// translates. Row and bank masks leave lanes without a bit, so those stay refused.
+    #[test]
+    fn a_compare_with_a_quad_permuted_operand_translates() {
+        let select = |ctrl_word: u32| {
+            [
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7E04_0282, // v_mov_b32 v2, 2
+                0x7C08_02FA, // v_cmp_gt_f32 vcc, v0 (DPP), v1
+                ctrl_word,
+                0x0206_0501, // v_cndmask_b32 v3, v1, v2, vcc
+            ]
+        };
+        // quad_perm:[2,3,0,1], row_mask 0xf, bank_mask 0xf
+        exports_v3(&select(0xFF00_4E00)).unwrap();
+        // bank_mask 0xa
+        let e = exports_v3(&select(0xFA00_4E00)).unwrap_err().to_string();
+        assert!(e.contains("a compare with DPP"), "{e}");
+    }
+
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
     /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
     /// written with (the compare's, EXEC's on entry). Now the store refuses;
