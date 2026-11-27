@@ -106,8 +106,22 @@ call can be tied to its slot without guessing from a dispatch's root views.
   Frames then took 8 to 20 s and the watchdog ended the run again. The
   recording threads spent 36 s a frame against 95 ms without the builder;
   the fault budget (2,048 pages for a run) was used up while some 2,500
-  pages a frame were still found without a copy. Cause under measurement
-  (the by-address line now splits its time by section).
+  pages a frame were still found without a copy. The cause, found in rt-4
+  with the by-address line's time split by section: the twentieth arena
+  could not be had (no hole of 64 MiB left in [4 GiB, 2^37), where the
+  title's own memory lies) and every builder dispatch asked for it again,
+  5 to 18 s of every frame under the module's mutex. Fixed: arenas fall
+  back to anywhere below 2^40 and a failure backs off (`memory.rs`
+  `another`, `upload.rs` `reserve_out_of_reach`).
+- rt-3: the same settings, and the address space happened to have room: 25
+  arenas, no failure, 75 ms a frame in the world at the end.
+- rt-4: the builder's calls size the structures (`structure_extent`); the
+  run ended as rt-2 did, at 19 arenas.
+- rt-5: with the arena fix, 23 arenas and no failure. Root views sized by
+  the builder's calls 150 to 430 a frame, by a guess 6 to 100; pages found
+  without a copy 250 to 430 a frame (830 in rt-3), cause not found yet.
+  About 300 ms a frame while the world's host pipelines were being made,
+  66 to 79 ms after.
 
 ## Not known yet
 
