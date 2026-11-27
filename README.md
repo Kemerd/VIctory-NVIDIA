@@ -14,17 +14,18 @@ Put both next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`
 
 ## The launcher, `PLAY.cmd`
 
-Enter starts with the recommended settings, or with your last ones. **C** walks through nine choices:
+Enter starts with the recommended settings, or with your last ones. **C** walks through ten choices:
 
 1. **Resolution:** 2560x1440, 1920x1080 upscaled to 1440, 3840x2160, **5120x1440 (32:9)**, **3440x1440 (21:9)**, 2560x1080, or any width x height.
 2. **Window:** fullscreen with no border (default) or in a window.
 3. **Console profile:** Series X, the default and the one to use. Series S (1280x720 inside, much softer) is only for weaker cards.
 4. **DLSS:** Quality, Balanced, Performance, DLAA or off.
 5. **Frame generation:** ready to switch on in F1, **2x to 6x** from the start (3x and up need an RTX 50), or not loaded.
-6. **HDR10** on or off (turn Windows HDR on first).
-7. **Frame cap:** none, 30, 60, 120, 144 or any.
-8. **Interface on ultrawide screens:** kept 16:9 in the middle, or stretched.
-9. **Speed:** fast (recommended), plain (the official release's settings), or fast with the title's own ray tracing (experimental, 5-8 fps).
+6. **NVIDIA Reflex:** on + boost (default), on, or off (frame generation turns it on anyway).
+7. **HDR10** on or off (turn Windows HDR on first).
+8. **Frame cap:** none, 30, 60, 120, 144 or any.
+9. **Interface on ultrawide screens:** kept 16:9 in the middle, or stretched.
+10. **Speed:** fast (recommended), plain (the official release's settings), or fast with the title's own ray tracing (experimental, 5-8 fps).
 
 The choices are remembered; `PLAY.cmd last` starts with no questions. The launcher's resolution, DLSS, frame
 generation and HDR choices win over the ones the F1 menu saved; every other F1 choice is kept.
@@ -42,7 +43,7 @@ generation and HDR choices win over the ones the F1 menu saved; every other F1 c
   library, instead of about 1,100 being made again by the driver every run (1.4 s each).
 - **32:9 and HDR10.** The display mode is patched wider, so the camera, culling and motion vectors are made for
   the wide picture; the interface stays 16:9 in the middle. The upload memory that crashed 32:9 runs is fixed.
-- **NVIDIA Reflex.** Low latency mode is on by itself whenever frame generation is on, which takes back much of the delay generated frames add. Without frame generation, turn it on (or on + boost) in the F1 menu under REFLEX.
+- **NVIDIA Reflex.** Low latency mode is on by itself whenever frame generation is on, which takes back much of the delay generated frames add. The launcher turns it on with boost by default.
 - **Ray tracing.** The title's own builder calls are interposed (`VICTORY_RT_NATIVE=1`). It works, at 5-8 fps.
   Next: a builder of our own and the title's two traversal loop shapes on RayQuery, then DLSS Ray Reconstruction.
 
@@ -76,8 +77,11 @@ Everything below is the upstream README.
   generation files (about 70 MB) from NVIDIA's own GitHub. They are NVIDIA's
   and are not part of this program; say no and the game still runs, with its
   own upscaling and no frame generation.
-- Nothing is written into your game folder: settings, saves, caches, logs and
-  NVIDIA's files are kept under `%LOCALAPPDATA%\victory`.
+- Nothing is written into your game folder but crash files: settings, saves,
+  caches, logs and NVIDIA's files are kept under `%LOCALAPPDATA%\victory`.
+- **If it crashes,** it leaves `crash-<time>.log` (the run's log, ending with
+  the crash report) and `crash-<time>.dmp` (a small minidump) next to
+  `PLAY.cmd`, and the launcher names them. Send both.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.

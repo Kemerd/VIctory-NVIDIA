@@ -29,6 +29,7 @@ set "C_FAST=1"
 set "C_RT=0"
 set "C_UI=band"
 set "C_WIN=full"
+set "C_REFLEX=boost"
 if exist "%LAST%" call "%LAST%"
 
 if /i "%~1"=="last" goto :go
@@ -48,7 +49,7 @@ if /i not "%A%"=="C" goto :go
 
 rem ---- 1. resolution ----
 cls
-echo 1/9  Resolution (output)
+echo 1/10  Resolution (output)
 echo   1. 2560x1440  16:9                        (recommended)
 echo   2. 1920x1080 rendered, upscaled to 2560x1440
 echo   3. 3840x2160  16:9  (4K)
@@ -73,7 +74,7 @@ if "%A%"=="7" (
 
 rem ---- 2. window ----
 cls
-echo 2/9  Window
+echo 2/10  Window
 echo   1. Fullscreen, no border   (recommended; fills the whole screen)
 echo   2. In a window
 set "A="
@@ -83,7 +84,7 @@ if "%A%"=="2" set "C_WIN=window"
 
 rem ---- 3. console profile ----
 cls
-echo 3/9  Console profile
+echo 3/10  Console profile
 echo   1. Series X   (default: the full-detail profile)
 echo   2. Series S   (only for weaker cards: 1280x720 inside, much softer)
 set "A="
@@ -93,7 +94,7 @@ if "%A%"=="2" set "C_CONSOLE=s"
 
 rem ---- 3. DLSS ----
 cls
-echo 4/9  DLSS upscaling
+echo 4/10  DLSS upscaling
 echo   1. Quality       (recommended)
 echo   2. Balanced
 echo   3. Performance
@@ -109,7 +110,7 @@ if "%A%"=="5" set "C_DLSS=off"
 
 rem ---- 4. frame generation ----
 cls
-echo 5/9  DLSS frame generation   (needs DLSS on; RTX 40 or later; 3x-6x need an RTX 50)
+echo 5/10  DLSS frame generation   (needs DLSS on; RTX 40 or later; 3x-6x need an RTX 50)
 echo   1. Ready, off   (switch it on in the F1 menu while playing; recommended)
 echo   2. 2x
 echo   3. 3x
@@ -127,9 +128,21 @@ if "%A%"=="5" set "C_FG=5"
 if "%A%"=="6" set "C_FG=6"
 if "%A%"=="7" set "C_FG=none"
 
+rem ---- reflex ----
+cls
+echo 6/10  NVIDIA Reflex   (lower input lag; always on with frame generation)
+echo   1. On + boost   (recommended)
+echo   2. On
+echo   3. Off          (frame generation still turns it on)
+set "A="
+set /p A=Choice [1]:
+set "C_REFLEX=boost"
+if "%A%"=="2" set "C_REFLEX=on"
+if "%A%"=="3" set "C_REFLEX=off"
+
 rem ---- 5. HDR ----
 cls
-echo 6/9  HDR10   (turn Windows HDR on first)
+echo 7/10  HDR10   (turn Windows HDR on first)
 echo   1. Off
 echo   2. On
 set "A="
@@ -139,7 +152,7 @@ if "%A%"=="2" set "C_HDR=1"
 
 rem ---- 6. frame rate cap ----
 cls
-echo 7/9  Frame rate cap
+echo 8/10  Frame rate cap
 echo   1. None        (recommended)
 echo   2. 30   (the game's own rate)
 echo   3. 60
@@ -157,7 +170,7 @@ if "%A%"=="6" set /p C_FPS=Frames a second, 1 to 1000:
 
 rem ---- 7. interface on wide screens ----
 cls
-echo 8/9  Menus and interface on ultrawide screens   (16:9 screens: no difference)
+echo 9/10  Menus and interface on ultrawide screens   (16:9 screens: no difference)
 echo   1. Kept 16:9 in the middle, black bars   (recommended)
 echo   2. Stretched over the whole width
 set "A="
@@ -167,7 +180,7 @@ if "%A%"=="2" set "C_UI=stretch"
 
 rem ---- 8. speed and experiments ----
 cls
-echo 9/9  Speed settings
+echo 10/10  Speed settings
 echo   1. Fast: pipelines from pieces, parallel submitting thread   (recommended)
 echo   2. Plain: the official release's settings only
 echo   3. Fast + the game's own ray tracing   (EXPERIMENTAL: works, but 5-8 fps)
@@ -191,6 +204,7 @@ if not exist "%HOME_V%" mkdir "%HOME_V%" >nul 2>nul
   echo set "C_RT=%C_RT%"
   echo set "C_UI=%C_UI%"
   echo set "C_WIN=%C_WIN%"
+  echo set "C_REFLEX=%C_REFLEX%"
 ) > "%LAST%" 2>nul
 
 :go
@@ -202,6 +216,7 @@ if not "%C_FG%"=="ready" if not "%C_FG%"=="none" set "ARGS=!ARGS! --framegen %C_
 if not "%C_WIDE%"=="" set "ARGS=!ARGS! --set VICTORY_DISPLAY_WIDE=%C_WIDE%"
 set "ARGS=!ARGS! --set VICTORY_HDR=%C_HDR%"
 if "%C_UI%"=="stretch" set "ARGS=!ARGS! --set VICTORY_UI_LETTERBOX=0"
+if not "%C_REFLEX%"=="off" set "ARGS=!ARGS! --set VICTORY_REFLEX=%C_REFLEX%"
 if "%C_WIN%"=="full" (set "ARGS=!ARGS! --set VICTORY_FULLSCREEN=1") else (set "ARGS=!ARGS! --set VICTORY_FULLSCREEN=0")
 if "%C_RT%"=="1" set "ARGS=!ARGS! --set VICTORY_RT_NATIVE=1"
 rem the official release's loading fix, always
@@ -213,7 +228,7 @@ rem rate choices, and those would win over this launcher's: drop them, keep
 rem every other F1 choice.
 set "SETS=%HOME_V%\victory-settings.txt"
 if exist "%SETS%" (
-  findstr /v /b /i /c:"VICTORY_MENU_RES=" /c:"VICTORY_MENU_DLSS=" /c:"VICTORY_MENU_FRAMEGEN=" /c:"VICTORY_MENU_FPS=" /c:"VICTORY_MENU_CONSOLE=" /c:"VICTORY_HDR=" /c:"VICTORY_DISPLAY_WIDE=" /c:"VICTORY_RT_NATIVE=" /c:"VICTORY_UI_LETTERBOX=" /c:"VICTORY_FULLSCREEN=" "%SETS%" > "%SETS%.tmp" 2>nul
+  findstr /v /b /i /c:"VICTORY_MENU_RES=" /c:"VICTORY_MENU_DLSS=" /c:"VICTORY_MENU_FRAMEGEN=" /c:"VICTORY_MENU_FPS=" /c:"VICTORY_MENU_CONSOLE=" /c:"VICTORY_HDR=" /c:"VICTORY_DISPLAY_WIDE=" /c:"VICTORY_RT_NATIVE=" /c:"VICTORY_UI_LETTERBOX=" /c:"VICTORY_FULLSCREEN=" /c:"VICTORY_REFLEX=" "%SETS%" > "%SETS%.tmp" 2>nul
   if exist "%SETS%.tmp" move /y "%SETS%.tmp" "%SETS%" >nul
 )
 
@@ -221,7 +236,20 @@ echo.
 call :show
 echo.
 echo Starting...  F1 settings menu, F3 stats.
+rem a crash leaves crash-<run>.log and crash-<run>.dmp next to this file
+set "BEFORE="
+for /f "delims=" %%F in ('dir /b /o-d "%~dp0crash-*.log" 2^>nul') do if not defined BEFORE set "BEFORE=%%F"
 "%VX%" play !ARGS!
+set "AFTER="
+for /f "delims=" %%F in ('dir /b /o-d "%~dp0crash-*.log" 2^>nul') do if not defined AFTER set "AFTER=%%F"
+if defined AFTER if not "!AFTER!"=="!BEFORE!" (
+  echo.
+  echo The game crashed. Send these two files from this folder:
+  echo   !AFTER!
+  echo   !AFTER:.log=.dmp!
+  echo.
+  pause
+)
 endlocal
 exit /b 0
 
@@ -250,6 +278,9 @@ if "%C_FG%"=="ready" set "S_FG=ready, switch on in F1"
 if "%C_FG%"=="none" set "S_FG=not loaded"
 set "S_FPS=%C_FPS%"
 if "%C_FPS%"=="1000" set "S_FPS=none"
+set "S_REFLEX=on + boost"
+if "%C_REFLEX%"=="on" set "S_REFLEX=on"
+if "%C_REFLEX%"=="off" set "S_REFLEX=off (on with frame generation)"
 set "S_HDR=off"
 if "%C_HDR%"=="1" set "S_HDR=on"
 set "S_SPEED=plain"
@@ -264,6 +295,7 @@ echo   Window          !S_WIN!
 echo   Console         Series %C_CONSOLE%
 echo   DLSS            %C_DLSS%
 echo   Frame gen       !S_FG!
+echo   Reflex          !S_REFLEX!
 echo   HDR10           !S_HDR!
 echo   Frame cap       !S_FPS!
 echo   Wide interface  !S_UI!
