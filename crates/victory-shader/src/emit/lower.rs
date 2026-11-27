@@ -9396,6 +9396,50 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_ldexp_f32" => {
+                // D = S0 * 2^S1 with S1 a signed integer. One multiply by 2^n
+                // overflows its own scale for |n| > 127, so the exponent is
+                // clamped (the result is then inf or zero anyway) and applied
+                // in steps. Down-steps of 2^-102 keep the last multiply exact
+                // above the denormal range, so a denormal result is rounded
+                // once, as the hardware does (the musl scalbnf scheme).
+                let mut y = f(self, 0)?;
+                let n = s(self, 1)?;
+                let (lo, hi) = (self.s.m.i32((-300i32) as u32), self.s.m.i32(300));
+                let t = self.s.m.cmp(c, pred::SGT, n, lo);
+                let n = self.s.m.select(c, t, n, lo);
+                let t = self.s.m.cmp(c, pred::SLT, n, hi);
+                let mut n = self.s.m.select(c, t, n, hi);
+                let (k127, km126, zero) = (
+                    self.s.m.i32(127),
+                    self.s.m.i32((-126i32) as u32),
+                    self.s.m.i32(0),
+                );
+                let (up, down, one) = (
+                    self.s.m.f32(0x7F00_0000),
+                    self.s.m.f32(0x0C80_0000),
+                    self.s.m.f32(1.0f32.to_bits()),
+                );
+                for _ in 0..2 {
+                    let big = self.s.m.cmp(c, pred::SGT, n, k127);
+                    let small = self.s.m.cmp(c, pred::SLT, n, km126);
+                    let sd = self.s.m.select(c, small, down, one);
+                    let scale = self.s.m.select(c, big, up, sd);
+                    y = self.s.m.bin(c, Bin::Mul, y, scale);
+                    let (k102, km127) = (self.s.m.i32(102), self.s.m.i32((-127i32) as u32));
+                    let ds = self.s.m.select(c, small, k102, zero);
+                    let step = self.s.m.select(c, big, km127, ds);
+                    n = self.s.m.bin(c, Bin::Add, n, step);
+                }
+                // n is now in [-126, 127] (n <= 300 and 300 - 254 = 46).
+                let k127 = self.s.m.i32(127);
+                let k23 = self.s.m.i32(23);
+                let e = self.s.m.bin(c, Bin::Add, n, k127);
+                let bits = self.s.m.bin(c, Bin::Shl, e, k23);
+                let scale = self.as_float(bits);
+                let r = self.s.m.bin(c, Bin::Mul, y, scale);
+                float(self, r)
+            }
             "v_cvt_f32_f64" => {
                 let (lo, hi) = self.f64_pair(inst, 0)?;
                 let bits = self.f64_to_f32_bits(lo, hi);
