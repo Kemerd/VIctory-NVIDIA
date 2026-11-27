@@ -4,7 +4,7 @@ A fork of [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA), re
 higher frame rates, 32:9 and HDR10, a one-click launcher with every option, and the groundwork for the title's ray
 tracing on the RTX cores.
 
-**Download:** [latest test build](https://github.com/Kemerd/VIctory-NVIDIA-RT/releases) (`victory.exe` + `PLAY.cmd`).
+**Download:** [latest test build](https://github.com/Kemerd/VIctory-NVIDIA-RT/releases) (`victory.exe`, `victory-win10.exe` and `PLAY.cmd`).
 Put both next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`.
 
 | RTX 5090, 2560x1440, DLSS Quality, open world, no frame generation | official settings | this fork (fast) |
@@ -82,6 +82,12 @@ Everything below is the upstream README.
 - **If it crashes,** it leaves `crash-<time>.log` (the run's log, ending with
   the crash report) and `crash-<time>.dmp` (a small minidump) next to
   `PLAY.cmd`, and the launcher names them. Send both.
+- **Windows 10:** the launcher starts `victory-win10.exe`, built with the
+  `agility` feature: it loads Microsoft's D3D12 Agility SDK (shader model
+  6.6) from a `D3D12` folder next to it, which the launcher offers to fetch
+  from Microsoft's NuGet and checks. Windows 11 keeps `victory.exe`, which has
+  no such exports: with them and no `D3D12` folder, Windows 11 refuses to
+  make the device (0x887E0003), which is why upstream PR #10 stayed out.
 - You need Windows 10 or 11, 32 GB of RAM or more, an SSD and an NVIDIA
   GeForce RTX card with a recent driver. This repository and its releases
   contain no game files.

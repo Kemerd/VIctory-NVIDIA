@@ -17,6 +17,14 @@ if not exist "%~dp0game_scarlett_master.exe" (
   pause & exit /b 1
 )
 
+rem ---- Windows 10: Microsoft's D3D12 Agility SDK ----
+rem Windows 10's own D3D12 stops at shader model 6.5 and the game needs 6.6.
+rem victory-win10.exe loads Microsoft's newer runtime from the D3D12 folder.
+set "HERE=%~dp0"
+set "WINBUILD=0"
+for /f "tokens=2 delims=[]" %%V in ('ver') do for /f "tokens=4 delims=. " %%B in ("%%V") do set "WINBUILD=%%B"
+if %WINBUILD% GTR 0 if %WINBUILD% LSS 22000 call :win10
+
 rem ---- defaults (the recommended start) ----
 set "C_CONSOLE=x"
 set "C_RES=1440"
@@ -301,3 +309,39 @@ echo   Frame cap       !S_FPS!
 echo   Wide interface  !S_UI!
 echo   Speed           !S_SPEED!
 exit /b 0
+
+:win10
+if not exist "%HERE%victory-win10.exe" (
+  echo Windows 10: victory-win10.exe is missing next to this file; the game may not start.
+  goto :eof
+)
+if not exist "%HERE%D3D12\D3D12Core.dll" (
+  cls
+  echo Windows 10 needs Microsoft's newer D3D12 runtime for this game
+  echo ^(the D3D12 Agility SDK, about 35 MB^), from Microsoft's own NuGet:
+  echo   https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2
+  echo It goes into a D3D12 folder next to this file, once.
+  set "A="
+  set /p A=Download it now? [Y/n]:
+  if /i "!A!"=="n" goto :eof
+  set "PKG=%TEMP%\victory-d3d12"
+  if exist "!PKG!" rd /s /q "!PKG!"
+  mkdir "!PKG!"
+  "%SystemRoot%\System32\curl.exe" -L --fail -o "!PKG!\d3d12.nupkg" "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.D3D12/1.620.2"
+  "%SystemRoot%\System32\tar.exe" -xf "!PKG!\d3d12.nupkg" -C "!PKG!" build/native/bin/x64/D3D12Core.dll
+  rem only Microsoft's file goes in: its SHA-256 is checked first
+  set "SUM="
+  for /f "skip=1 delims=" %%H in ('certutil -hashfile "!PKG!\build\native\bin\x64\D3D12Core.dll" SHA256 2^>nul') do if not defined SUM set "SUM=%%H"
+  set "SUM=!SUM: =!"
+  if /i "!SUM!"=="70a6d47d335b4a15180544c01a35b84474522a369dc582d85fe057313a3aeaa0" (
+    if not exist "%HERE%D3D12" mkdir "%HERE%D3D12"
+    copy /y "!PKG!\build\native\bin\x64\D3D12Core.dll" "%HERE%D3D12\" >nul
+    echo Done.
+  ) else (
+    echo The download did not work or is not Microsoft's file. Starting without it.
+    pause
+  )
+  rd /s /q "!PKG!" 2>nul
+)
+if exist "%HERE%D3D12\D3D12Core.dll" set "VX=%HERE%victory-win10.exe"
+goto :eof
