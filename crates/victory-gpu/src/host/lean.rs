@@ -13,7 +13,9 @@
 //! - [`spread`] (`VICTORY_REFRESH_PROBE_US`): a small flush is tried here first.
 //! - [`Declared`] (`VICTORY_DECLARE_ACROSS_LISTS=1`): a range shaders write is
 //!   declared once to a copy per submission, not once per list.
-//! - [`ours`] and [`declared`] only count, in every build.
+//! - [`ours`] and [`declared`] only count, and only while a switch of this file
+//!   is on ([`counting`], [`declare_across`]): with all unset the steps are not
+//!   timed and nothing is counted.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -166,7 +168,8 @@ impl Declared {
 /// lists declared them, and those of them that were repeats left out.
 static DECLARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Counts a declaration (`repeat`: left out).
+/// Counts a declaration (`repeat`: left out). Called only with [`declare_across`]
+/// on, so with the switch unset a declaration costs no counting at all.
 pub(super) fn declared(repeat: bool) {
     DECLARED[0].fetch_add(1, Ordering::Relaxed);
     if repeat {
@@ -179,7 +182,15 @@ pub(super) fn declared(repeat: bool) {
 /// and the like are), and their nanoseconds.
 static OURS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Counts a step of ours that took `took`.
+/// Whether the steps of ours are timed: only while one of this file's switches is
+/// on, so that with all of them unset the submitting thread reads no clock and
+/// writes no counter for them. One load of a cell read once.
+pub(super) fn counting() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| declare_across() || probe().is_some())
+}
+
+/// Counts a step of ours that took `took` (the caller timed it under [`counting`]).
 pub(super) fn ours(took: Duration) {
     OURS[0].fetch_add(1, Ordering::Relaxed);
     OURS[1].fetch_add(took.as_nanos() as u64, Ordering::Relaxed);

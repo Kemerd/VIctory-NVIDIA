@@ -191,12 +191,18 @@ const WHY_FULL: usize = 7;
 const WHY_NO_ARENA: usize = 8;
 
 /// The most runs of pages one arena is brought up in by one [`settle`]: each
-/// is a kernel asking of its own, and joined across the smallest gaps they
-/// cost the gap's pages (that were never taken, and go up as zeros) instead.
-const RUNS: usize = 16;
+/// is a kernel asking of its own (about 43 us on the submitting thread, which
+/// is what 130 KB of copying takes, two pages), and joined across the smallest
+/// gaps they cost the gap's pages (that were never taken, and go up as zeros)
+/// instead. A streaming frame settles hundreds of times, so an arena with many
+/// scattered runs must not cost many askings each time: past four the next gap
+/// is cheaper to copy than to ask across.
+const RUNS: usize = 4;
 
 /// Pages a call's pre-asking looks at at most ([`ask_ahead_of_the_mutex`]).
 const PRE: usize = 64;
+/// Refusals one thread keeps for a frame ([`REFUSED`]); past it they are let go.
+const REFUSED_MOST: usize = 4096;
 
 /// Pages given a place in one frame for structures the builder's calls
 /// named that shaders found empty (64 MiB: several top levels of 12 MB).
@@ -1715,6 +1721,17 @@ fn not_ours(page: u64) -> Option<usize> {
 }
 
 thread_local! {
+    /// Pages this thread's pre-asking was told are not the title's memory, with
+    /// the reason, for the frame in the first field. The mutex's `refused`
+    /// keeps a refused page from being asked about twice in a frame; a builder
+    /// frame has a thousand dispatches naming the same constants that only look
+    /// like addresses, so the pre-asking, which runs before that set can be
+    /// read, keeps its own and asks the kernel once a page a frame, not once a
+    /// dispatch.
+    static REFUSED: std::cell::RefCell<(u64, HashMap<u64, usize>)> = std::cell::RefCell::new((0, HashMap::new()));
+}
+
+thread_local! {
     /// The kernel's answers for the pages the call on this thread names
     /// (page, [`not_ours`]), made before it took the mutex.
     static ASKED: std::cell::RefCell<Vec<(u64, Option<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1779,6 +1796,7 @@ fn pages_named(addresses: &[u64], constants: &[u32], builds: bool, extent: impl 
 /// under the mutex.
 fn ask_ahead_of_the_mutex(addresses: &[u64], constants: &[u32], builds: bool) -> Answers {
     let entries = DIRECTORY.load(std::sync::atomic::Ordering::Acquire);
+    let frame = crate::frame::current();
     let mut found = Vec::new();
     for page in pages_named(addresses, constants, builds, structure_extent_from) {
         if !(0x1_0000..u64::from(MEMORY_PAGES) - 1).contains(&page) {
@@ -1788,7 +1806,30 @@ fn ask_ahead_of_the_mutex(addresses: &[u64], constants: &[u32], builds: bool) ->
             LEAN[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
-        found.push((page, not_ours(page)));
+        // A page this thread was told is not the title's earlier in the frame
+        // is answered the same without the kernel, as the mutex's own set does.
+        let again = REFUSED.with(|refused| {
+            let mut refused = refused.borrow_mut();
+            if refused.0 != frame {
+                *refused = (frame, HashMap::new());
+            }
+            refused.1.get(&page).copied()
+        });
+        if let Some(why) = again {
+            found.push((page, Some(why)));
+            continue;
+        }
+        let answer = not_ours(page);
+        if let Some(why) = answer {
+            REFUSED.with(|refused| {
+                let mut refused = refused.borrow_mut();
+                if refused.1.len() >= REFUSED_MOST {
+                    refused.1.clear();
+                }
+                refused.1.insert(page, why);
+            });
+        }
+        found.push((page, answer));
         LEAN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     ASKED.with(|asked| *asked.borrow_mut() = found);

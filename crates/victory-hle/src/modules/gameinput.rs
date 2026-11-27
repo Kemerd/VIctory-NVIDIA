@@ -652,6 +652,19 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // `VICTORY_REFLEX`: the title is about to take a pad or keyboard
+    // reading. A reading that opens a simulation is where Reflex sleeps and
+    // that simulation starts with its input sample, so this comes before
+    // the reading is picked (afterwards a sleep could not make it fresher)
+    // and before our lock is taken (our poll thread must not wait for the
+    // sleep). Here, where the title asks, not where our poll thread reads
+    // the host; whether a reading is then found does not matter, the title
+    // sampled its input either way. A call with nowhere to put a reading
+    // is not one. Nothing without the switch.
+    #[cfg(windows)]
+    if !out.is_null() {
+        victory_gpu::streamline::input_sampling();
+    }
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -678,20 +691,7 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    let taken = found.is_some() && !out.is_null();
-    let hr = hand(out, found);
-    // Our lock goes first: what follows takes one of the renderer's.
-    drop(state);
-    // `VICTORY_REFLEX`: the title has taken a pad or keyboard reading, which
-    // is the frame's input sample for Reflex. Here, where the title asks,
-    // not where our poll thread read the host. Nothing without the switch.
-    #[cfg(windows)]
-    if taken {
-        victory_gpu::streamline::input_sampled();
-    }
-    #[cfg(not(windows))]
-    let _ = taken;
-    hr
+    hand(out, found)
 }
 
 /// The reading after (`forward`) or before `reference` on its device.

@@ -7818,9 +7818,11 @@ impl HostList {
                     // (Counted for the lists' steps line: the part of them
                     // that is neither refreshes nor copies, which was one
                     // number with the walk over the steps.)
-                    let ours = std::time::Instant::now();
+                    let ours = lean::counting().then(std::time::Instant::now);
                     work();
-                    lean::ours(ours.elapsed());
+                    if let Some(ours) = ours {
+                        lean::ours(ours.elapsed());
+                    }
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -7844,7 +7846,9 @@ impl HostList {
                     // of this submission declared to the copy is not
                     // declared again, unless title memory was written since.
                     let repeat = lean::declare_across() && !batch.declared.first(std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
-                    lean::declared(repeat);
+                    if lean::declare_across() {
+                        lean::declared(repeat);
+                    }
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     if !repeat {

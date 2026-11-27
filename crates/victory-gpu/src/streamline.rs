@@ -18,11 +18,14 @@
 //!   of submissions (`VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1`).
 //! - `VICTORY_REFLEX=on` (or `1`) or `boost`: Reflex by itself, whenever
 //!   Streamline is loaded for one of the two above, with or without frame
-//!   generation: `slReflexSleep` where the title's frame begins
-//!   ([`frame_begins`]), each latency marker at its own time with the
-//!   frame's token ([`reflex`] keeps the frames), and every ten seconds a
-//!   line of what `slReflexGetState` reports. Unset, the calls made of
-//!   Streamline are those made before the switch existed.
+//!   generation: `slReflexSleep` where the title asks for the reading that
+//!   opens a frame's simulation ([`input_sampling`]), or where its frame
+//!   begins when it reads input on few frames or none ([`frame_begins`]),
+//!   each latency marker
+//!   at its own time with the frame's token ([`reflex`] keeps the frames
+//!   and says why the sleep goes there), and every ten seconds a line of
+//!   what `slReflexGetState` reports. Unset, the calls made of Streamline
+//!   are those made before the switch existed.
 //! - `VICTORY_STREAMLINE_DIR`: the folder of `sl.interposer.dll`, its plugins
 //!   and NGX's DLLs (default [`DEFAULT_DIR`]).
 //!
@@ -88,9 +91,9 @@ pub struct Asked {
     /// our swap chain is Streamline's proxy of it, so that Streamline sees
     /// the presents (its bookkeeping per frame).
     pub present_hook: bool,
-    /// `VICTORY_REFLEX=on|1|boost`: Reflex by itself (the sleep at each
-    /// frame's begin, the markers at their times); `None`: as without the
-    /// switch.
+    /// `VICTORY_REFLEX=on|1|boost`: Reflex by itself (the sleep before each
+    /// frame's simulation, the markers at their times); `None`: as without
+    /// the switch.
     pub reflex: Option<Reflex>,
 }
 
@@ -255,13 +258,17 @@ static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static DLSS_READY: AtomicBool = AtomicBool::new(false);
 static FG_READY: AtomicBool = AtomicBool::new(false);
 /// Reflex by itself runs (`VICTORY_REFLEX`, its functions found, its options
-/// set): the sleep at each frame's begin and the markers at their times.
-/// While it is false every call made of Streamline is as without the switch.
+/// set): the sleep before each frame's simulation and the markers at their
+/// times. While it is false every call made of Streamline is as without the
+/// switch.
 static REFLEX_READY: AtomicBool = AtomicBool::new(false);
 /// The frames Reflex by itself has markers for, shared by the title's
-/// threads and the presenting one. Held while a frame's markers are sent
-/// (they leave in order), never across the sleep, and never while waiting
-/// for [`CALLS`] (the present takes that one first).
+/// threads and the presenting one. Held from deciding a frame's markers
+/// until their token is made ([`TOKENS`] is then held), and let go before
+/// the markers are sent ([`send_markers`]): so they leave in order without
+/// another thread's submission waiting here for `slPCLSetMarker`. Never
+/// held across the sleep, and never while waiting for [`CALLS`] (the
+/// present takes that one first).
 static REFLEX_FRAMES: Mutex<reflex::Frames> = Mutex::new(reflex::Frames::new());
 /// With Reflex by itself: one frame token is made and in use at a time
 /// ([`Token`] holds this from where the token is made until the call that
@@ -271,13 +278,19 @@ static REFLEX_FRAMES: Mutex<reflex::Frames> = Mutex::new(reflex::Frames::new());
 /// another thread may wait that long ([`REFLEX_TOKEN_WAITS`] says how long
 /// it was).
 static TOKENS: Mutex<()> = Mutex::new(());
-/// Since the last Reflex line: the sleeps, the microseconds they took in
-/// all, and the longest of them.
-static REFLEX_SLEEPS: AtomicU64 = AtomicU64::new(0);
-static REFLEX_SLEPT: AtomicU64 = AtomicU64::new(0);
-static REFLEX_SLEPT_LONGEST: AtomicU64 = AtomicU64::new(0);
+/// Since the last Reflex line, by where the sleep was made ([`AT_READING`],
+/// [`AT_ORIGIN`]): the sleeps, the microseconds they took in all, and the
+/// longest of them.
+static REFLEX_SLEEPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static REFLEX_SLEPT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static REFLEX_SLEPT_LONGEST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// The sleep at the reading that opens a simulation ([`input_sampling`]).
+const AT_READING: usize = 0;
+/// The sleep at the origin wait of a frame with no simulation to take
+/// ([`frame_begins`]).
+const AT_ORIGIN: usize = 1;
 /// A Reflex sleep took longer than [`reflex::SLEEP_TOO_LONG_US`]: none is
-/// asked for any more ([`frame_begins`]); the markers go on.
+/// asked for any more ([`reflex_sleep`]); the markers go on.
 static REFLEX_SLEEP_OFF: AtomicBool = AtomicBool::new(false);
 /// Since the last Reflex line, microseconds: what the threads waited for
 /// [`TOKENS`] in all, and the longest wait.
@@ -983,15 +996,29 @@ pub(crate) fn reflex_marking() -> bool {
 }
 
 /// Reflex by itself: `markers` of frame `index` sent in order, with a token
-/// made from the frame's index. The caller holds [`REFLEX_FRAMES`], so what
-/// another thread owes the frame waits behind these.
-fn send_markers(sl: &Sl, marker: abi::SlPclSetMarker, index: u32, markers: reflex::Markers) {
+/// made from the frame's index. The caller decided them with
+/// [`REFLEX_FRAMES`] held and hands its guard over here: it is let go once
+/// the token is made, with [`TOKENS`] then held until the last marker has
+/// returned. What another thread decides next waits for that lock, so its
+/// markers still leave after these; but no thread stands on
+/// [`REFLEX_FRAMES`] for this one's `slPCLSetMarker` calls (a submission of
+/// the title's that owes nothing does not wait for them at all).
+fn send_markers(
+    sl: &Sl,
+    marker: abi::SlPclSetMarker,
+    index: u32,
+    markers: reflex::Markers,
+    frames: std::sync::MutexGuard<'_, reflex::Frames>,
+) {
     if markers.is_empty() {
         return;
     }
     // Kept until the last marker below has returned: no other token is made
-    // meanwhile ([`Token`]).
-    let Some(token) = frame_token(sl, index) else {
+    // meanwhile ([`Token`]). Made with the frames' lock still held (taken
+    // last, as the rule of [`TOKENS`] allows), so the order holds.
+    let token = frame_token(sl, index);
+    drop(frames);
+    let Some(token) = token else {
         once!(warn, index, "Reflex: no frame token for a frame's markers; they are not sent");
         return;
     };
@@ -1005,102 +1032,137 @@ fn send_markers(sl: &Sl, marker: abi::SlPclSetMarker, index: u32, markers: refle
     }
 }
 
-/// The title's frame begins: the wait for the frame origin made its token
-/// `origin` and is about to return (`crate::frame::wait`, the only caller,
-/// says why there). With Reflex by itself the frame gets its index, Reflex
-/// sleeps (`slReflexSleep` with the frame's token), and the simulation start
-/// is marked right after the sleep returns.
-///
-/// On the title's own thread and under no lock of ours: the sleep may take
-/// milliseconds, and the presenting thread's markers must not wait for it.
+/// Reflex by itself: `slReflexSleep` before frame `index`'s simulation,
+/// made `at` the reading that opened it ([`AT_READING`]) or at the origin
+/// wait of a frame with no simulation to take ([`AT_ORIGIN`]). On the
+/// title's own thread and under no lock of ours: the sleep may take
+/// milliseconds, and the other threads' markers must not wait for it.
 ///
 /// The sleep has no bound in the header and the title's thread stands in it,
-/// so its length is watched: the longest goes into the ten-second line, one
-/// longer than [`reflex::SLEEP_LONG_US`] is warned of, and after one longer
-/// than [`reflex::SLEEP_TOO_LONG_US`] no further sleep is asked for (the
-/// markers go on). A sleep that never returns cannot be ended from here.
+/// so its length is watched: the longest of each place goes into the
+/// ten-second line, one longer than [`reflex::SLEEP_LONG_US`] is warned of,
+/// and after one longer than [`reflex::SLEEP_TOO_LONG_US`] no further sleep
+/// is asked for (the markers go on). A sleep that never returns cannot be
+/// ended from here.
+fn reflex_sleep(sl: &Sl, sleep: abi::SlReflexSleep, index: u32, at: usize) {
+    // (After a sleep that took too long there is none: see below.)
+    if REFLEX_SLEEP_OFF.load(Relaxed) {
+        return;
+    }
+    let place = if at == AT_READING { "at a reading" } else { "at the origin wait" };
+    // The sleep's token is the one token read with [`TOKENS`] let go: held
+    // across the sleep, the lock would stop every marker of the frame
+    // before, on the presenting thread too, for as long as Reflex sleeps.
+    // So the token is made last, with nothing between it and the call, and
+    // the other threads go on making theirs while this one sleeps. Whether
+    // the sleep reads its token after its first moment the header does not
+    // say.
+    let Some(token) = frame_token(sl, index).map(Token::let_go) else {
+        once!(warn, index, "Reflex: no frame token for a sleep; no sleep");
+        return;
+    };
+    let began = std::time::Instant::now();
+    // SAFETY: this frame's token, made just above; the header calls the
+    // sleep thread safe.
+    let code = unsafe { sleep(token) };
+    let took = began.elapsed().as_micros() as u64;
+    REFLEX_SLEEPS[at].fetch_add(1, Relaxed);
+    REFLEX_SLEPT[at].fetch_add(took, Relaxed);
+    REFLEX_SLEPT_LONGEST[at].fetch_max(took, Relaxed);
+    if code != 0 {
+        once!(warn, "Reflex: slReflexSleep failed: {} ({code})", abi::result_name(code));
+    }
+    match reflex::slept(took) {
+        reflex::Slept::Fine => {}
+        reflex::Slept::Long => once!(
+            warn,
+            index,
+            place,
+            "Reflex: one slReflexSleep took {:.1} ms, more than the {} ms a sleep is expected to stay under (said once; the longest is in each Reflex line)",
+            took as f64 / 1000.0,
+            reflex::SLEEP_LONG_US / 1000
+        ),
+        reflex::Slept::TooLong => {
+            // This thread is the title's, in its request for a reading or
+            // its wait for the frame origin: a second sleep like this one
+            // and the title's frames stand. One frame is what it costs.
+            // (Said once: the flag is set once.)
+            if !REFLEX_SLEEP_OFF.swap(true, Relaxed) {
+                tracing::warn!(
+                    index,
+                    place,
+                    "Reflex: one slReflexSleep took {:.1} ms, more than {} ms: no further sleep is asked for in this run (Reflex's low latency needs its sleep, so it no longer works as meant); the latency markers go on",
+                    took as f64 / 1000.0,
+                    reflex::SLEEP_TOO_LONG_US / 1000
+                );
+            }
+        }
+    }
+}
+
+/// The title's frame begins: the wait for the frame origin made its token
+/// `origin` and is about to return (`crate::frame::wait`, the only caller).
+/// With Reflex by itself the frame takes the simulation the title's last
+/// opening reading began ([`input_sampling`]): its sleep and its start were
+/// made there, and nothing is done here. A frame with no simulation to take
+/// gets an index of its own and its simulation start here, after a sleep
+/// unless most of the title's last frames took a simulation
+/// ([`reflex::HOLD`] says why).
+///
+/// On the title's own thread and under no lock of ours while it sleeps.
 pub(crate) fn frame_begins(origin: u64) {
     if !reflex_marking() {
         return;
     }
     let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return };
     let (Some(sleep), Some(marker)) = (functions.reflex_sleep, functions.pcl_set_marker) else { return };
+    let (thread, now) = (crate::host::thread_id(), crate::host::now_us());
     // The index every token of this frame is made from, here and at its
-    // readings, submissions and present.
-    let index = lock(&REFLEX_FRAMES).begin(origin);
-    // (After a sleep that took too long there is none: see below.)
-    if !REFLEX_SLEEP_OFF.load(Relaxed) {
-        // The sleep's token is the one token read with [`TOKENS`] let go:
-        // held across the sleep, the lock would stop every marker of the
-        // frame before, on the presenting thread too, for as long as Reflex
-        // sleeps. So the token is made last, with nothing between it and
-        // the call, and the other threads go on making theirs while this
-        // one sleeps. Whether the sleep reads its token after its first
-        // moment the header does not say.
-        match frame_token(sl, index).map(Token::let_go) {
-            Some(token) => {
-                let began = std::time::Instant::now();
-                // SAFETY: this frame's token, made just above; the header
-                // calls the sleep thread safe.
-                let code = unsafe { sleep(token) };
-                let took = began.elapsed().as_micros() as u64;
-                REFLEX_SLEEPS.fetch_add(1, Relaxed);
-                REFLEX_SLEPT.fetch_add(took, Relaxed);
-                REFLEX_SLEPT_LONGEST.fetch_max(took, Relaxed);
-                if code != 0 {
-                    once!(warn, "Reflex: slReflexSleep failed: {} ({code})", abi::result_name(code));
-                }
-                match reflex::slept(took) {
-                    reflex::Slept::Fine => {}
-                    reflex::Slept::Long => once!(
-                        warn,
-                        index,
-                        origin,
-                        "Reflex: one slReflexSleep took {:.1} ms, more than the {} ms a sleep is expected to stay under (said once; the longest is in each Reflex line)",
-                        took as f64 / 1000.0,
-                        reflex::SLEEP_LONG_US / 1000
-                    ),
-                    reflex::Slept::TooLong => {
-                        // This thread is the title's, in its wait for the
-                        // frame origin: a second sleep like this one and
-                        // the title's frames stand. One frame is what it
-                        // costs. (Said once: the flag is set once.)
-                        if !REFLEX_SLEEP_OFF.swap(true, Relaxed) {
-                            tracing::warn!(
-                                index,
-                                origin,
-                                "Reflex: one slReflexSleep took {:.1} ms, more than {} ms: no further sleep is asked for in this run (Reflex's low latency needs its sleep, so it no longer works as meant); the latency markers go on",
-                                took as f64 / 1000.0,
-                                reflex::SLEEP_TOO_LONG_US / 1000
-                            );
-                        }
-                    }
-                }
-            }
-            None => once!(warn, index, "Reflex: no frame token at a frame's begin; no sleep"),
+    // submissions and present.
+    let begin = lock(&REFLEX_FRAMES).begin(origin, thread, now);
+    let index = match begin {
+        reflex::Begin::Adopted(_) => return,
+        reflex::Begin::Unpaced(index) => index,
+        reflex::Begin::Paced(index) => {
+            reflex_sleep(sl, sleep, index, AT_ORIGIN);
+            index
         }
-    }
-    // The simulation starts where the sleep ends: from here on the title's
-    // readings and submissions are this frame's.
+    };
+    // The simulation starts where the sleep ends, or at once: from here on
+    // the title's submissions are this frame's.
     let mut frames = lock(&REFLEX_FRAMES);
     let owed = frames.reach(index, reflex::Stage::SimulationStart);
-    send_markers(sl, marker, index, owed);
+    send_markers(sl, marker, index, owed, frames);
 }
 
-/// The title took a pad or keyboard reading (`victory_hle`'s GameInput
-/// calls this where the title asks for its current reading, not where our
-/// poll thread reads the host). With Reflex by itself the first reading of a
-/// frame's simulation is the frame's input sample: the controller's, the one
-/// input-sample marker `sl_pcl.h` has. Nothing otherwise.
-pub fn input_sampled() {
+/// The title asks for its current pad or keyboard reading (`victory_hle`'s
+/// GameInput calls this on the title's thread at the start of that call,
+/// before the reading is picked, not where our poll thread reads the host).
+/// With Reflex by itself the reading that opens a simulation
+/// ([`reflex::Frames::sample`]) is where Reflex sleeps: the reading is then
+/// picked after the sleep, as fresh as the sleep makes it, and the
+/// simulation's start and its input sample (the controller's, the one
+/// input-sample marker `sl_pcl.h` has) are sent where the sleep returns.
+/// Other readings send nothing. Nothing without the switch.
+///
+/// Under no lock of ours while it sleeps. The title's thread stands in the
+/// sleep, as it stood in the origin wait's before; if the title holds a
+/// lock of its own here, whoever waits for it stands too, which the sleeps'
+/// longest in the ten-second line would show.
+pub fn input_sampling() {
     if !reflex_marking() {
         return;
     }
-    let (Some(sl), Some(marker)) = (SL.get(), FUNCTIONS.get().and_then(|f| f.pcl_set_marker)) else { return };
+    let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return };
+    let (Some(sleep), Some(marker)) = (functions.reflex_sleep, functions.pcl_set_marker) else { return };
+    let thread = crate::host::thread_id();
+    // (The frames' lock goes at the end of this statement, before the sleep.)
+    let sample = lock(&REFLEX_FRAMES).sample(thread, crate::host::now_us());
+    let reflex::Sample::Open(index) = sample else { return };
+    reflex_sleep(sl, sleep, index, AT_READING);
     let mut frames = lock(&REFLEX_FRAMES);
-    if let Some((index, owed)) = frames.input() {
-        send_markers(sl, marker, index, owed);
-    }
+    let owed = frames.sampled(index, crate::host::now_us());
+    send_markers(sl, marker, index, owed, frames);
 }
 
 /// The title submits command lists to a queue that draws (its
@@ -1113,9 +1175,10 @@ pub(crate) fn title_submits(origin: u64) {
         return;
     }
     let (Some(sl), Some(marker)) = (SL.get(), FUNCTIONS.get().and_then(|f| f.pcl_set_marker)) else { return };
+    let (thread, now) = (crate::host::thread_id(), crate::host::now_us());
     let mut frames = lock(&REFLEX_FRAMES);
-    if let Some((index, owed)) = frames.submit(origin) {
-        send_markers(sl, marker, index, owed);
+    if let Some((index, owed)) = frames.submit(origin, thread, now) {
+        send_markers(sl, marker, index, owed, frames);
     }
 }
 
@@ -1128,7 +1191,8 @@ pub(crate) fn title_presents(present: u64, origin: u64) {
     if !reflex_marking() {
         return;
     }
-    lock(&REFLEX_FRAMES).title_presents(present, origin);
+    let thread = crate::host::thread_id();
+    lock(&REFLEX_FRAMES).title_presents(present, origin, thread);
 }
 
 /// Reflex by itself, on the presenting thread: the markers frame `index`
@@ -1142,8 +1206,7 @@ fn reflex_reach(index: u32, stage: reflex::Stage) {
         reflex::Stage::PresentEnd => frames.presented(index),
         _ => frames.reach(index, stage),
     };
-    send_markers(sl, marker, index, owed);
-    drop(frames);
+    send_markers(sl, marker, index, owed, frames);
     spent(T_MARKERS, began);
 }
 
@@ -1180,20 +1243,65 @@ fn reflex_line(now: bool) -> Option<String> {
         *last = Some(at);
     }
     let _one_caller = calls();
-    let counts = lock(&REFLEX_FRAMES).take_counts();
-    let (sleeps, slept) = (REFLEX_SLEEPS.swap(0, Relaxed), REFLEX_SLEPT.swap(0, Relaxed));
-    // The longest sleep by itself: an average hides the one that stood.
-    let longest = REFLEX_SLEPT_LONGEST.swap(0, Relaxed);
+    // (The bound an open simulation is let go after follows the frames:
+    // the one it is now.)
+    let (counts, stale_after_us) = {
+        let mut frames = lock(&REFLEX_FRAMES);
+        (frames.take_counts(), frames.stale_after_us())
+    };
+    // The sleeps by where they were made, each with its longest by itself:
+    // an average hides the one that stood.
+    let [at_reading, at_origin] = [AT_READING, AT_ORIGIN].map(|at| {
+        let (sleeps, slept) = (REFLEX_SLEEPS[at].swap(0, Relaxed), REFLEX_SLEPT[at].swap(0, Relaxed));
+        let longest = REFLEX_SLEPT_LONGEST[at].swap(0, Relaxed);
+        format!(
+            "{sleeps} of {:.2} ms on average (the longest {:.1} ms)",
+            slept as f64 / 1000.0 / sleeps.max(1) as f64,
+            longest as f64 / 1000.0
+        )
+    });
+    let gap = |gap: reflex::Gap| {
+        format!(
+            "{:.2} ms on average over {} (the longest {:.1} ms)",
+            gap.average_us() as f64 / 1000.0,
+            gap.count,
+            gap.longest_us as f64 / 1000.0
+        )
+    };
     // What the one-token-at-a-time rule cost the threads that asked.
     let [waited, waited_longest] = [0, 1].map(|i| REFLEX_TOKEN_WAITS[i].swap(0, Relaxed));
+    // Whether the sleep sits at the input: nearly every frame begun should
+    // have an input sample while the title reads a pad every frame, and its
+    // sleeps should be at a reading. The threads and the gaps say how the
+    // title's simulation and its submissions are laid out.
     let frames = format!(
-        "{} frames begun, {sleeps} sleeps of {:.2} ms on average (the longest {:.1} ms){}, {} frames with an input sample ({} read too late for one), {} simulations ended by a submission with the title's token and {} by one found by order, {} presented without a submission before, {} presents with no frame begun, {} presents bound by the title's token and {} by order, {} frames never presented, {:.2} ms waited for a frame token in use (the longest wait {:.2} ms)",
+        "{} frames begun: {} with an input sample, {} took the simulation a reading opened, {} had none to take and no sleep (most of the last {} frames took one), {} slept at the origin wait (fewer did); readings asked for: {} opened a simulation, {} were part of an open one, {} came before the newest frame's simulation ended, {} on another thread than the one that opens them; {} simulations let go at a reading because no origin wait took them within {} ms (the bound now), {} input samples lost (the frame was past its simulation's end when the reading's sleep returned), {} frames whose first submission came before their simulation started; sleeps at a reading {}, at the origin wait {}{}; on the frame's origin-wait thread and on another: openings {} and {}, first submissions {} and {}, title presents {} and {}; from the origin wait to the first submission {}, from the first submission to the next opening {}, from an opening to the origin wait that took it {}; {} simulations ended by a submission with the title's token and {} by one found by order, {} presented without a submission before, {} presents with no frame begun, {} presents bound by the title's token and {} by order, {} frames never presented, {:.2} ms waited for a frame token in use (the longest wait {:.2} ms)",
         counts.begun,
-        slept as f64 / 1000.0 / sleeps.max(1) as f64,
-        longest as f64 / 1000.0,
-        if REFLEX_SLEEP_OFF.load(Relaxed) { "; NO sleep is asked for any more, one took too long (see the warning)" } else { "" },
         counts.sampled,
-        counts.late,
+        counts.adopted,
+        counts.unpaced,
+        reflex::HOLD,
+        counts.origin_sleeps,
+        counts.opened,
+        counts.belongs,
+        counts.held_back,
+        counts.other_thread,
+        counts.stale,
+        stale_after_us / 1000,
+        counts.lost,
+        counts.submitted_before_start,
+        at_reading,
+        at_origin,
+        if REFLEX_SLEEP_OFF.load(Relaxed) { "; NO sleep is asked for any more, one took too long (see the warning)" } else { "" },
+        counts.openings_by_thread[0],
+        counts.openings_by_thread[1],
+        counts.first_submits_by_thread[0],
+        counts.first_submits_by_thread[1],
+        counts.presents_by_thread[0],
+        counts.presents_by_thread[1],
+        gap(counts.origin_to_submit),
+        gap(counts.submit_to_open),
+        gap(counts.open_to_adopt),
         counts.submitted_by_token,
         counts.submitted_by_order,
         counts.unsubmitted,
@@ -1829,10 +1937,11 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
     let began = std::time::Instant::now();
     // The index the frame's tokens are made from: the present's number, or
-    // with Reflex by itself the index the frame got where it began (its
-    // sleep and its earlier markers had tokens of the same index; the
-    // constants and tags below get it too, as frame generation wants the
-    // present's markers and the constants to name one frame).
+    // with Reflex by itself the index the frame got where its simulation
+    // began, at the reading that opened it or at its origin wait (its sleep
+    // and its earlier markers had tokens of the same index; the constants
+    // and tags below get it too, as frame generation wants the present's
+    // markers and the constants to name one frame).
     let marking = reflex_marking();
     let frame = if marking {
         let index = lock(&REFLEX_FRAMES).presenting(frame);
@@ -2142,7 +2251,8 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
     let calls = if reflex_marking() {
         // Reflex by itself: the frame's last marker, and the frame is over.
         // The next frame's simulation start is not marked here: it is marked
-        // where that frame's sleep returns ([`frame_begins`]).
+        // where that frame's sleep returns ([`input_sampling`] or
+        // [`frame_begins`]).
         reflex_reach(frame, reflex::Stage::PresentEnd);
         if let Some(line) = reflex_line(false) {
             tracing::info!("{line}");
@@ -2396,13 +2506,16 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         };
         let tagged = HUD_COUNTS[HUD_TAGGED].load(Relaxed);
         for frame in 1..=180u64 {
-            // With `VICTORY_REFLEX`: the frame as a title's would go, so
-            // that the sleep, the markers and the state are tried here too
-            // (it begins, takes a reading, submits, and calls its present
-            // with its token). Nothing without the switch.
+            // With `VICTORY_REFLEX`: the frame as the title's go, so that
+            // the sleeps, the markers and the state are tried here too (it
+            // begins, submits, takes the reading of the next frame's
+            // simulation, and calls its present with its token; the first
+            // frame sleeps at the origin wait, the others take the
+            // simulation the reading before opened). Nothing without the
+            // switch.
             frame_begins(frame);
-            input_sampled();
             title_submits(frame);
+            input_sampling();
             title_presents(frame, frame);
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
             *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Noted {
