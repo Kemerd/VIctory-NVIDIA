@@ -697,6 +697,13 @@ pub(crate) struct HostPipeline {
     /// (`victory_shader::emit::rect_list_gs`): its rectangle draws go out
     /// as the title gives them, three vertices a rectangle.
     pub(crate) rects: bool,
+    /// One colour target blended premultiplied over what is there (source
+    /// one, destination one minus source alpha): the shape of the title's
+    /// interface composite, which draw.rs places in the middle of a wide
+    /// picture. A shape, not a hash: the stage containers of a pipeline made
+    /// from pieces are ours (`VICTORY_PIPELINE_PIECES`), so the same program
+    /// has another hash there. Always false for compute and mesh.
+    pub(crate) over: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
     /// Its depth, stencil, cull and blend state in short, for the frame
@@ -989,6 +996,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
+                over: false,
                 state: String::new(),
             });
         }
@@ -1042,6 +1050,7 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
+                over: false,
                 state: String::new(),
             });
         }
@@ -1158,6 +1167,10 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            over: g.targets.NumRenderTargets == 1 && {
+                let b = &g.blend.RenderTarget[0];
+                b.BlendEnable.as_bool() && b.SrcBlend == D3D12_BLEND_ONE && b.DestBlend == D3D12_BLEND_INV_SRC_ALPHA
+            },
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
