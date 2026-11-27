@@ -114,9 +114,11 @@ if ($Fast) {
     # so the title falls back. Compute from pieces stays off until its layout is right (grey world).
     $settings.VICTORY_PIPELINE_PIECES = '1'; $settings.VICTORY_PIPELINE_PIECES_REFUSE_UNTRANSLATED = '1'
     $settings.VICTORY_PIPELINE_PIECES_ONLY = 'graphics'
-    # The submitting thread: refresh sets, refreshes kept across title writes, page parts, sending on its own thread
+    # The submitting thread: refresh sets, refreshes kept across title writes, page parts
     $settings.VICTORY_REFRESH_SET = '1'; $settings.VICTORY_TITLE_WRITE_RANGE = '1'
-    $settings.VICTORY_UNDER_PARTS = '1'; $settings.VICTORY_SEND_THREAD = '1'
+    # VICTORY_SEND_THREAD=1 is left out: on an RTX 5070 Ti it removes the device a few seconds after start
+    # (DXGI_ERROR_ACCESS_DENIED), with or without DLSS, release or diagnostics build
+    $settings.VICTORY_UNDER_PARTS = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
