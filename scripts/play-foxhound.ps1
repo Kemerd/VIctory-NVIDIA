@@ -34,6 +34,9 @@ param(
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # The streaming and submitting-thread switches (each described where the code reads it), all on at once.
+    # Newer than the settings above and not yet measured in the world one by one; -More turns any of them off.
+    [switch]$Fast,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -84,6 +87,21 @@ $settings = @{
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
 }
+if ($Fast) {
+    # Host pipelines: no wait that cannot end in the frame, none while a backlog is queued, extra threads for the
+    # slow ones while nothing is asked
+    $settings.VICTORY_PIPELINE_WAIT_ONCE = '1'; $settings.VICTORY_PIPELINE_WAIT_BACKLOG = '64'
+    $settings.VICTORY_PIPELINE_SLOW_WORKERS = '8'
+    # Textures and staging
+    $settings.VICTORY_TEXTURE_LOOK_ONCE = '1'; $settings.VICTORY_TEXTURE_READ_AHEAD = '1'; $settings.VICTORY_STAGING_NO_ZERO = '1'
+    $settings.VICTORY_SEND_COPIED_FIND = '1'; $settings.VICTORY_FILES_BUFFERED = '1'
+    # Title memory by address (the ray-tracing path)
+    $settings.VICTORY_MEMORY_FRESH = '1'; $settings.VICTORY_MEMORY_ARENAS_AHEAD = '1'; $settings.VICTORY_MEMORY_QUIET = '1'
+    $settings.VICTORY_MEMORY_LAND_SENT = '1'; $settings.VICTORY_MEMORY_ASK_RUNS = '1'; $settings.VICTORY_MEMORY_LEAN = '1'
+    $settings.VICTORY_MEMORY_DIRTY = '1'; $settings.VICTORY_MEMORY_BUFFER_FAULTS = '1'
+    # The submitting thread
+    $settings.VICTORY_REFRESH_PROBE_US = '300'; $settings.VICTORY_DECLARE_ACROSS_LISTS = '1'
+}
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
@@ -120,7 +138,7 @@ $settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [str
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
-$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })"
+$settings.VICTORY_MENU_ARGS = "-Exe '$($Exe -replace "'", "''")' -Build $Build$(if ($NoFrameGenReady) { ' -NoFrameGenReady' })$(if ($Fast) { ' -Fast' })"
 
 $victory = Join-Path $repo "target\$Build\victory.exe"
 if (-not (Test-Path $victory)) {
