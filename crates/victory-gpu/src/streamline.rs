@@ -1787,6 +1787,10 @@ pub fn upscaler_destroyed(context: usize) {
 /// frame 3 on in the 1440p runs with DLSS; `draw::State::native_frontend_viewport`
 /// (DexNom's) names the same draw. draw.rs places the same draw in the middle
 /// of a wide picture (`State::interface_band`), so both read the one pair.
+/// These are the hashes of the title's own containers: with
+/// `VICTORY_PIPELINE_PIECES=1` the composite's stages are containers of ours
+/// with other hashes, and only `interface_band` (which also takes the shape,
+/// `HostPipeline::over`) still finds it.
 pub(crate) const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
 
 /// Whether draws are looked at for the colour without the interface: frame

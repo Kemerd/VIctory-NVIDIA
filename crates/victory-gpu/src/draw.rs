@@ -4971,10 +4971,12 @@ impl State {
     /// With a 1440p-class output (`VICTORY_NATIVE_1440P=1`) wider than the
     /// interface's ratio (`VICTORY_UI_LETTERBOX`, parsed once by
     /// `compose::ui_band`): where the title's interface composite (one
-    /// triangle into the presented texture, `streamline::INTERFACE_COMPOSITE`)
-    /// goes. Answers the band's left edge, its width and the scissor for this
-    /// draw (the title's first rect cut to the band), or `None` for any other
-    /// draw and whenever the switches are off. Called for one-triangle draws.
+    /// triangle into the presented texture: the pair of
+    /// `streamline::INTERFACE_COMPOSITE`, or a pipeline of its shape,
+    /// `HostPipeline::over`) goes. Answers the band's left edge, its width
+    /// and the scissor for this draw (the title's first rect cut to the
+    /// band), or `None` for any other draw and whenever the switches are off.
+    /// Called for one-triangle draws.
     fn interface_band(&self) -> Option<(u32, u32, RECT)> {
         static BAND: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
         let (left, band) = (*BAND.get_or_init(|| {
@@ -4988,13 +4990,22 @@ impl State {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
-        if !crate::streamline::INTERFACE_COMPOSITE
+        let (w, h) = crate::dxgi::display_size();
+        // the composite is the title's pair of programs, or any pipeline of
+        // its shape: with VICTORY_PIPELINE_PIECES=1 the stage containers are
+        // ours, so the pair has other hashes there (the 2026-11-27 runs with
+        // it bound a pair that matched nothing, and the band never fired)
+        let stock = crate::streamline::INTERFACE_COMPOSITE
             .iter()
-            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == *hash))
-        {
+            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == *hash));
+        if !stock && !pipeline.over {
             return None;
         }
-        let (w, h) = crate::dxgi::display_size();
+        // each pipeline taken is named once, with where it draws, so that a
+        // run says which draws this took for the interface (a shape can fit
+        // more than the composite: a layer blended over another inside the
+        // interface's own target would be shrunk too)
+        self.name_taken(pipeline, stock, w, h);
         // the composite is ours; if its viewport is not the whole output the
         // interface stays stretched, and the log says why once
         let placed = match (self.viewports.as_slice(), self.scissors.first()) {
@@ -5045,6 +5056,45 @@ impl State {
             )
         });
         Some((left, band, scissor))
+    }
+
+    /// Says once per pipeline (eight at most) that `interface_band` took it
+    /// for the interface composite, by the title's hashes (`stock`) or by its
+    /// shape: its shaders and state, the size and format of the target it
+    /// draws into and the viewports and scissors in force. The target tells
+    /// the draw into the presented texture from a layer drawn inside the
+    /// interface's own target; the next wide run reads which draw was placed
+    /// in the middle from this line.
+    fn name_taken(&self, pipeline: &HostPipeline, stock: bool, w: u32, h: u32) {
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let key = std::ptr::from_ref(pipeline) as usize;
+        {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() >= 8 || seen.contains(&key) {
+                return;
+            }
+            seen.push(key);
+        }
+        let target = self
+            .targets
+            .first()
+            .and_then(|t| crate::resource::host_resource(*t as This))
+            .map(|texture| {
+                // SAFETY: a live host resource, kept by the title's target.
+                let d = unsafe { texture.GetDesc() };
+                (d.Width, d.Height, d.Format.0)
+            });
+        let viewports: Vec<_> = self.viewports.iter().map(|v| (v.TopLeftX, v.TopLeftY, v.Width, v.Height)).collect();
+        tracing::info!(
+            pipeline = %pipeline.name,
+            state = %pipeline.state,
+            by_hash = stock,
+            target = ?target,
+            output = ?(w, h),
+            viewports = ?viewports,
+            scissors = self.scissors.len(),
+            "a one-triangle draw is taken for the interface composite (VICTORY_UI_LETTERBOX): by the title's hashes, or by its shape (premultiplied over, one target); target is width, height, format"
+        );
     }
 
     /// The viewport (and, in the middle band, the scissor) for the title's
