@@ -9376,6 +9376,7 @@ impl Meter {
                 );
             }
             crate::texture::look_once_line(frames);
+            crate::texture::ahead::read_ahead_line(frames);
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {

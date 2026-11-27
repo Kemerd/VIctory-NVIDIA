@@ -3619,7 +3619,20 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::staged_memory(resource) } else { None };
                 memory.map(|(at, len)| (at, len, crate::texture::fingerprint(at, len)))
             });
-            rest(6, || crate::texture::unstage(resource));
+            let staged = rest(6, || crate::texture::unstage(resource));
+            // Read by threads of ours from here, after the fingerprint for
+            // the later look ([`crate::texture::ahead::read_ahead`]): not a
+            // bake's, not one taken ahead, not one looked at again by
+            // mapped bytes alone.
+            if let Some(staging) = staged
+                && crate::texture::ahead::read_ahead()
+                && ahead.is_none()
+                && sync.is_none()
+                && !baking
+                && memory.is_some()
+            {
+                crate::texture::ahead::read_soon(staging);
+            }
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
