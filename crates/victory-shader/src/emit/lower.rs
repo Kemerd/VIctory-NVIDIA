@@ -6865,6 +6865,24 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
                 (self.s.m.bin(c, Bin::Add, t, b), None)
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // D = {S1 half, S0 half}: the low half is S0[15:0] (ll, lh) or
+                // S0[31:16] (hh); the high half is S1[15:0] (ll) or S1[31:16].
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, ffff) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let lo = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, ffff)
+                };
+                let hi = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let ffff0000 = self.s.m.i32(0xFFFF_0000);
+                    self.s.m.bin(c, Bin::And, b, ffff0000)
+                };
+                (self.s.m.bin(c, Bin::Or, lo, hi), None)
+            }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
@@ -6931,6 +6949,9 @@ impl<'a> Lower<'a> {
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
+                        | "s_pack_ll_b32_b16"
+                        | "s_pack_lh_b32_b16"
+                        | "s_pack_hh_b32_b16"
                 ) =>
                 {
                     return Ok(());

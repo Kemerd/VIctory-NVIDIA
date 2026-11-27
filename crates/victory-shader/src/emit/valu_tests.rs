@@ -2551,3 +2551,20 @@ fn v_ldexp_f32_scales_exactly_in_every_range() {
         }
     });
 }
+
+#[test]
+fn scalar_pack_halves_take_the_chosen_halves() {
+    // s_pack_{ll,lh,hh}_b32_b16 s16, s0, s1 (SOP2 opcodes 0x32..0x34).
+    let inputs = [[0xAAAA_1111, 0xBBBB_2222, 0, 0], [0x1234_5678, 0x9ABC_DEF0, 0, 0]];
+    let want = |op: u8, a: u32, b: u32| match op {
+        0x32 => (a & 0xFFFF) | b << 16,
+        0x33 => (a & 0xFFFF) | (b & 0xFFFF_0000),
+        _ => (a >> 16) | (b & 0xFFFF_0000),
+    };
+    for op in [0x32u8, 0x33, 0x34] {
+        let shader = build_valu_cs(&[sop2(op, 16, 0, 1), vop1(1, 0, sgpr(16))]);
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            assert_eq!(got, want(op, inp[0], inp[1]), "{backend}: pack {op:#x} case {i}");
+        });
+    }
+}
