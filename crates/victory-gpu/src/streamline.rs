@@ -26,6 +26,16 @@
 //!   and says why the sleep goes there), and every ten seconds a line of
 //!   what `slReflexGetState` reports. Unset, the calls made of Streamline
 //!   are those made before the switch existed.
+//! - `VICTORY_DLSS_RR=1` (needs `VICTORY_DLSS=1`): loads DLSS Ray
+//!   Reconstruction's plugin beside DLSS, checks support, logs the buffer
+//!   tags the plugin says it needs, its version and its optimal render size
+//!   for the title's output next to Super Resolution's. It does not draw:
+//!   Super Resolution still takes every upscale, because the guide buffers
+//!   (diffuse albedo, specular albedo, normals, roughness) of the title are
+//!   not identified.
+//! - `VICTORY_RR_TARGETS=1` (or a list of upscaling numbers): diagnostics
+//!   that log the textures the title's passes write around the upscale
+//!   ([`targets`]).
 //! - `VICTORY_STREAMLINE_DIR`: the folder of `sl.interposer.dll`, its plugins
 //!   and NGX's DLLs (default [`DEFAULT_DIR`]).
 //!
@@ -43,6 +53,7 @@
 pub(crate) mod abi;
 pub mod plan;
 mod reflex;
+pub(crate) mod targets;
 
 pub use plan::Mode;
 pub use reflex::Reflex;
@@ -95,6 +106,8 @@ pub struct Asked {
     /// frame's simulation, the markers at their times); `None`: as without
     /// the switch.
     pub reflex: Option<Reflex>,
+    /// `VICTORY_DLSS_RR=1`: DLSS Ray Reconstruction's plugin is loaded beside DLSS (it needs `VICTORY_DLSS=1`); it loads and reports, it does not draw yet.
+    pub rr: bool,
 }
 
 impl Asked {
@@ -131,6 +144,7 @@ impl Asked {
             hudless: var("VICTORY_FRAMEGEN_HUDLESS").is_none_or(|v| v.trim() != "0"),
             present_hook: on("VICTORY_STREAMLINE_PRESENT"),
             reflex,
+            rr: on("VICTORY_DLSS_RR"),
         })
     }
 
@@ -236,6 +250,8 @@ struct Plan {
     /// Reflex by itself: asked for (`VICTORY_REFLEX`) and, with the latency
     /// markers, supported here.
     reflex: Option<Reflex>,
+    /// DLSS Ray Reconstruction: asked for (VICTORY_DLSS_RR), DLSS on, and supported here.
+    rr: bool,
 }
 
 static PLAN: OnceLock<Plan> = OnceLock::new();
@@ -245,6 +261,7 @@ static PLAN: OnceLock<Plan> = OnceLock::new();
 struct Functions {
     dlss_optimal: Option<abi::SlDlssGetOptimalSettings>,
     dlss_set_options: Option<abi::SlDlssSetOptions>,
+    dlssd_optimal: Option<abi::SlDlssdGetOptimalSettings>,
     dlssg_set_options: Option<abi::SlDlssgSetOptions>,
     dlssg_get_state: Option<abi::SlDlssgGetState>,
     reflex_set_options: Option<abi::SlReflexSetOptions>,
@@ -256,6 +273,8 @@ struct Functions {
 
 static FUNCTIONS: OnceLock<Functions> = OnceLock::new();
 static DLSS_READY: AtomicBool = AtomicBool::new(false);
+/// The RR plugin answers (its functions were found at the device). It never means RR draws.
+static RR_READY: AtomicBool = AtomicBool::new(false);
 static FG_READY: AtomicBool = AtomicBool::new(false);
 /// Reflex by itself runs (`VICTORY_REFLEX`, its functions found, its options
 /// set): the sleep before each frame's simulation and the markers at their
@@ -367,6 +386,9 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
 pub fn init(asked: &Asked) -> Available {
+    if asked.rr && !asked.dlss {
+        tracing::warn!("VICTORY_DLSS_RR=1: Ray Reconstruction takes the place of DLSS Super Resolution at the title's upscale, so it needs VICTORY_DLSS=1; it stays off");
+    }
     if !asked.any() {
         // Reflex by itself rides on a Streamline that is loaded for DLSS or
         // frame generation: alone it loads nothing.
@@ -412,6 +434,9 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
     let mut features = Vec::new();
     if asked.dlss {
         features.push(abi::FEATURE_DLSS);
+        if asked.rr {
+            features.push(abi::FEATURE_DLSS_RR);
+        }
     }
     if framegen_asked {
         features.extend([abi::FEATURE_DLSS_G, abi::FEATURE_REFLEX, abi::FEATURE_PCL]);
@@ -464,6 +489,10 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         if code == 0 { Ok(()) } else { Err(format!("{} ({code})", abi::result_name(code))) }
     };
     let dlss = asked.dlss && report("DLSS Super Resolution", abi::FEATURE_DLSS, supported(abi::FEATURE_DLSS), sl);
+    let rr = asked.rr && asked.dlss && report("DLSS Ray Reconstruction", abi::FEATURE_DLSS_RR, supported(abi::FEATURE_DLSS_RR), sl);
+    if rr {
+        log_required_tags(sl, abi::FEATURE_DLSS_RR, "DLSS Ray Reconstruction");
+    }
     let generation = framegen_asked && report("DLSS Frame Generation", abi::FEATURE_DLSS_G, supported(abi::FEATURE_DLSS_G), sl);
     // Reflex is asked about once: for frame generation, which needs it, or
     // for itself (`VICTORY_REFLEX`). Without the switch this is the check
@@ -496,7 +525,10 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         preset = asked.preset,
         "Streamline loaded (manual hooking, no downloads)"
     );
-    let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen, reflex });
+    if asked.rr {
+        tracing::info!(rr, "Streamline: DLSS Ray Reconstruction is asked for (VICTORY_DLSS_RR); it loads and reports, it does not draw yet");
+    }
+    let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen, reflex, rr });
     Ok(Available { dlss, framegen })
 }
 
@@ -526,6 +558,27 @@ fn report(name: &str, feature: u32, supported: Result<(), String>, sl: &Sl) -> b
             false
         }
     }
+}
+
+/// Logs the buffer tags a feature's plugin says it needs, by name, so the
+/// required set is read from the plugin and not guessed.
+fn log_required_tags(sl: &Sl, feature: u32, name: &str) {
+    let mut requirements = unsafe_zeroed_requirements();
+    // SAFETY: a structure to fill.
+    let code = unsafe { (sl.get_feature_requirements)(feature, &mut requirements) };
+    if code != 0 {
+        tracing::warn!("Streamline: {name}: no requirements to read: {} ({code})", abi::result_name(code));
+        return;
+    }
+    let count = requirements.num_required_tags as usize;
+    if requirements.required_tags.is_null() || !(1..=64).contains(&count) {
+        tracing::info!("Streamline: {name} names no required buffer tags");
+        return;
+    }
+    // SAFETY: the plugin's list, valid for the count it names, read at once.
+    let raw = unsafe { std::slice::from_raw_parts(requirements.required_tags, count) }.to_vec();
+    let names: Vec<&str> = raw.iter().map(|&kind| abi::buffer_name(kind)).collect();
+    tracing::info!(tags = ?names, kinds = ?raw, "Streamline: {name} says it needs these buffer tags");
 }
 
 fn unsafe_zeroed_requirements() -> abi::FeatureRequirements {
@@ -710,6 +763,10 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
         log_version(sl, abi::FEATURE_DLSS, "DLSS Super Resolution");
         DLSS_READY.store(ready, Release);
     }
+    if plan.rr {
+        functions.dlssd_optimal = f!(abi::FEATURE_DLSS_RR, c"slDLSSDGetOptimalSettings", abi::SlDlssdGetOptimalSettings);
+        log_version(sl, abi::FEATURE_DLSS_RR, "DLSS Ray Reconstruction");
+    }
     let mut queue = None;
     // Whether Reflex's options were set (they are set once).
     let mut reflex_set = false;
@@ -791,6 +848,7 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
         }
     }
     let _ = FUNCTIONS.set(functions);
+    RR_READY.store(plan.rr && FUNCTIONS.get().is_some_and(|f| f.dlssd_optimal.is_some()), Release);
     // (After the functions: a title thread that sees this finds them.)
     if reflex_ready {
         REFLEX_READY.store(true, Release);
@@ -1367,6 +1425,7 @@ pub fn upscale(up: &Upscale) -> Taken {
     let asked = crate::list::external(
         up.list,
         Box::new(move |host| {
+            targets::upscaled(host, &up, id);
             if framegen {
                 note(host, &up, id);
             }
@@ -1543,6 +1602,9 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
             evaluations = all,
             "DLSS: upscaling recorded in place of the title's FidelityFX"
         );
+        if RR_READY.load(Acquire) {
+            rr_report(camera.output, recorded.mode, recorded.optimal);
+        }
     }
     true
 }
@@ -1665,6 +1727,41 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         spent(T_UPSCALE, began);
     }
     Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
+}
+
+/// What DLSS Ray Reconstruction would render at for this output, logged
+/// beside Super Resolution's. Nothing is evaluated: its guide buffers are
+/// not identified, so this only asks the plugin a question.
+fn rr_report(output: [u32; 2], mode: u32, sr_optimal: Option<[u32; 2]>) {
+    let Some(optimal_of) = FUNCTIONS.get().and_then(|f| f.dlssd_optimal) else { return };
+    // The header marks the function not thread safe; `record` let go of the
+    // lock by now.
+    let _one_caller = calls();
+    let options = abi::DlssdOptions::new(mode, output);
+    let mut settings = abi::DlssdOptimalSettings::default();
+    // SAFETY: filled options and a structure to fill; one caller at a time.
+    let code = unsafe { optimal_of(&options, &mut settings) };
+    if code == 0 {
+        // only an answered query shows the plugin answering
+        once!(info, "DLSS Ray Reconstruction: loaded and answering, not drawing: it needs the diffuse albedo, specular albedo, normals and roughness of the title's own passes, and none of those targets is identified yet, so DLSS Super Resolution still does every upscale (VICTORY_RR_TARGETS=1 logs the candidates)");
+        tracing::info!(
+            mode = plan::sl_mode_name(mode),
+            ?output,
+            rr_render = ?[settings.optimal_render_width, settings.optimal_render_height],
+            rr_min = ?[settings.render_width_min, settings.render_height_min],
+            rr_max = ?[settings.render_width_max, settings.render_height_max],
+            sr_render = ?sr_optimal,
+            "DLSS Ray Reconstruction: optimal render size for this output (beside Super Resolution's)"
+        );
+    } else {
+        tracing::warn!(
+            code,
+            result = abi::result_name(code),
+            mode = plan::sl_mode_name(mode),
+            ?output,
+            "DLSS Ray Reconstruction: slDLSSDGetOptimalSettings failed"
+        );
+    }
 }
 
 /// The title's FidelityFX upscaler `context` is destroyed: what DLSS made
@@ -2354,7 +2451,7 @@ fn shut_down() -> Option<String> {
     let (sl, host) = (SL.get()?, crate::host::host()?);
     resizing();
     host.drop_presenter();
-    for ready in [&FG_READY, &DLSS_READY, &SWAP_CHAIN_PROXIED, &HUDLESS_WANTED, &REFLEX_READY] {
+    for ready in [&FG_READY, &DLSS_READY, &SWAP_CHAIN_PROXIED, &HUDLESS_WANTED, &REFLEX_READY, &RR_READY] {
         ready.store(false, Release);
     }
     *lock(&SUBMITTED) = None;

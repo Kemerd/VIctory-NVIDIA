@@ -1873,6 +1873,8 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        // the pass the next views belong to, for the diagnostics that name the title's render targets (VICTORY_RR_TARGETS)
+        crate::streamline::targets::pass(list, p, compute, self.depth, &self.targets);
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -5723,6 +5725,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // the compute-written textures of the pass being logged (VICTORY_RR_TARGETS), kept ungated for the release build
+            crate::streamline::targets::unordered(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.

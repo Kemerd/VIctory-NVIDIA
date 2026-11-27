@@ -70,6 +70,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
     // The layer's switches.
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
+    // DLSS Ray Reconstruction (`streamline`, `VICTORY_DLSS_RR`): its plugin loads and reports beside DLSS; it does not draw yet
+    // (the title's guide buffers are not identified), so Super Resolution still does the upscaling. Needs DLSS on.
+    Item { var: "VICTORY_DLSS_RR", label: "RAY RECONSTRUCTION (LOADS ONLY)", values: UNSET_ON, live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },

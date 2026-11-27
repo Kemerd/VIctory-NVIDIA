@@ -130,6 +130,39 @@ fn shader_of(stage: &'static str, bytes: std::borrow::Cow<[u8]>) -> Arc<Shader> 
         .clone()
 }
 
+impl Shader {
+    /// The program's own name where its container carries one: the first run of letters, digits and underscores that starts with CS_, PS_, VS_, MS_, GS_, HS_, DS_ or AS_ at a word boundary, up to 96 characters. Scans the whole container, so only the diagnostics that name passes (`streamline::targets`, once per pipeline) call it.
+    pub(crate) fn program_name(&self) -> Option<String> {
+        program_name_in(&self.container)
+    }
+}
+
+/// The first program name in `bytes`, see [`Shader::program_name`].
+fn program_name_in(bytes: &[u8]) -> Option<String> {
+    const PREFIXES: [&[u8]; 8] = [
+        b"CS_", b"PS_", b"VS_", b"MS_", b"GS_", b"HS_", b"DS_", b"AS_",
+    ];
+    // a name is cut here so a stray run of text cannot flood a log line
+    const LONGEST: usize = 96;
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for i in 0..bytes.len() {
+        let rest = &bytes[i..];
+        // a prefix only counts at a word boundary, so "xCS_" is not a name
+        if i > 0 && is_word(bytes[i - 1]) {
+            continue;
+        }
+        if !PREFIXES.iter().any(|p| rest.starts_with(p)) {
+            continue;
+        }
+        let len = rest.iter().take(LONGEST).take_while(|&&b| is_word(b)).count();
+        // a bare prefix is not a name, keep looking
+        if len > 3 {
+            return Some(String::from_utf8_lossy(&rest[..len]).into_owned());
+        }
+    }
+    None
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -833,6 +866,27 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn program_name_finds_the_first_name_at_a_word_boundary() {
+        assert_eq!(
+            program_name_in(b"\0\x01..PS_Example_Pass_01\0tail").as_deref(),
+            Some("PS_Example_Pass_01")
+        );
+        assert_eq!(program_name_in(b"xCS_notaname CS_Real").as_deref(), Some("CS_Real"));
+        assert_eq!(program_name_in(b"CS_ then VS_Ok").as_deref(), Some("VS_Ok"));
+        assert_eq!(program_name_in(b"no names here"), None);
+        assert_eq!(program_name_in(b""), None);
+    }
+
+    #[test]
+    fn program_name_is_cut_at_96() {
+        let mut bytes = b"\0CS_".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', 200));
+        let name = program_name_in(&bytes).unwrap();
+        assert_eq!(name.len(), 96);
+        assert!(name.starts_with("CS_aaa"));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
