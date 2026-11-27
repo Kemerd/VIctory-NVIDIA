@@ -2846,6 +2846,22 @@ const WHY_FENCE: usize = 10;
 /// copy, a fill of upload memory, a texture).
 static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atomic::AtomicU64::new(0) }; 18];
 
+/// `VICTORY_WAIT_SPLIT=1`: stats only, read once. Splits the waits for
+/// landings over title memory read or changed by whether the card had
+/// already run every flight when the wait began (what is left is the relay
+/// thread landing them) or flights were still on the card (the wait is the
+/// card finishing them).
+fn wait_split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_SPLIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, for [`wait_split`]: waits begun after the
+/// card had run every flight; their microseconds; waits begun with flights
+/// still on the card; their microseconds; the sum over waits of the flights
+/// in the line when the wait began.
+static WAIT_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
@@ -3510,6 +3526,18 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    // only for the two reasons the split is about, and only when asked for:
+    // looked at while the line is still held, so the flights counted and the
+    // fence read are the ones this wait is about.
+    let split = (why == WHY_READ || why == WHY_STALE) && wait_split();
+    let (flights, ran) = if split {
+        let flights = line.line.iter().filter(|l| matches!(l, Late::Run(_))).count() as u64;
+        // SAFETY: a plain query of our own fence.
+        let ran = host().is_some_and(|h| unsafe { h.fence.GetCompletedValue() } >= line.target);
+        (flights, ran)
+    } else {
+        (0, false)
+    };
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     let _waiting = crate::timeline::span(match why {
@@ -3529,6 +3557,12 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
+    if split {
+        let at = if ran { 0 } else { 2 };
+        WAIT_SPLIT[at].fetch_add(1, Ordering::Relaxed);
+        WAIT_SPLIT[at + 1].fetch_add(us, Ordering::Relaxed);
+        WAIT_SPLIT[4].fetch_add(flights, Ordering::Relaxed);
+    }
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
@@ -3773,6 +3807,20 @@ fn late_line(frames: f64) {
             w[WHY_WRITES],
             w[WHY_FENCE],
         );
+    }
+    if wait_split() {
+        let w: Vec<f64> = WAIT_SPLIT.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64).collect();
+        let waits = w[0] + w[2];
+        if waits > 0.0 {
+            tracing::info!(
+                "waits for landings over title memory read or changed, per frame (VICTORY_WAIT_SPLIT=1): {:.2} begun after the card had run every flight ({:.1} ms, the landing alone), {:.2} begun with flights still on the card ({:.1} ms), {:.1} flights in the line when a wait began (mean over waits)",
+                w[0] / frames,
+                w[1] / 1000.0 / frames,
+                w[2] / frames,
+                w[3] / 1000.0 / frames,
+                w[4] / waits,
+            );
+        }
     }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -8044,6 +8092,7 @@ fn submit_split_line(frames: f64) {
         ms[15],
     );
     lean::line(frames);
+    crate::shadow::refresh_split_line(frames);
     let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if first + again > 0.0 {
         tracing::info!(
@@ -8617,8 +8666,11 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        // A few copies and no texture: tried here first ([`lean::spread`]).
-        lean::spread(spans.len() + due.len(), !many && due.is_empty(), move |i| {
+        // A few copies, and no texture or only small ones (the latter with
+        // VICTORY_REFRESH_PROBE_TEXTURES): tried here first ([`lean::spread`]).
+        // taken before the closure moves `due`.
+        let small = !many && (due.is_empty() || lean::textures_small(&due, spans.len()));
+        lean::spread(spans.len() + due.len(), small, move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();

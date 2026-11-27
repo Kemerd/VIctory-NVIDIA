@@ -61,6 +61,60 @@ fn probe_of(setting: Option<&str>) -> Option<Duration> {
 /// spent here before either, and the refreshes done here.
 static PROBED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Bytes of title memory a due texture may read and still count as light for
+/// [`textures_small`].
+const SMALL_TEXTURE: usize = 256 << 10;
+
+/// Whether a flush with only light textures due still counts as small for
+/// [`spread`] (`VICTORY_REFRESH_PROBE_TEXTURES=1`; off by default: a flush with
+/// any texture due goes to the threads at once, as before). Only meaningful
+/// with [`probe`] set, so it is off without it.
+///
+/// 30 of the 36.5 flushes a frame in run12-live went straight to the kept
+/// threads, most because a texture was due or the flush was over 256 spans. A
+/// wake and a barrier for work of a few dozen microseconds is what the probe
+/// was written to avoid, and a texture that reads under 256 KiB, or was read
+/// ahead already, costs about as little as a few copies. The probe still bounds
+/// the time on this thread (its microseconds, plus the one refresh in progress,
+/// which for these textures is small). A texture refresh that blocks on another
+/// thread's hold of the same texture can run past the probe, since the probe is
+/// only looked at between refreshes; the line's "waiting for a texture another
+/// thread is refreshing" says whether that happens.
+fn probe_textures() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| probe().is_some() && textures_of(std::env::var("VICTORY_REFRESH_PROBE_TEXTURES").ok().as_deref()))
+}
+
+/// [`probe_textures`] for a setting: only "1".
+fn textures_of(setting: Option<&str>) -> bool {
+    setting == Some("1")
+}
+
+/// Since the last frame-rate line: flushes with textures due that were taken
+/// as small only because the textures were light.
+static TEXTURES_PROBED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether every texture in `due` is light enough ([`SMALL_TEXTURE`]) for the
+/// flush to be tried on this thread first. False with the switch off, so the
+/// caller's own test stands as it was. Counts a yes for a non-empty `due` when
+/// with the `spans` the flush has two or more pieces: with fewer it never went
+/// to the threads, so the textures did not change where it ran.
+pub(super) fn textures_small(due: &[std::sync::Arc<crate::texture::Staging>], spans: usize) -> bool {
+    if !probe_textures() || !due.iter().all(|t| t.cheap(SMALL_TEXTURE)) {
+        return false;
+    }
+    if !due.is_empty() && spans + due.len() >= 2 {
+        TEXTURES_PROBED.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
+/// Since the last frame-rate line (`VICTORY_REFRESH_SPLIT=1`): flushes with
+/// nothing left to do after the checks, flushes handed straight to the threads
+/// (one or more to do, or not small), the nanoseconds in those calls, and the
+/// refreshes in them.
+static SPLIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// What [`spread_with`] did.
 #[derive(Debug, PartialEq, Eq)]
 struct Spread {
@@ -106,10 +160,25 @@ fn serial_first(n: usize, probe: Duration, mut elapsed: impl FnMut() -> Duration
 }
 
 /// [`spread_with`] under [`probe`], counted. `small`: the caller's flush is one
-/// the probe is for (few spans, no textures due).
+/// the probe is for (few spans, and no textures due, or with
+/// `VICTORY_REFRESH_PROBE_TEXTURES=1` only light ones: [`textures_small`]).
 pub(super) fn spread(n: usize, small: bool, work: impl Fn(usize) + Send + Sync + 'static) {
     let Some(probe) = probe().filter(|_| small && n >= 2) else {
+        // (with the split switch off no clock is read and no counter touched.)
+        if !crate::shadow::refresh_split() {
+            crate::shadow::wide_each(n, work);
+            return;
+        }
+        if n == 0 {
+            SPLIT[0].fetch_add(1, Ordering::Relaxed);
+            crate::shadow::wide_each(n, work);
+            return;
+        }
+        let started = std::time::Instant::now();
         crate::shadow::wide_each(n, work);
+        SPLIT[1].fetch_add(1, Ordering::Relaxed);
+        SPLIT[2].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        SPLIT[3].fetch_add(n as u64, Ordering::Relaxed);
         return;
     };
     let started = std::time::Instant::now();
@@ -204,7 +273,9 @@ pub(super) fn line(frames: f64) {
     let o: [f64; 2] = std::array::from_fn(|i| OURS[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let d: [f64; 2] = std::array::from_fn(|i| DECLARED[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let p: [f64; 4] = std::array::from_fn(|i| PROBED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-    if o[0] + d[0] + p[0] + p[1] <= 0.0 {
+    let sp: [f64; 4] = std::array::from_fn(|i| SPLIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let textures = TEXTURES_PROBED.swap(0, Ordering::Relaxed) as f64 / frames;
+    if o[0] + d[0] + p[0] + p[1] + sp[0] + sp[1] <= 0.0 {
         return;
     }
     let across = if declare_across() {
@@ -212,7 +283,7 @@ pub(super) fn line(frames: f64) {
     } else {
         "VICTORY_DECLARE_ACROSS_LISTS is off".to_string()
     };
-    let probed = match probe() {
+    let mut probed = match probe() {
         Some(probe) => format!(
             "{:.1} small flushes done on this thread alone and {:.1} that went on to the threads, {:.2} ms in all these calls, \
              {:.0} refreshes made here (VICTORY_REFRESH_PROBE_US={})",
@@ -224,6 +295,11 @@ pub(super) fn line(frames: f64) {
         ),
         None => "VICTORY_REFRESH_PROBE_US is off".to_string(),
     };
+    if probe_textures() {
+        probed.push_str(&format!(
+            ", {textures:.1} flushes taken as small only because their due textures were light (VICTORY_REFRESH_PROBE_TEXTURES=1)"
+        ));
+    }
     tracing::info!(
         "the lists' other steps, per frame, the submitting thread: {:.1} steps of ours in {:.1} ms; {:.0} ranges shaders write \
          declared to host copies, {across}; {probed}",
@@ -231,6 +307,15 @@ pub(super) fn line(frames: f64) {
         o[1] / 1e6,
         d[0]
     );
+    if crate::shadow::refresh_split() {
+        tracing::info!(
+            "refresh flushes, per frame (VICTORY_REFRESH_SPLIT=1): {:.1} had nothing left after the checks, {:.1} went straight to the threads ({:.2} ms in the calls, {:.0} refreshes among them)",
+            sp[0],
+            sp[1],
+            sp[2] / 1e6,
+            sp[3]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +327,15 @@ mod tests {
     /// A table of how many times each number was called.
     fn tally(n: usize) -> Arc<Vec<AtomicUsize>> {
         Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect())
+    }
+
+    #[test]
+    fn the_texture_switch_is_one_and_nothing_else() {
+        assert!(textures_of(Some("1")));
+        assert!(!textures_of(None));
+        assert!(!textures_of(Some("")));
+        assert!(!textures_of(Some("0")));
+        assert!(!textures_of(Some("true")));
     }
 
     #[test]
