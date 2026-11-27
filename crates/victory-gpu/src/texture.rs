@@ -110,6 +110,11 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The frame a guarded texture was last read and digested whole in, as
+    /// the guard's check read it before the read ([`look_once`]). Noted
+    /// only where all of it was read: not for a partly mapped texture, a
+    /// first filling from the pages there, or a kernel read that failed.
+    looked: Option<u64>,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -406,6 +411,70 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 /// through the kernel without waiting, and those that had to wait (a page
 /// was not there).
 pub(crate) static EXACT_UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a guarded texture the guard saw no write to is read and
+/// digested at most once a frame (`VICTORY_TEXTURE_LOOK_ONCE=1`, off by
+/// default). Without it such a texture, while it is hot or on its turn, is
+/// read whole at every check: once per submission whose lists sample it,
+/// and again after every step of that submission that writes title memory
+/// (17-30 submissions a frame). With it, a check in the frame the texture
+/// was last read whole in finds nothing to do. A write the guard saw is
+/// read as before; exact refreshes (bakes) are never passed over.
+///
+/// What it saves is time of the threads that refresh, not frame time: the
+/// frame line's "textures" (the submitting thread's wall time) was 0.9 ms
+/// of 24 in ordinary frames and 9.75 of 390 while the world streamed in
+/// with ray tracing (logs of 2026-11-26), and in streaming the submitting
+/// thread stands about 178 ms a frame waiting for translation. How much
+/// the hashing of second looks is shows in [`look_once_line`] with the
+/// switch off; if it is small the switch has nothing to give.
+///
+/// The risk, said plainly: a texture written by a way the guard cannot see
+/// (another view of its pages) between two samplings in one frame shows
+/// the older bytes to the later one; written so every frame, it stays one
+/// write behind for the later sampling as long as that goes on. A texture
+/// that is not hot is still found within eight frames, as now. It relies
+/// on the frame counter advancing, as the turns of [`Staging::refresh`]
+/// already do.
+fn look_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOOK_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, guarded textures the guard saw no write
+/// to that went to a read anyway (hot or on their turn) and their bytes;
+/// of them, those that had been read whole in the same frame already and
+/// their bytes; and with [`look_once`], those passed over for that and
+/// their bytes. Kept whether the switch is on or not.
+pub(crate) static LOOK_ONCE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Whether a texture last read whole in frame `looked` (`None`: not since
+/// it was made or forgotten) was read whole in `frame` already. A frame
+/// counter that moved on during the read makes the next look a first one.
+fn looked_already(looked: Option<u64>, frame: u64) -> bool {
+    looked == Some(frame)
+}
+
+/// The periodic line of [`LOOK_ONCE`], per frame (`frames` since the last).
+pub(crate) fn look_once_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if frames <= 0.0 {
+        return;
+    }
+    let [looks, bytes, again, again_bytes, skipped, skipped_bytes] =
+        [0, 1, 2, 3, 4, 5].map(|i| LOOK_ONCE[i].swap(0, Relaxed) as f64 / frames);
+    if looks + skipped > 0.0 {
+        tracing::info!(
+            "guarded textures read with no write told, per frame: {looks:.1} ({:.1} MB), of them {again:.1} ({:.1} MB) \
+             read whole in the same frame already; {skipped:.1} ({:.1} MB) passed over for that \
+             (VICTORY_TEXTURE_LOOK_ONCE=1: now {})",
+            bytes / 1e6,
+            again_bytes / 1e6,
+            skipped_bytes / 1e6,
+            if look_once() { "on" } else { "off" }
+        );
+    }
+}
 
 /// Whether an exact refresh (the uploads before a bake, `BAKING`) that
 /// finds the runtime remapping title memory first reads the texture whole
@@ -1477,6 +1546,9 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        // The frame the guard's check below read, noted in `last.looked`
+        // where the texture is then read whole ([`look_once`]).
+        let mut looked = None;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1496,6 +1568,24 @@ impl Staging {
             let hot = hot_textures() && frame < last.hot_until;
             if !exact && unwritten && !turn && !hot {
                 return 0;
+            }
+            looked = Some(frame);
+            // Hot or on its turn with no write told: read whole at every
+            // such check today, possibly several times in one frame.
+            if !exact && unwritten {
+                use std::sync::atomic::Ordering::Relaxed;
+                let again = looked_already(last.looked, frame);
+                if again && look_once() {
+                    LOOK_ONCE[4].fetch_add(1, Relaxed);
+                    LOOK_ONCE[5].fetch_add(size as u64, Relaxed);
+                    return 0;
+                }
+                LOOK_ONCE[0].fetch_add(1, Relaxed);
+                LOOK_ONCE[1].fetch_add(size as u64, Relaxed);
+                if again {
+                    LOOK_ONCE[2].fetch_add(1, Relaxed);
+                    LOOK_ONCE[3].fetch_add(size as u64, Relaxed);
+                }
             }
             blind = unwritten;
         }
@@ -1518,13 +1608,13 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, looked);
             };
             mapped
         } else if exact && exact_unlocked() {
             match crate::watch::title_memory_reading_now() {
                 Some(mapped) => mapped,
-                None => match self.refresh_exact_unlocked(last, size) {
+                None => match self.refresh_exact_unlocked(last, size, looked) {
                     Some(read) => {
                         if read {
                             found_blind(last);
@@ -1581,6 +1671,7 @@ impl Staging {
         if through_copy() || !crate::watch::soft_runs(start, size).is_empty() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
+                last.looked = looked;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1598,6 +1689,7 @@ impl Staging {
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
+        last.looked = looked;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1618,12 +1710,13 @@ impl Staging {
     /// next refresh (what was learnt about writes to it is forgotten, so
     /// that it is not passed over as unwritten); one never filled takes the
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, looked: Option<u64>) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
+            last.looked = looked;
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
@@ -1650,13 +1743,14 @@ impl Staging {
     /// lock would be. `Some(changed)` if read (and detiled if it changed),
     /// `None` if a page was missing: then the refresh waits for the lock
     /// as before.
-    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize) -> Option<bool> {
+    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize, looked: Option<u64>) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut changed = false;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
+            last.looked = looked;
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
@@ -2361,6 +2455,24 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+/// [`looked_already`]: what `VICTORY_TEXTURE_LOOK_ONCE` passes over.
+#[cfg(test)]
+mod look_once_tests {
+    use super::{Last, looked_already};
+
+    /// A texture never read whole, or forgotten, is read at its first look
+    /// of a frame; one read whole in this frame is passed over; one read in
+    /// the frame before, or read while the counter moved on, is read again.
+    #[test]
+    fn only_a_second_look_in_the_same_frame_is_passed_over() {
+        assert!(!looked_already(Last::default().looked, 0));
+        assert!(!looked_already(None, 7));
+        assert!(looked_already(Some(7), 7));
+        assert!(!looked_already(Some(6), 7));
+        assert!(!looked_already(Some(7), 8));
     }
 }
 
