@@ -1,8 +1,7 @@
 # VIctory-NVIDIA-RT
 
-A fork of [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) with the work from
-[pull request #18](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/18): higher frame rates,
-32:9 and HDR10, a one-click launcher with every option, and the groundwork for the title's ray
+A fork of [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA), released on its own:
+higher frame rates, 32:9 and HDR10, a one-click launcher with every option, and the groundwork for the title's ray
 tracing on the RTX cores.
 
 **Download:** [latest test build](https://github.com/Kemerd/VIctory-NVIDIA-RT/releases) (`victory.exe` + `PLAY.cmd`).
