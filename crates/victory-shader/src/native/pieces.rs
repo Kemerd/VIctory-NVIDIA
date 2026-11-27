@@ -150,6 +150,8 @@ fn outside(value: u32, unhandled: u32, fields: &[(u32, Refusal)], other: Refusal
 /// (21), the two clip and cull distance vectors (22, 23) and the side bus
 /// for the miscellaneous vector (24).
 const CL_CLIP_DIST_ENA: u32 = 0xff;
+const CL_CULL_DIST_ENA: u32 = 0xff00;
+const CL_MISC_SIDE_BUS: u32 = 1 << 24;
 const CL_CCDIST0_VEC: u32 = 1 << 22;
 const CL_CCDIST1_VEC: u32 = 1 << 23;
 
@@ -160,15 +162,30 @@ const CL_CCDIST1_VEC: u32 = 1 << 23;
 /// (the first vector holds 0-3, the second 4-7: radeonsi's export order, and
 /// the order the lowering of a position export takes), each vector exported
 /// where `VS_OUT_CCDIST0_VEC_ENA` or `VS_OUT_CCDIST1_VEC_ENA` says and in
-/// the four-component format. Cull distances and the miscellaneous vector
-/// are refused: a capture has a cull distance 0 enabled beside the clip
-/// distance 0 and a single exported channel, which does not say which
-/// channel a cull distance takes.
+/// the four-component format. A cull distance enabled on exactly the channels
+/// of the clip distances is one clip distance: radv and radeonsi set
+/// `CULL_DIST_ENA` on the clip channels too (radeonsi: "for points, we need
+/// to set the cull distance bits too because the clip distance bits have no
+/// effect on them"), so the pair is how a plain clip distance is written, and
+/// D3D clips a primitive or a point whose distance is negative. A cull
+/// distance on any other channel set and the miscellaneous vector are
+/// refused. `VS_OUT_MISC_SIDE_BUS_ENA` is taken only where Mesa sets it
+/// without the miscellaneous vector: on GFX10.3 and later when there is more
+/// than one position export, here a clip distance vector.
 fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
     if pos_format & 0xf != 4 {
         return Err("SPI_SHADER_POS_FORMAT POS0_EXPORT_FORMAT other than 4COMP (4)");
     }
-    let rest = out_cntl & !(CL_CLIP_DIST_ENA | CL_CCDIST0_VEC | CL_CCDIST1_VEC);
+    let mut known = CL_CLIP_DIST_ENA | CL_CCDIST0_VEC | CL_CCDIST1_VEC;
+    // The cull enables that merely repeat the clip enables.
+    if out_cntl >> 8 & 0xff == out_cntl & CL_CLIP_DIST_ENA {
+        known |= CL_CULL_DIST_ENA;
+    }
+    // The side bus beside an extra position export that is a distance vector.
+    if out_cntl & (CL_CCDIST0_VEC | CL_CCDIST1_VEC) != 0 {
+        known |= CL_MISC_SIDE_BUS;
+    }
+    let rest = out_cntl & !known;
     if rest != 0 {
         return Err(outside(
             out_cntl,
@@ -176,7 +193,7 @@ fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
             &[
                 (
                     0xff00,
-                    "PA_CL_VS_OUT_CNTL CULL_DIST_ENA_0..7 (bits 8-15): the channel of a cull distance is not settled",
+                    "PA_CL_VS_OUT_CNTL CULL_DIST_ENA_0..7 (bits 8-15) other than the CLIP_DIST_ENA channels",
                 ),
                 (
                     0x1f_0000,
@@ -185,7 +202,7 @@ fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
                 (1 << 21, "PA_CL_VS_OUT_CNTL VS_OUT_MISC_VEC_ENA (bit 21)"),
                 (
                     1 << 24,
-                    "PA_CL_VS_OUT_CNTL VS_OUT_MISC_SIDE_BUS_ENA (bit 24)",
+                    "PA_CL_VS_OUT_CNTL VS_OUT_MISC_SIDE_BUS_ENA (bit 24) without a clip distance vector",
                 ),
             ],
             "PA_CL_VS_OUT_CNTL bits above bit 24",
@@ -2483,18 +2500,31 @@ mod tests {
             let why = clip_distances(0x44, 1 | vec0 | bits).unwrap_err();
             assert!(why.contains(field), "{bits:#x}: {why}");
         };
-        named(1 << 8, "CULL_DIST_ENA");
+        named(1 << 9, "CULL_DIST_ENA");
         named(1 << 15, "CULL_DIST_ENA");
         named(1 << 16, "USE_VTX_POINT_SIZE");
         named(1 << 19, "VIEWPORT_INDX");
         named(1 << 21, "VS_OUT_MISC_VEC_ENA");
-        named(1 << 24, "VS_OUT_MISC_SIDE_BUS_ENA");
         named(1 << 25, "above bit 24");
         named(1 << 31, "above bit 24");
-        // The one value captured: a clip and a cull distance 0, a vector
-        // and the side bus.
-        let seen = 0x0140_0101;
-        assert!(clip_distances(0x44, seen).unwrap_err().contains("CULL_DIST_ENA"));
+        // The one value captured: clip distance 0 repeated as a cull
+        // distance, a vector and the side bus. It is one clip distance.
+        assert_eq!(clip_distances(0x44, 0x0140_0101), Ok(1));
+        // The cull enables equal to the clip enables, on more channels.
+        assert_eq!(clip_distances(0x444, 0x1f1f | vec0 | vec1), Ok(5));
+        assert_eq!(clip_distances(0x44, 0x0f0f | vec0 | (1 << 24)), Ok(4));
+        // The side bus alone beside a clip distance vector.
+        assert_eq!(clip_distances(0x44, 1 | vec0 | (1 << 24)), Ok(1));
+        // Any other pairing of cull and clip is refused.
+        let cull = |out: u32| clip_distances(0x44, out | vec0).unwrap_err();
+        assert!(cull(0x100).contains("CULL_DIST_ENA"), "a cull distance with no clip");
+        assert!(cull(0x101 | 0x200).contains("CULL_DIST_ENA"), "a cull distance beyond the clip");
+        assert!(cull(0x301).contains("CULL_DIST_ENA"), "more cull than clip");
+        assert!(cull(0x201).contains("CULL_DIST_ENA"), "cull on another channel");
+        assert!(cull(1 | 0x100 | 1 << 21).contains("VS_OUT_MISC_VEC_ENA"));
+        // The side bus without a distance vector is not the Mesa form.
+        assert!(clip_distances(4, 1 << 24).unwrap_err().contains("SIDE_BUS"));
+        assert!(clip_distances(4, 1 << 24 | 1 << 21).unwrap_err().contains("MISC_VEC_ENA"));
     }
 
     #[test]
