@@ -10916,6 +10916,38 @@ impl<'a> Lower<'a> {
             let x = l.operand(inst, &op.ok_or("an interpolation operand")?)?;
             Ok(l.as_float(x))
         };
+        // An input that is a constant (SPI_PS_INPUT_CNTL OFFSET 0x20, made
+        // from loose pieces) is held by no signature element: whatever the
+        // vertex program exports, the input is DEFAULT_VAL's value. It is
+        // the vertex values P0, and what an interpolation weighs P10 and
+        // P20 by is the difference of equal values, zero, so a first half
+        // gives the constant, a second half leaves what it was given, and
+        // a read of P10 or P20 gives zero.
+        let held = match *interp {
+            Interp::Interpolated { attribute, .. }
+            | Interp::Vertex { attribute, .. }
+            | Interp::Weighted { attribute } => attribute,
+        };
+        if let Some(value) = crate::native::PsInput::default_value(held.row) {
+            if name.ends_with("_f16") || held.high {
+                return Err("a 16-bit read of a constant input");
+            }
+            let constant = crate::native::PsInput::default_channel(value, held.channel);
+            let x = match *interp {
+                Interp::Weighted { .. } if !name.starts_with("v_interp_p1") => {
+                    let old = match &inst.fields {
+                        Fields::Valu(v) => v.src.get(2).copied(),
+                        _ => Some(dst),
+                    };
+                    float(self, old)?
+                }
+                Interp::Vertex { vertex, .. } if vertex != 2 => self.s.m.f32(0f32.to_bits()),
+                _ => self.s.m.f32(constant.to_bits()),
+            };
+            let x = self.as_int(x);
+            self.write(inst, Reg::V(reg), x, None);
+            return Ok(());
+        }
         // What the result adds to the evaluated channel (a second half's
         // first half, when the halves evaluate on their own).
         let mut add = None;
@@ -12667,6 +12699,23 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether the program was made from loose pieces ([`crate::pieces`])
+    /// and not passed by a title in a container. Those programs carry a
+    /// layout entry whose `RootType::Other` code is in the 0x200 range (the
+    /// vertex buffer table, [`crate::native::VERTEX_BUFFERS`], is the
+    /// first); a title's programs never do, the codes the host computes
+    /// for them lie in the 0x100 range. What the pieces added to the
+    /// translation is taken only where this holds, so a title's shaders
+    /// translate as they did before the pieces existed.
+    fn made_from_pieces(&self) -> bool {
+        let range = crate::native::VERTEX_BUFFERS >> 8;
+        self.x
+            .native
+            .layout
+            .iter()
+            .any(|p| matches!(p.root, RootType::Other(code) if code >> 8 == range))
+    }
+
     /// Whether layout entry `param` is the table of vertex buffer
     /// descriptors of a program that fetches its own attributes.
     fn vertex_table(&self, param: usize) -> bool {
@@ -12794,12 +12843,15 @@ impl<'a> Lower<'a> {
         // dwords: channel c in half c % 2 of dword c / 2. It is taken apart
         // for a render target the signature declares as 16-bit floats (a
         // program whose exports are final, made from loose pieces, with the
-        // `FP16_ABGR` export format); what the halves are under any other
-        // format is not known here.
+        // `FP16_ABGR` export format) or as 16-bit integers (`UINT16_ABGR`,
+        // `SINT16_ABGR`); what the halves are under any other format is not
+        // known here.
         let packed = match e.target {
-            Target::Color(n) if e.compressed => {
+            // (only for a program made from pieces: a title's container
+            // keeps the refusal)
+            Target::Color(n) if e.compressed && self.made_from_pieces() => {
                 let declared = self.s.outputs.iter().any(|o| {
-                    o.kind == 16 && o.row == Some(u32::from(n)) && o.half && o.comp == 9
+                    o.kind == 16 && o.row == Some(u32::from(n)) && o.half && matches!(o.comp, 4 | 5 | 9)
                 });
                 if !declared {
                     return Err("a compressed export");
@@ -12945,6 +12997,14 @@ impl<'a> Lower<'a> {
                     let k = usize::from(n - 1) * 4 + usize::from(ch);
                     flat.get(k).copied()
                 }
+                // (pos3 exists only behind a misc vector in pos1, whose point
+                // size, layer and viewport D3D12 does not take from a
+                // vertex program the way the hardware does)
+                Target::Position(_) if self.made_from_pieces() => {
+                    return Err(
+                        "pos3 (PA_CL_VS_OUT_CNTL USE_VTX_POINT_SIZE / VS_OUT_MISC_VEC_ENA: a misc vector in pos1)",
+                    );
+                }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),
             };
@@ -12999,7 +13059,29 @@ impl<'a> Lower<'a> {
         };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
-            if let Some(high) = half {
+            let comp = elements(self, primitive)[id].comp;
+            if let Some(high) = half
+                && packed
+                && matches!(comp, 4 | 5)
+            {
+                // A half of a compressed export under a 16-bit integer
+                // format, declared a 32-bit integer on the host: zero extended where unsigned (comp 5), sign extended
+                // where signed (comp 4).
+                let c = self.cur;
+                let k16 = self.s.m.i32(16);
+                x = match (comp, high) {
+                    (5, true) => self.s.m.bin(c, Bin::LShr, x, k16),
+                    (5, false) => {
+                        let mask = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, x, mask)
+                    }
+                    (_, true) => self.s.m.bin(c, Bin::AShr, x, k16),
+                    (_, false) => {
+                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
+                        self.s.m.bin(c, Bin::AShr, up, k16)
+                    }
+                };
+            } else if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
                 if high {
@@ -14123,5 +14205,94 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// Lowers a pixel program that exports `v0..v3` to render target 0 in
+    /// compressed form, with `layout` as its root parameters and a
+    /// 16-bit render target declared as `comp` (9 floats, 5 unsigned
+    /// integers, 4 signed ones). Gives the refusal's reason, if any.
+    fn compressed_export(layout: Vec<RootParam>, comp: u8) -> Option<&'static str> {
+        use super::super::container::SigElement;
+        use crate::native::PsInput;
+        // exp mrt0 v0, v1, off, off compr done vm; s_endpgm
+        let words = [0xF800_1C0F, 0x0000_0201, S_ENDPGM];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout,
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: Vec::<PsInput>::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: true,
+        };
+        let p = ir::build(&native.code, false, 4).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        match lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        }) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(_) => Some("another error"),
+            Ok(_) => None,
+        }
+    }
+
+    /// A compressed export is taken apart only for a program made from
+    /// loose pieces: a title's container keeps the refusal, whatever its
+    /// signature declares.
+    #[test]
+    fn a_compressed_export_is_unpacked_only_for_pieces() {
+        let ours = |code| RootParam {
+            root: RootType::Other(code),
+            table_offset_dwords: 0,
+            sgprs: 0,
+            base_register: 0,
+            user_data: 0,
+            slot: u8::MAX,
+        };
+        for comp in [9, 5, 4] {
+            assert_eq!(
+                compressed_export(vec![], comp),
+                Some("a compressed export"),
+                "a title's program, comp {comp}"
+            );
+            // the host's own codes (0x100 range) are not pieces either
+            assert_eq!(
+                compressed_export(vec![ours(0x101)], comp),
+                Some("a compressed export"),
+                "a host-computed code, comp {comp}"
+            );
+            assert_eq!(
+                compressed_export(vec![ours(crate::native::VERTEX_BUFFERS + 1)], comp),
+                None,
+                "a program made from pieces, comp {comp}"
+            );
+        }
     }
 }

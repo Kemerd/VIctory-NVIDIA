@@ -36,7 +36,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
-use super::host::{GraphicsState, integer_format};
+use super::host::GraphicsState;
 use super::{Shader, hand_out, shader_of};
 use crate::object::{HRESULT, Iid, This};
 
@@ -168,14 +168,54 @@ pub(crate) fn compute(
     Ok(hand_out(vec![shader], None, iid, out))
 }
 
+/// Refuses a description whose words after the vertex stage are not zero.
+/// They are room for five more stage slots of four words (code, then
+/// metadata, as the two before them; a guess, no capture had any set), and
+/// a title's description of a pipeline with a stage besides the pixel and
+/// the vertex stage sets one: run 10 had 11,000 such calls. Which stage a
+/// slot is was not captured either (the console's order of stages would
+/// make them the geometry, export, hull and local stages, a guess), so
+/// each refusal names the slot and the first call of each logs its words.
+///
+/// What support would take: the host translates the vertex, mesh, pixel and
+/// compute stages and builds no pipeline with a geometry, hull or domain
+/// stage (`HostPipeline::new` says so), so any such pipeline needs those
+/// stage kinds first, whatever the description says. A slot that holds a
+/// stage the host does build (a vertex stage that runs as an export stage
+/// of the console's geometry path, say) needs its metadata kind and the
+/// packet's registers for it understood, which only a capture of such a
+/// description gives.
+fn other_stages(rest: &[u64; 20]) -> Result<(), Refusal> {
+    let Some(slot) = rest.chunks(4).position(|w| w.iter().any(|&v| v != 0)) else {
+        return Ok(());
+    };
+    let why = [
+        "a graphics description with a stage in its first extra slot (+0x68)",
+        "a graphics description with a stage in its second extra slot (+0x88)",
+        "a graphics description with a stage in its third extra slot (+0xa8)",
+        "a graphics description with a stage in its fourth extra slot (+0xc8)",
+        "a graphics description with a stage in its fifth extra slot (+0xe8)",
+    ][slot.min(4)];
+    // Once per slot: the words say whether it is a stage (an address and a
+    // length that look like one) or something else.
+    static SEEN: std::sync::Mutex<[bool; 5]> = std::sync::Mutex::new([false; 5]);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !std::mem::replace(&mut seen[slot.min(4)], true) {
+        let w = &rest[slot * 4..slot * 4 + 4];
+        tracing::warn!(
+            words = format_args!("{:#x} {:#x} {:#x} {:#x}", w[0], w[1], w[2], w[3]),
+            "a pipeline from pieces is not made: {why} (logged once for this slot)"
+        );
+    }
+    Err(why)
+}
+
 /// The containers of the stages `d` describes, vertex first, and the
 /// pipeline's state.
 fn graphics_parts(
     d: &GraphicsDesc,
 ) -> Result<(Vec<(&'static str, Vec<u8>)>, GraphicsState), Refusal> {
-    if d.rest != [0; 20] {
-        return Err("a graphics description with more than a pixel and a vertex stage");
-    }
+    other_stages(&d.rest)?;
     // A pixel stage is there whole or not at all.
     let pixel = [d.pixel_code, d.pixel_metadata];
     let has_pixel = pixel.iter().any(|p| p.address != 0 || p.len != 0);
@@ -185,7 +225,7 @@ fn graphics_parts(
     let state = &mut state[..len(d.state, pieces::MAX_STATE)?];
     read(d.packet, packet)?;
     read(d.state, state)?;
-    let g = Graphics::parse(packet, state, has_pixel)?;
+    let g = Graphics::parse(packet, state, has_pixel).inspect_err(|why| unparsed(why, packet, state))?;
     // The state before any code is read: most refusals are decided here.
     let host = state_of(&g)?;
     let stage = |code: Pair,
@@ -229,20 +269,62 @@ pub(crate) fn graphics(
     Ok(hand_out(shaders, Some(Box::new(state)), iid, out))
 }
 
-/// A register value this module has no host state for.
-fn unknown(what: Refusal, register: &'static str, value: u32) -> Refusal {
-    // Once per register: the value says what a later change must cover.
+/// Says once per reason what the registers of a packet that does not parse
+/// hold. A reason names a field; the values say what it held, which is what
+/// a later change has to cover. Log only: nothing is kept.
+fn unparsed(why: Refusal, packet: &[u8], state: &[u8]) {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&register) {
-        seen.push(register);
+    if seen.contains(&why) {
+        return;
+    }
+    seen.push(why);
+    tracing::warn!(
+        registers = %Graphics::describe(packet, state),
+        "a graphics packet is not parsed: {why} (logged once for this reason)"
+    );
+}
+
+/// A register value this module has no host state for.
+fn unknown(what: Refusal, register: &'static str, value: u32) -> Refusal {
+    // Once per reason: the value says what a later change must cover, and
+    // a register refused for two fields shows the value of each.
+    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&what) {
+        seen.push(what);
         tracing::warn!(
             register,
             value = format_args!("{value:#x}"),
-            "a pipeline from pieces is not made: {what} (logged once for this register)"
+            "a pipeline from pieces is not made: {what} (logged once for this reason)"
         );
     }
     what
+}
+
+/// The depth-stencil view format for the state piece's depth format byte,
+/// `None` for one that has no depth-stencil format. D3D12 has four of
+/// those (D32_FLOAT_S8X24_UINT 20, D32_FLOAT 40, D24_UNORM_S8_UINT 45,
+/// D16_UNORM 55) and a pipeline's must be one of them. The same bits are
+/// also named by the typeless and shader-view formats of their families,
+/// which a title may give for the texture it renders depth into, so those
+/// map to the member of the family that is a depth-stencil format. The
+/// console's 16-bit depth with 8-bit stencil (118, and its two view
+/// formats) is the 24-bit one on the host, as for the title's textures.
+fn depth_format_of(format: u8) -> Option<DXGI_FORMAT> {
+    let family = match crate::resource::pc_format(format.into()) {
+        0 => return Some(DXGI_FORMAT_UNKNOWN),
+        // R32G8X24_TYPELESS, R32_FLOAT_X8X24_TYPELESS, X32_TYPELESS_G8X24_UINT
+        19 | 20 | 21 | 22 => DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        // R32_TYPELESS and R32_FLOAT (as a depth texture's view)
+        39 | 40 | 41 => DXGI_FORMAT_D32_FLOAT,
+        // R24G8_TYPELESS, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT
+        44 | 45 | 46 | 47 => DXGI_FORMAT_D24_UNORM_S8_UINT,
+        // R16_TYPELESS, D16_UNORM and R16_UNORM
+        53 | 55 | 56 => DXGI_FORMAT_D16_UNORM,
+        _ => return None,
+    };
+    Some(family)
 }
 
 /// The host's graphics state for a packet's registers and its state piece.
@@ -266,17 +348,18 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
     for (to, &format) in s.targets.RTFormats.iter_mut().zip(&g.target_formats) {
         let host = crate::resource::target_format(crate::resource::pc_format(format.into()));
         *to = DXGI_FORMAT(host as i32);
-        // The exports are floats; what an integer target would take from
-        // them is not known.
-        if integer_format(*to) {
-            return Err("an integer render target");
-        }
+        // (an integer target is fed by the program's own integer exports,
+        // which the pixel stage's signature declares as such; the host
+        // creation turns blending off on it, as D3D12 requires)
     }
-    // (none, D32_FLOAT_S8X24, D32_FLOAT, D24_UNORM_S8, D16_UNORM)
-    if !matches!(g.depth_format, 0 | 20 | 40 | 45 | 55) {
-        return Err("a depth format that is not handled");
-    }
-    s.depth_format = DXGI_FORMAT(crate::resource::pc_format(g.depth_format.into()) as i32);
+    let Some(depth_format) = depth_format_of(g.depth_format) else {
+        return Err(unknown(
+            "a depth format that is not handled",
+            "the state piece's depth format",
+            g.depth_format.into(),
+        ));
+    };
+    s.depth_format = depth_format;
     s.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(g.topology.into());
 
     // The input layout: every element in slot 0, per vertex, at the byte
@@ -304,16 +387,41 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
         })
         .collect();
 
-    // CB_COLOR_CONTROL: mode 1 (normal) or 0 (no colour written), with the
-    // raster operation that copies the source.
-    let colour = match r.cb_color_control {
-        0x00cc_0010 => true,
-        0x00cc_0000 => false,
-        v => {
+    // CB_COLOR_CONTROL: DISABLE_DUAL_QUAD (bit 0), ENABLE_1FRAG_PS_INVOKE
+    // (1), DEGAMMA_ENABLE (3), MODE (4-6: 1 normal, 0 no colour written)
+    // and ROP3 (16-23: 0xcc copies the source). DISABLE_DUAL_QUAD turns the
+    // render backend's blend optimisations off (Mesa sets it for dual
+    // source blending and logic operations, which they cannot do); what is
+    // drawn is the same, so it maps to nothing.
+    let cc = r.cb_color_control;
+    if cc & !0x00ff_0071 != 0 {
+        return Err(unknown(
+            if cc & 2 != 0 {
+                "CB_COLOR_CONTROL ENABLE_1FRAG_PS_INVOKE (bit 1)"
+            } else if cc & 8 != 0 {
+                "CB_COLOR_CONTROL DEGAMMA_ENABLE (bit 3)"
+            } else {
+                "CB_COLOR_CONTROL bits outside its documented fields"
+            },
+            "CB_COLOR_CONTROL",
+            cc,
+        ));
+    }
+    if cc >> 16 != 0xcc {
+        return Err(unknown(
+            "CB_COLOR_CONTROL ROP3 (bits 16-23) other than copy",
+            "CB_COLOR_CONTROL",
+            cc,
+        ));
+    }
+    let colour = match cc >> 4 & 7 {
+        1 => true,
+        0 => false,
+        _ => {
             return Err(unknown(
-                "a colour mode or raster operation that is not handled",
+                "CB_COLOR_CONTROL MODE (bits 4-6) other than disabled and normal",
                 "CB_COLOR_CONTROL",
-                v,
+                cc,
             ));
         }
     };
@@ -326,6 +434,20 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
         // and its inverse, source alpha saturated
         0..=10 => Some(D3D12_BLEND(v as i32 + 1)),
         _ => None,
+    };
+    // The alpha channel has no colour to blend with: the hardware reads a
+    // colour factor there as the alpha of the same operand, while D3D12
+    // refuses the colour factors in the alpha slots outright. This matters
+    // most when SEPARATE_ALPHA_BLEND is clear and alpha reuses colour's
+    // table, but a separate alpha table may name them too.
+    let for_alpha = |b: Option<D3D12_BLEND>| {
+        b.map(|b| match b {
+            D3D12_BLEND_SRC_COLOR => D3D12_BLEND_SRC_ALPHA,
+            D3D12_BLEND_INV_SRC_COLOR => D3D12_BLEND_INV_SRC_ALPHA,
+            D3D12_BLEND_DEST_COLOR => D3D12_BLEND_DEST_ALPHA,
+            D3D12_BLEND_INV_DEST_COLOR => D3D12_BLEND_INV_DEST_ALPHA,
+            other => other,
+        })
     };
     let function = |v: u32| match v {
         0 => Some(D3D12_BLEND_OP_ADD),
@@ -346,14 +468,15 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
         if v & 1 << 30 == 0 {
             continue;
         }
-        // With one set of factors for both, alpha takes colour's.
+        // With one set of factors for both, alpha takes colour's (as alpha
+        // factors, see `for_alpha`).
         let alpha = if v & 1 << 29 != 0 { v >> 16 } else { v };
         let fields = (
             factor(v & 0x1f),
             factor(v >> 8 & 0x1f),
             function(v >> 5 & 7),
-            factor(alpha & 0x1f),
-            factor(alpha >> 8 & 0x1f),
+            for_alpha(factor(alpha & 0x1f)),
+            for_alpha(factor(alpha >> 8 & 0x1f)),
             function(alpha >> 5 & 7),
         );
         let (Some(src), Some(dst), Some(op), Some(src_alpha), Some(dst_alpha), Some(op_alpha)) =
@@ -830,6 +953,100 @@ mod tests {
         let mut faces = packet.clone();
         put(&mut faces, 0xc4, 1 << 24);
         assert!(state_of(&Graphics::parse(&faces, &state_piece(), false).unwrap()).is_err());
+    }
+
+    /// The state of a packet with `blend` in every target's blend register.
+    fn blended(blend: u32) -> GraphicsState {
+        let mut packet = graphics_packet();
+        put(&mut packet, 0x7c, 0x00cc_0010);
+        for n in 0..8 {
+            put(&mut packet, 0xd0 + 4 * n, blend);
+        }
+        state_of(&Graphics::parse(&packet, &state_piece(), false).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn colour_factors_in_the_alpha_slots_become_alpha_factors() {
+        // One table for both (bit 29 clear): source and inverse source
+        // colour, then destination and its inverse. D3D12 refuses the
+        // colour factors for alpha, the hardware reads them as alpha.
+        for (src, dst, want) in [
+            (2, 3, (D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA)),
+            (8, 9, (D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA)),
+            // factors that are alpha ones already stay
+            (4, 5, (D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA)),
+            (0, 1, (D3D12_BLEND_ZERO, D3D12_BLEND_ONE)),
+        ] {
+            let s = blended(1 << 30 | dst << 8 | src);
+            let t = &s.blend.RenderTarget[0];
+            assert_eq!((t.SrcBlendAlpha, t.DestBlendAlpha), want);
+            // colour keeps the colour factors
+            assert_eq!(t.SrcBlend.0, src as i32 + 1);
+            assert_eq!(t.DestBlend.0, dst as i32 + 1);
+        }
+        // Separate alpha factors that name colour ones are read the same.
+        let s = blended(1 << 30 | 1 << 29 | 9 << 24 | 8 << 16 | 1 << 8 | 1);
+        let t = &s.blend.RenderTarget[0];
+        assert_eq!(
+            (t.SrcBlendAlpha, t.DestBlendAlpha),
+            (D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA)
+        );
+    }
+
+    #[test]
+    fn colour_control_with_the_dual_quad_bit_is_a_plain_copy() {
+        let mut packet = graphics_packet();
+        put(&mut packet, 0x7c, 0x00cc_0011);
+        let g = Graphics::parse(&packet, &state_piece(), false).unwrap();
+        assert!(state_of(&g).is_ok());
+        // A raster operation other than copy, and a mode other than normal.
+        for cc in [0x0066_0010, 0x00cc_0020] {
+            put(&mut packet, 0x7c, cc);
+            let g = Graphics::parse(&packet, &state_piece(), false).unwrap();
+            assert!(state_of(&g).is_err(), "{cc:#x}");
+        }
+    }
+
+    #[test]
+    fn depth_formats_are_depth_stencil_formats() {
+        assert_eq!(depth_format_of(0), Some(DXGI_FORMAT_UNKNOWN));
+        for (given, want) in [
+            (20, DXGI_FORMAT_D32_FLOAT_S8X24_UINT),
+            (19, DXGI_FORMAT_D32_FLOAT_S8X24_UINT),
+            (40, DXGI_FORMAT_D32_FLOAT),
+            (39, DXGI_FORMAT_D32_FLOAT),
+            (41, DXGI_FORMAT_D32_FLOAT),
+            (45, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (44, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (118, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (119, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (55, DXGI_FORMAT_D16_UNORM),
+            (53, DXGI_FORMAT_D16_UNORM),
+            (56, DXGI_FORMAT_D16_UNORM),
+        ] {
+            assert_eq!(depth_format_of(given), Some(want), "{given}");
+        }
+        // Colour formats are no depth format.
+        for given in [1, 2, 10, 28, 87, 255] {
+            assert_eq!(depth_format_of(given), None, "{given}");
+        }
+    }
+
+    #[test]
+    fn extra_stage_slots_are_refused_by_slot() {
+        assert_eq!(other_stages(&[0; 20]), Ok(()));
+        let mut rest = [0u64; 20];
+        let mut reasons = Vec::new();
+        for slot in 0..5 {
+            rest = [0; 20];
+            rest[slot * 4 + 3] = 0x40;
+            reasons.push(other_stages(&rest).unwrap_err());
+        }
+        // Each slot has a reason of its own.
+        reasons.sort_unstable();
+        reasons.dedup();
+        assert_eq!(reasons.len(), 5);
+        assert_ne!(rest, [0; 20]);
     }
 
     /// The packet and state piece of every graphics description captured

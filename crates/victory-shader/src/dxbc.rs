@@ -192,4 +192,19 @@ mod tests {
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
     }
+
+    #[test]
+    fn native_part_order_keeps_title_containers_as_they_were() {
+        // a title's container has a DXIL or ACCC part and never the pieces part
+        let both = build(&[(FourCC::PIECES, &[3]), (FourCC::ACCC, &[2]), (FourCC::DXIL, &[1])]);
+        let c = Container::parse(&both).unwrap();
+        assert_eq!(c.native_part().unwrap().data, &[1]);
+        let acc = build(&[(FourCC::PIECES, &[3]), (FourCC::ACCC, &[2])]);
+        assert_eq!(Container::parse(&acc).unwrap().native_part().unwrap().data, &[2]);
+        // only a container with none of the title's parts falls to the pieces
+        let pieces = build(&[(FourCC::PIECES, &[3])]);
+        assert_eq!(Container::parse(&pieces).unwrap().native_part().unwrap().data, &[3]);
+        let none = build(&[(FourCC::SFI0, &[0; 4])]);
+        assert!(Container::parse(&none).unwrap().native_part().is_none());
+    }
 }

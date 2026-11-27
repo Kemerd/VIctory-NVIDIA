@@ -45,7 +45,8 @@
 //! +0x60 SPI_SHADER_Z_FORMAT, +0x68 DB_SHADER_CONTROL
 //! +0x70 SPI_SHADER_COL_FORMAT, +0x7c CB_COLOR_CONTROL
 //! +0x84 SPI_VS_OUT_CONFIG, +0x90 SPI_SHADER_POS_FORMAT
-//! +0x98 PA_CL_VS_OUT_CNTL, +0x9c PA_CL_CLIP_CNTL, +0xa0 PA_SU_SC_MODE_CNTL
+//! +0x98 PA_CL_VS_OUT_CNTL (nonzero in one call of 48, with a second
+//!       position export), +0x9c PA_CL_CLIP_CNTL, +0xa0 PA_SU_SC_MODE_CNTL
 //! +0xac three dwords, always 0 (depth bias: a guess)
 //! +0xb8 DB_DEPTH_CONTROL, +0xbc DB_STENCIL_CONTROL
 //! +0xc0 DB_STENCILREFMASK, +0xc4 DB_STENCILREFMASK_BF
@@ -64,8 +65,10 @@
 //! +0x38 u32 size of the input layout block at +0x4c: u32 element count,
 //!       then per element u32 name length with its NUL, the name, and six
 //!       u32 of which the second is the DXGI format and the fourth the byte
-//!       offset in the vertex. The other four were 0 in every element
-//!       (semantic index, slot, class and step rate, in an order not known)
+//!       offset in the vertex. The other four were 0 in every element. They
+//!       lie where D3D12's element description has its semantic index, slot,
+//!       class and step rate (words 0, 2, 4 and 5), which no capture
+//!       confirms, so a value in any of them is refused by its place
 //!
 //! metadata piece
 //! +0x00 u32 0x403 (compute) or 2 (graphics)
@@ -111,7 +114,7 @@ use crate::ShaderError::{self, Malformed};
 use crate::dxbc::{FourCC, u16_at, u32_at};
 use crate::native::{
     self, ComputeIo, HwStage, NativeProgram, PsInput, RecordRules, RootParam, RootType, StageIo,
-    Usage, VERTEX_BUFFERS, VsFetch, VsOutput,
+    PIXEL_PIECES, Usage, VERTEX_BUFFERS, VsFetch, VsOutput,
 };
 
 /// What starts the part of ours.
@@ -129,6 +132,108 @@ pub const MAX_STATE: usize = 0x400;
 /// Why a pipeline is not made from its pieces: something malformed, or
 /// something understood too little to translate without guessing.
 pub type Refusal = &'static str;
+
+/// The reason for the first field of `value` that lies in `unhandled`, from
+/// `fields` as (mask of its bits, reason); `other` where no listed field
+/// does. A register refused for "some bit" says nothing the next run can
+/// act on, so each refusal names the field it is about.
+fn outside(value: u32, unhandled: u32, fields: &[(u32, Refusal)], other: Refusal) -> Refusal {
+    fields
+        .iter()
+        .find(|(mask, _)| value & unhandled & mask != 0)
+        .map_or(other, |&(_, why)| why)
+}
+
+/// `PA_CL_VS_OUT_CNTL` bits: `CLIP_DIST_ENA_0..7` (0-7), `CULL_DIST_ENA_0..7`
+/// (8-15), the point size, edge flag, render target index, viewport index
+/// and kill flag of the miscellaneous vector (16-20), `VS_OUT_MISC_VEC_ENA`
+/// (21), the two clip and cull distance vectors (22, 23) and the side bus
+/// for the miscellaneous vector (24).
+const CL_CLIP_DIST_ENA: u32 = 0xff;
+const CL_CCDIST0_VEC: u32 = 1 << 22;
+const CL_CCDIST1_VEC: u32 = 1 << 23;
+
+/// How many clip distances a vertex program exports, from
+/// `SPI_SHADER_POS_FORMAT` and `PA_CL_VS_OUT_CNTL`; why not if the two
+/// registers say more than that. The position is the first export, in the
+/// four-component format. Distance n is channel n of the vectors that follow
+/// (the first vector holds 0-3, the second 4-7: radeonsi's export order, and
+/// the order the lowering of a position export takes), each vector exported
+/// where `VS_OUT_CCDIST0_VEC_ENA` or `VS_OUT_CCDIST1_VEC_ENA` says and in
+/// the four-component format. Cull distances and the miscellaneous vector
+/// are refused: a capture has a cull distance 0 enabled beside the clip
+/// distance 0 and a single exported channel, which does not say which
+/// channel a cull distance takes.
+fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
+    if pos_format & 0xf != 4 {
+        return Err("SPI_SHADER_POS_FORMAT POS0_EXPORT_FORMAT other than 4COMP (4)");
+    }
+    let rest = out_cntl & !(CL_CLIP_DIST_ENA | CL_CCDIST0_VEC | CL_CCDIST1_VEC);
+    if rest != 0 {
+        return Err(outside(
+            out_cntl,
+            rest,
+            &[
+                (
+                    0xff00,
+                    "PA_CL_VS_OUT_CNTL CULL_DIST_ENA_0..7 (bits 8-15): the channel of a cull distance is not settled",
+                ),
+                (
+                    0x1f_0000,
+                    "PA_CL_VS_OUT_CNTL USE_VTX_POINT_SIZE, EDGE_FLAG, RENDER_TARGET_INDX, VIEWPORT_INDX or KILL_FLAG (bits 16-20)",
+                ),
+                (1 << 21, "PA_CL_VS_OUT_CNTL VS_OUT_MISC_VEC_ENA (bit 21)"),
+                (
+                    1 << 24,
+                    "PA_CL_VS_OUT_CNTL VS_OUT_MISC_SIDE_BUS_ENA (bit 24)",
+                ),
+            ],
+            "PA_CL_VS_OUT_CNTL bits above bit 24",
+        ));
+    }
+    let clip = out_cntl & CL_CLIP_DIST_ENA;
+    // Distances count up from 0: the lowering takes the signature's
+    // distances in order, from channel 0 of the first vector.
+    if clip & (clip + 1) != 0 {
+        return Err("PA_CL_VS_OUT_CNTL CLIP_DIST_ENA_0..7 (bits 0-7) that do not count up from 0");
+    }
+    let vectors = [clip & 0xf != 0, clip & 0xf0 != 0];
+    let enabled = (out_cntl & CL_CCDIST0_VEC != 0, out_cntl & CL_CCDIST1_VEC != 0);
+    if enabled != (vectors[0], vectors[1]) {
+        return Err(
+            "PA_CL_VS_OUT_CNTL VS_OUT_CCDIST0_VEC_ENA or _CCDIST1_VEC_ENA (bits 22-23) that disagree with CLIP_DIST_ENA",
+        );
+    }
+    let wanted = 4 | u32::from(vectors[0]) * 0x40 | u32::from(vectors[1]) * 0x400;
+    if pos_format != wanted {
+        return Err("SPI_SHADER_POS_FORMAT that disagrees with PA_CL_VS_OUT_CNTL");
+    }
+    Ok(clip.count_ones() as u8)
+}
+
+/// What a render target takes from a pixel program's exports: the type of
+/// the host's output for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    Float,
+    Uint,
+    Sint,
+}
+
+/// The kind of render target of DXGI format `format`: the unsigned and
+/// signed integer formats (D3D12 does not blend into them and wants the
+/// program's output declared as the integer it is), floats and the
+/// normalised formats alike otherwise.
+pub fn target_kind(format: u8) -> TargetKind {
+    match format {
+        // R32G32B32A32, R32G32B32, R16G16B16A16, R32G32, R10G10B10A2,
+        // R8G8B8A8, R16G16, R32, R8G8, R16, R8 (UINT)
+        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => TargetKind::Uint,
+        // the same without R10G10B10A2 (SINT)
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => TargetKind::Sint,
+        _ => TargetKind::Float,
+    }
+}
 
 const HEAD: usize = 0x30;
 const RECORD: usize = 32;
@@ -183,6 +288,50 @@ const G_INPUT_CNTL: usize = 0x170;
 const G_SECOND_HEAD: usize = 0x38;
 const G_TARGET_INFO: usize = 12;
 
+/// `SPI_PS_IN_CONTROL.PS_W32_EN`.
+const PS_W32_EN: u32 = 1 << 15;
+/// `SPI_PS_INPUT_CNTL.OFFSET` of an input that is a constant
+/// (`DEFAULT_VAL` says which).
+const CONSTANT_OFFSET: u32 = 0x20;
+/// What a pixel stage's `DB_SHADER_CONTROL` may set: Z_EXPORT_ENABLE (0),
+/// Z_ORDER (4-5), KILL_ENABLE (6), DEPTH_BEFORE_SHADER (12),
+/// CONSERVATIVE_Z_EXPORT (13-14) and DUAL_QUAD_DISABLE (15, which Mesa sets
+/// where the render backend's blend optimisations are off). EXEC_ON_HIER_FAIL
+/// (9), EXEC_ON_NOOP (10) and PRIMITIVE_ORDERED_PIXEL_SHADER (16) stay
+/// refused: D3D12 has no field for the first two, which decide whether a
+/// program that writes memory runs for pixels the depth test rejects, and
+/// nothing in the host program carries rasteriser ordering for the third.
+const DB_HANDLED: u32 = 0x1 | 0x30 | 0x40 | 0x1000 | 0x6000 | 0x8000;
+/// The fields of `SPI_PS_INPUT_CNTL` that are not handled, by their bits.
+const INPUT_CNTL_FIELDS: [(u32, Refusal); 11] = [
+    (
+        0x20,
+        "SPI_PS_INPUT_CNTL OFFSET (bits 0-5) of 0x21 or more",
+    ),
+    (
+        1 << 10,
+        "SPI_PS_INPUT_CNTL FLAT_SHADE (bit 10) with the constant offset",
+    ),
+    (
+        0x300,
+        "SPI_PS_INPUT_CNTL DEFAULT_VAL (bits 8-9) with a parameter offset",
+    ),
+    (1 << 11, "SPI_PS_INPUT_CNTL ROTATE_PC_PTR (bit 11)"),
+    (1 << 12, "SPI_PS_INPUT_CNTL PRIM_ATTR (bit 12)"),
+    (0x1_e000, "SPI_PS_INPUT_CNTL CYL_WRAP (bits 13-16)"),
+    (1 << 17, "SPI_PS_INPUT_CNTL PT_SPRITE_TEX (bit 17)"),
+    (1 << 18, "SPI_PS_INPUT_CNTL DUP (bit 18)"),
+    (1 << 19, "SPI_PS_INPUT_CNTL FP16_INTERP_MODE (bit 19)"),
+    (
+        0x00f0_0000,
+        "SPI_PS_INPUT_CNTL second attribute defaults (bits 20-23)",
+    ),
+    (
+        0x0300_0000,
+        "SPI_PS_INPUT_CNTL ATTR0_VALID and ATTR1_VALID (bits 24-25)",
+    ),
+];
+
 // The state piece.
 const S_TARGETS: usize = 0x10;
 const S_SAMPLE_MASK: usize = 0x1c;
@@ -233,9 +382,11 @@ struct Head {
 struct Row<'a> {
     name: &'a str,
     index: u32,
-    /// `D3D_NAME`: 0 none, 1 position, 9 front face, 64 target, 65 depth.
+    /// `D3D_NAME`: 0 none, 1 position, 9 front face, 64 target, 65 depth,
+    /// 67 depth that is at least the position's, 68 at most.
     system: u32,
-    /// `D3D_REGISTER_COMPONENT_TYPE`: 1 uint32, 3 float32, 6 float16.
+    /// `D3D_REGISTER_COMPONENT_TYPE`: 1 uint32, 2 sint32, 3 float32, 4 uint16,
+    /// 5 sint16, 6 float16.
     component: u32,
     register: u32,
     mask: u8,
@@ -358,9 +509,13 @@ pub fn compute(packet: &[u8], code: usize, metadata: usize) -> Result<Draft, Ref
     let word = |at: usize| u32_at(packet, at).unwrap_or(0);
     let threads: [u32; 3] =
         std::array::from_fn(|i| u16_at(packet, C_THREADS + 2 * i).map_or(0, u32::from));
-    // What a thread group can be on the host: no side over 1024, 1024
-    // threads in all.
-    if threads.contains(&0) || threads.iter().product::<u32>() > 1024 {
+    // What a thread group can be on the host: x and y up to 1024, z up to
+    // 64, 1024 threads in all. The sides are the title's 16-bit values, and
+    // three of them multiplied in 32 bits wrap (0x8000 twice and 4 make 0),
+    // so the product is taken in 64.
+    let total: u64 = threads.iter().map(|&n| u64::from(n)).product();
+    let limits = [1024, 1024, 64];
+    if threads.iter().zip(limits).any(|(&n, max)| n == 0 || n > max) || total > 1024 {
         return Err("a compute packet with an implausible thread-group size");
     }
     let wave32 = u16_at(packet, C_FLAGS).unwrap_or(0) & C_WAVE32 != 0;
@@ -405,6 +560,8 @@ pub struct Registers {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pixel {
     vgprs: u16,
+    /// `SPI_PS_IN_CONTROL.PS_W32_EN`: the program runs in waves of 32.
+    wave32: bool,
     user_sgprs: u32,
     input_addr: u32,
     db_shader_control: u32,
@@ -430,6 +587,8 @@ pub struct Graphics {
     vertex_user_sgprs: u32,
     /// `exp param<n>` of the vertex program, n below this.
     params: u32,
+    /// Clip distances the vertex program exports after its position.
+    clips: u8,
     pixel: Option<Pixel>,
 }
 
@@ -462,13 +621,29 @@ impl Graphics {
             _ if out & !0x3e == 0 => (out >> 1 & 0x1f) + 1,
             _ => return Err("SPI_VS_OUT_CONFIG bits that are not handled"),
         };
-        // One position export and nothing else of the clipper's: a second
-        // one carries clip and cull distances, whose rows are not known.
-        if word(G_POS_FORMAT) != 4 || word(G_VS_OUT_CNTL) != 0 {
-            return Err("a vertex program that exports clip or cull distances");
+        // The position export, and the clip distances after it if the
+        // clipper has any enabled.
+        let clips = clip_distances(word(G_POS_FORMAT), word(G_VS_OUT_CNTL))?;
+        // Words that were zero in every call captured. The three before
+        // DB_DEPTH_CONTROL sit where polygon offset values would (a guess),
+        // the one after DB_STENCILREFMASK_BF is not identified; each is
+        // named, so that a refusal says which one carried a value.
+        for (i, why) in [
+            "a graphics packet with a value at +0xac, where depth bias was guessed (zero in every call captured)",
+            "a graphics packet with a value at +0xb0, where depth bias was guessed (zero in every call captured)",
+            "a graphics packet with a value at +0xb4, where depth bias was guessed (zero in every call captured)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if word(G_DEPTH_BIAS + 4 * i) != 0 {
+                return Err(why);
+            }
         }
-        if (0..3).any(|i| word(G_DEPTH_BIAS + 4 * i) != 0) || word(G_UNKNOWN) != 0 {
-            return Err("a graphics packet with values where only zeros were seen");
+        if word(G_UNKNOWN) != 0 {
+            return Err(
+                "a graphics packet with a value at +0xc8, a word not identified (zero in every call captured)",
+            );
         }
         let pixel = if pixel {
             if word(G_RSRC1_PS) == 0 {
@@ -476,47 +651,152 @@ impl Graphics {
             }
             let control = word(G_PS_IN_CONTROL);
             let interpolants = (control & 0x3f) as usize;
-            // (bit 15 would be a wave32 pixel program: never seen)
-            if control & !0x3f != 0 || interpolants > controls / 4 {
-                return Err("SPI_PS_IN_CONTROL bits that are not handled");
+            // NUM_INTERP (bits 0-5) and PS_W32_EN (bit 15, a pixel program
+            // that runs in waves of 32: Mesa sets it from the shader's wave
+            // size). The rest are fields of their own, each refused by name.
+            let handled = 0x3f | PS_W32_EN;
+            if control & !handled != 0 {
+                return Err(outside(
+                    control,
+                    !handled,
+                    &[
+                        (1 << 6, "SPI_PS_IN_CONTROL PARAM_GEN (bit 6)"),
+                        (1 << 7, "SPI_PS_IN_CONTROL OFFCHIP_PARAM_EN (bit 7)"),
+                        (1 << 8, "SPI_PS_IN_CONTROL LATE_PC_DEALLOC (bit 8)"),
+                        (
+                            0x3e00,
+                            "SPI_PS_IN_CONTROL NUM_PRIM_INTERP (bits 9-13, per-primitive inputs)",
+                        ),
+                        (1 << 14, "SPI_PS_IN_CONTROL BC_OPTIMIZE_DISABLE (bit 14)"),
+                    ],
+                    "SPI_PS_IN_CONTROL bits above bit 15",
+                ));
             }
+            if interpolants > controls / 4 {
+                return Err(
+                    "SPI_PS_IN_CONTROL NUM_INTERP (bits 0-5) counts more inputs than the packet has controls",
+                );
+            }
+            let wave32 = control & PS_W32_EN != 0;
             let controls: Vec<u32> = (0..interpolants)
                 .map(|k| word(G_INPUT_CNTL + 4 * k))
                 .collect();
             for &c in &controls {
-                // The parameter read (bits 0-4) and flat shading (bit 10):
-                // a default value, 16-bit interpolation and point sprites
-                // are other bits.
-                if c & !0x41f != 0 || c & 0x1f >= params {
-                    return Err("a pixel input control that is not handled");
+                // An input that is a constant: OFFSET 0x20 and DEFAULT_VAL
+                // (bits 8-9), nothing else.
+                if c & 0x3f == CONSTANT_OFFSET {
+                    if c & !(0x3f | 0x300) != 0 {
+                        return Err(outside(
+                            c,
+                            !(0x3f | 0x300),
+                            &INPUT_CNTL_FIELDS,
+                            "SPI_PS_INPUT_CNTL bits outside its documented fields",
+                        ));
+                    }
+                    continue;
+                }
+                // The parameter read (bits 0-4) and flat shading (bit 10).
+                // DEFAULT_VAL means nothing beside a parameter offset.
+                if c & !0x41f != 0 {
+                    return Err(outside(
+                        c,
+                        !0x41f,
+                        &INPUT_CNTL_FIELDS,
+                        "SPI_PS_INPUT_CNTL bits outside its documented fields",
+                    ));
+                }
+                if c & 0x1f >= params {
+                    return Err(
+                        "SPI_PS_INPUT_CNTL OFFSET (bits 0-5) names a parameter the vertex program does not export",
+                    );
                 }
             }
             // One parameter read both flat and interpolated has no one type.
-            for a in &controls {
-                if controls.iter().any(|b| a & 0x1f == b & 0x1f && a != b) {
+            let is_param = |c: &u32| c & 0x3f != CONSTANT_OFFSET;
+            for a in controls.iter().filter(|c| is_param(c)) {
+                if controls
+                    .iter()
+                    .filter(|c| is_param(c))
+                    .any(|b| a & 0x1f == b & 0x1f && a != b)
+                {
                     return Err("a vertex parameter read both flat and interpolated");
                 }
             }
             let db = word(G_DB_SHADER_CONTROL);
-            // Depth export, the depth test's order, kill, depth before the
-            // shader. Stencil and coverage exports, conservative depth and
-            // alpha to coverage are other bits.
-            if db & !0x1071 != 0 || word(G_Z_FORMAT) != db & 1 {
-                return Err("DB_SHADER_CONTROL bits that are not handled");
+            if db & !DB_HANDLED != 0 {
+                return Err(outside(
+                    db,
+                    !DB_HANDLED,
+                    &[
+                        (
+                            1 << 1,
+                            "DB_SHADER_CONTROL STENCIL_TEST_VAL_EXPORT_ENABLE (bit 1)",
+                        ),
+                        (
+                            1 << 2,
+                            "DB_SHADER_CONTROL STENCIL_OP_VAL_EXPORT_ENABLE (bit 2)",
+                        ),
+                        (1 << 3, "DB_SHADER_CONTROL bit 3, which has no field"),
+                        (
+                            1 << 7,
+                            "DB_SHADER_CONTROL COVERAGE_TO_MASK_ENABLE (bit 7)",
+                        ),
+                        (1 << 8, "DB_SHADER_CONTROL MASK_EXPORT_ENABLE (bit 8)"),
+                        (
+                            1 << 9,
+                            "DB_SHADER_CONTROL EXEC_ON_HIER_FAIL (bit 9)",
+                        ),
+                        (1 << 10, "DB_SHADER_CONTROL EXEC_ON_NOOP (bit 10)"),
+                        (
+                            1 << 11,
+                            "DB_SHADER_CONTROL ALPHA_TO_MASK_DISABLE (bit 11)",
+                        ),
+                        (
+                            1 << 16,
+                            "DB_SHADER_CONTROL PRIMITIVE_ORDERED_PIXEL_SHADER (bit 16)",
+                        ),
+                        (
+                            1 << 17,
+                            "DB_SHADER_CONTROL EXEC_IF_OVERLAPPED (bit 17)",
+                        ),
+                        (
+                            0x70_0000,
+                            "DB_SHADER_CONTROL POPS_OVERLAP_NUM_SAMPLES (bits 20-22)",
+                        ),
+                        (
+                            1 << 23,
+                            "DB_SHADER_CONTROL PRE_SHADER_DEPTH_COVERAGE_ENABLE (bit 23)",
+                        ),
+                    ],
+                    "DB_SHADER_CONTROL bits in a gap between its fields",
+                ));
             }
-            let col_format = word(G_COL_FORMAT);
-            // Per target: nothing, 32-bit floats (32_R, 32_GR, 32_AR,
-            // 32_ABGR) or 16-bit floats (FP16_ABGR). The 16-bit integer
-            // formats were never seen.
-            if (0..8).any(|n| !matches!(col_format >> (4 * n) & 0xf, 0..=4 | 9)) {
-                return Err("an export format that is not handled");
+            // CONSERVATIVE_Z_EXPORT (bits 13-14) qualifies a depth export;
+            // 3 is reserved.
+            let conservative = db >> 13 & 3;
+            if conservative == 3 {
+                return Err("DB_SHADER_CONTROL CONSERVATIVE_Z_EXPORT (bits 13-14) of 3, reserved");
             }
+            if conservative != 0 && db & 1 == 0 {
+                return Err(
+                    "DB_SHADER_CONTROL CONSERVATIVE_Z_EXPORT (bits 13-14) without Z_EXPORT_ENABLE (bit 0)",
+                );
+            }
+            // SPI_SHADER_Z_FORMAT 32_R is the depth export, and only it.
+            if word(G_Z_FORMAT) != db & 1 {
+                return Err(
+                    "SPI_SHADER_Z_FORMAT other than 32_R with Z_EXPORT_ENABLE, or 32_R without it",
+                );
+            }
+            // (the export formats are checked against the render targets,
+            // once the state piece has them)
             Some(Pixel {
-                vgprs: vgprs(word(G_RSRC1_PS), false),
+                vgprs: vgprs(word(G_RSRC1_PS), wave32),
+                wave32,
                 user_sgprs: word(G_RSRC2_PS) >> 1 & 0x1f,
                 input_addr: word(G_PS_INPUT_ADDR),
                 db_shader_control: db,
-                col_format,
+                col_format: word(G_COL_FORMAT),
                 controls,
             })
         } else {
@@ -554,6 +834,43 @@ impl Graphics {
         if !matches!(topology, 3 | 19) {
             return Err("a primitive topology type other than triangles and rectangles");
         }
+        // Each target's export format against the kind of target it feeds.
+        // The 32-bit formats carry the channels whole, whatever the target
+        // is; the 16-bit float format feeds a float target; the 16-bit
+        // integer formats feed the integer target of their signedness. A
+        // target past the count has no format, and takes the export (if
+        // any) as a float one.
+        if let Some(p) = &pixel {
+            for n in 0..8 {
+                let kind = if n < usize::from(targets) {
+                    target_kind(target_formats[n])
+                } else {
+                    TargetKind::Float
+                };
+                match (p.col_format >> (4 * n) & 0xf, kind) {
+                    (0..=3 | 9, _) | (4, TargetKind::Float) => {}
+                    (4, _) => {
+                        return Err(
+                            "SPI_SHADER_COL_FORMAT FP16_ABGR (4) for an integer render target",
+                        );
+                    }
+                    (5, _) => return Err("SPI_SHADER_COL_FORMAT UNORM16_ABGR (5)"),
+                    (6, _) => return Err("SPI_SHADER_COL_FORMAT SNORM16_ABGR (6)"),
+                    (7, TargetKind::Uint) | (8, TargetKind::Sint) => {}
+                    (7, _) => {
+                        return Err(
+                            "SPI_SHADER_COL_FORMAT UINT16_ABGR (7) for a target that is not an unsigned integer",
+                        );
+                    }
+                    (8, _) => {
+                        return Err(
+                            "SPI_SHADER_COL_FORMAT SINT16_ABGR (8) for a target that is not a signed integer",
+                        );
+                    }
+                    _ => return Err("SPI_SHADER_COL_FORMAT of 10 or more, which has no format"),
+                }
+            }
+        }
         // The input layout: a count, then elements back to back.
         let layout = &state[S_BLOCK..S_BLOCK + block];
         let count = u32_at(layout, 0).unwrap_or(u32::MAX) as usize;
@@ -588,10 +905,20 @@ impl Graphics {
                 None => return Err(BAD),
             };
             at += 24;
-            // Which of these four is the index, the slot, the class and the
-            // step rate is not known: all were zero wherever seen.
-            if [words[0], words[2], words[4], words[5]] != [0; 4] {
-                return Err("an input element with an index, slot, class or step rate");
+            // Words 0, 2, 4 and 5 lie where D3D12's element description has
+            // the semantic index, the slot, the class and the step rate, in
+            // that order (words 1 and 3 are where it has the format and the
+            // offset). All were zero wherever seen, so that order is a
+            // guess, and each refusal names the word that carried a value.
+            for (at, why) in [
+                (0, "an input element with a value in word 0 (the semantic index, by a guess)"),
+                (2, "an input element with a value in word 2 (the slot, by a guess)"),
+                (4, "an input element with a value in word 4 (the class, by a guess)"),
+                (5, "an input element with a value in word 5 (the step rate, by a guess)"),
+            ] {
+                if words[at] != 0 {
+                    return Err(why);
+                }
             }
             if words[3] > 0x800 {
                 return Err("an input element at an implausible byte offset");
@@ -626,8 +953,74 @@ impl Graphics {
             vertex_vgprs: vgprs(word(G_RSRC1_VS), false),
             vertex_user_sgprs: word(G_RSRC2_VS) >> 1 & 0x1f,
             params,
+            clips,
             pixel,
         })
+    }
+
+    /// The registers [`parse`](Self::parse) judges, as `name=value` for a
+    /// log line (what a packet that is refused held; a short packet gives
+    /// what is there). Values of the run's own, never kept.
+    pub fn describe(packet: &[u8], state: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let mut note = |name: &str, at: usize, from: &[u8]| {
+            match u32_at(from, at) {
+                Ok(v) => write!(out, "{name}={v:#x} "),
+                Err(_) => write!(out, "{name}=none "),
+            }
+            .ok();
+        };
+        for (name, at) in [
+            ("SPI_PS_IN_CONTROL", G_PS_IN_CONTROL),
+            ("SPI_PS_INPUT_ADDR", G_PS_INPUT_ADDR),
+            ("DB_SHADER_CONTROL", G_DB_SHADER_CONTROL),
+            ("SPI_SHADER_Z_FORMAT", G_Z_FORMAT),
+            ("SPI_SHADER_COL_FORMAT", G_COL_FORMAT),
+            ("CB_COLOR_CONTROL", G_CB_COLOR_CONTROL),
+            ("SPI_VS_OUT_CONFIG", G_VS_OUT_CONFIG),
+            ("SPI_SHADER_POS_FORMAT", G_POS_FORMAT),
+            ("PA_CL_VS_OUT_CNTL", G_VS_OUT_CNTL),
+            ("+0xac", G_DEPTH_BIAS),
+            ("+0xb0", G_DEPTH_BIAS + 4),
+            ("+0xb4", G_DEPTH_BIAS + 8),
+            ("+0xc8", G_UNKNOWN),
+        ] {
+            note(name, at, packet);
+        }
+        // The input controls the packet counts, at most eight.
+        let count = (u32_at(packet, G_PS_IN_CONTROL).unwrap_or(0) & 0x3f).min(8) as usize;
+        for k in 0..count {
+            note(&format!("SPI_PS_INPUT_CNTL_{k}"), G_INPUT_CNTL + 4 * k, packet);
+        }
+        // The state piece's formats: one byte each.
+        let byte = |at: usize| state.get(at).map_or_else(|| "none".into(), |b| b.to_string());
+        write!(
+            out,
+            "depth_format={} targets={} formats={:?}",
+            byte(S_DEPTH),
+            byte(S_COUNT),
+            state.get(S_TARGETS..S_TARGETS + 8).unwrap_or(&[])
+        )
+        .ok();
+        // The input layout's six words of each element, as stored, so that
+        // a refusal for one of them says which word carried the value.
+        let layout = state.get(S_BLOCK..).unwrap_or(&[]);
+        let count = (u32_at(layout, 0).unwrap_or(0) as usize).min(MAX_ELEMENTS);
+        let mut at = 4;
+        for _ in 0..count {
+            let Ok(len) = u32_at(layout, at) else { break };
+            at = at.saturating_add(4).saturating_add(len as usize);
+            if at > layout.len() {
+                break;
+            }
+            let words: Vec<u32> = (0..6)
+                .map_while(|k| u32_at(layout, at + 4 * k).ok())
+                .collect();
+            write!(out, " element={words:x?}").ok();
+            at += 24;
+        }
+        out
     }
 
     /// Whether the packet has a pixel stage.
@@ -641,7 +1034,7 @@ impl Graphics {
     fn flat(&self) -> u32 {
         let controls = self.pixel.iter().flat_map(|p| &p.controls);
         controls
-            .filter(|&&c| c & 0x400 != 0)
+            .filter(|&&c| c & 0x3f != CONSTANT_OFFSET && c & 0x400 != 0)
             .fold(0, |m, &c| m | 1 << (c & 0x1f))
     }
 
@@ -701,6 +1094,19 @@ impl Graphics {
             .collect();
         let mut outputs: Vec<Row> = (0..self.params).map(|p| self.param(p)).collect();
         outputs.push(self.position());
+        // The clip distances: up to four to a row, in the registers after
+        // the position's (D3D_NAME_CLIP_DISTANCE is 2).
+        for v in 0..u32::from(self.clips).div_ceil(4) {
+            let left = u32::from(self.clips) - 4 * v;
+            outputs.push(Row {
+                name: "SV_ClipDistance",
+                index: v,
+                system: 2,
+                component: 3,
+                register: self.params + 1 + v,
+                mask: ((1u32 << left.min(4)) - 1) as u8,
+            });
+        }
         let head = Head {
             stage: VERTEX,
             flags: 0,
@@ -726,7 +1132,13 @@ impl Graphics {
         // Each parameter read, once, then the system values the packet
         // enables: the position (bits 8-11) where the vertex program has
         // it, the front face (bit 12) after it.
-        let mut read: Vec<u32> = pixel.controls.iter().map(|c| c & 0x1f).collect();
+        // (an input that is a constant reads no parameter)
+        let mut read: Vec<u32> = pixel
+            .controls
+            .iter()
+            .filter(|&&c| c & 0x3f != CONSTANT_OFFSET)
+            .map(|c| c & 0x1f)
+            .collect();
         read.sort_unstable();
         read.dedup();
         let mut inputs: Vec<Row> = read.into_iter().map(|p| self.param(p)).collect();
@@ -743,30 +1155,51 @@ impl Graphics {
                 mask: 1,
             });
         }
-        // A render target per export format: 16-bit floats travel two to a
+        // A render target per export format: 16-bit values travel two to a
         // dword and are declared so, which is what lets the lowering take
-        // a compressed export apart.
+        // a compressed export apart. The 32-bit formats carry the bits of
+        // the target's own type: an integer target gets its program's
+        // output declared as that integer.
         let mut outputs = Vec::new();
-        for n in 0..8 {
-            let component = match pixel.col_format >> (4 * n) & 0xf {
-                0 => continue,
-                4 => 6,
-                _ => 3,
+        for n in 0..8usize {
+            let kind = if n < usize::from(self.targets) {
+                target_kind(self.target_formats[n])
+            } else {
+                TargetKind::Float
+            };
+            let component = match (pixel.col_format >> (4 * n) & 0xf, kind) {
+                (0, _) => continue,
+                (4, _) => 6,
+                (7, _) => 4,
+                (8, _) => 5,
+                (_, TargetKind::Float) => 3,
+                (_, TargetKind::Uint) => 1,
+                (_, TargetKind::Sint) => 2,
             };
             outputs.push(Row {
                 name: "SV_Target",
-                index: n,
+                index: n as u32,
                 system: 64,
                 component,
-                register: n,
+                register: n as u32,
                 mask: 0xf,
             });
         }
         if pixel.db_shader_control & 1 != 0 {
+            // CONSERVATIVE_Z_EXPORT says the exported depth is never below
+            // (2) or never above (1) the one the rasteriser made. Mesa
+            // derives the field from the shader's depth layout, "greater"
+            // setting EXPORT_GREATER_THAN_Z and "less" EXPORT_LESS_THAN_Z:
+            // HLSL's SV_DepthGreaterEqual and SV_DepthLessEqual.
+            let system = match pixel.db_shader_control >> 13 & 3 {
+                1 => 68,
+                2 => 67,
+                _ => 65,
+            };
             outputs.push(Row {
                 name: "SV_Depth",
                 index: 0,
-                system: 65,
+                system,
                 component: 3,
                 register: u32::MAX,
                 mask: 1,
@@ -779,7 +1212,7 @@ impl Graphics {
             .collect();
         let head = Head {
             stage: PIXEL,
-            flags: 0,
+            flags: if pixel.wave32 { WAVE32 } else { 0 },
             vgprs: pixel.vgprs,
             user_sgprs: pixel.user_sgprs,
             words: [
@@ -959,6 +1392,17 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
             }
         }
         _ => {
+            // A pixel program owns no user SGPR for this entry: it only says the
+            // program was made from pieces, which is what lets its compressed
+            // exports be taken apart (a title's container never has one).
+            r.layout.push(RootParam {
+                root: RootType::Other(PIXEL_PIECES),
+                table_offset_dwords: 0,
+                sgprs: 0,
+                base_register: 0,
+                user_data: 0,
+                slot: u8::MAX,
+            });
             let (controls, rest) = extra.as_chunks::<4>();
             if !rest.is_empty() || controls.len() != words[4] as usize || controls.len() > 32 {
                 return Err(Malformed(
@@ -971,6 +1415,20 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
                     .enumerate()
                     .map(|(k, c)| {
                         let c = u32::from_le_bytes(*c);
+                        // An input that is a constant names no parameter:
+                        // its row says which constant.
+                        if c & 0x3f == CONSTANT_OFFSET {
+                            return PsInput {
+                                usage: Usage::Generic,
+                                row: PsInput::constant_row((c >> 8 & 3) as u8),
+                                mask: 0xf,
+                                attr: k as u8,
+                                flat: false,
+                                fp16: false,
+                                pack2: false,
+                                row2: 0,
+                            };
+                        }
                         PsInput {
                             usage: Usage::Generic,
                             row: (c & 0x1f) as u8,
@@ -1218,6 +1676,34 @@ mod tests {
         assert!(compute(&threads, 4, 0x38).is_err(), "absurd thread group");
         threads[C_THREADS..C_THREADS + 2].copy_from_slice(&[0, 0]);
         assert!(compute(&threads, 4, 0x38).is_err(), "no threads");
+    }
+
+    /// A compute packet with thread-group sides `sides`.
+    fn with_threads(sides: [u16; 3]) -> [u8; COMPUTE_PACKET] {
+        let mut p = compute_packet(6);
+        for (i, n) in sides.into_iter().enumerate() {
+            p[C_THREADS + 2 * i..C_THREADS + 2 * i + 2].copy_from_slice(&n.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn thread_group_sides_are_bounded_one_by_one() {
+        let made = |sides: [u16; 3]| compute(&with_threads(sides), 4, 0x38).is_ok();
+        // Three 16-bit sides multiplied in 32 bits wrap to 0 here: the
+        // product must be taken wider, and each side bounded.
+        assert!(!made([0x8000, 0x8000, 4]));
+        assert!(!made([0xffff, 0xffff, 0xffff]));
+        assert!(!made([0, 1, 1]), "a side of 0");
+        assert!(!made([1025, 1, 1]), "a side over 1024");
+        assert!(!made([1, 1, 1025]));
+        assert!(!made([1, 1, 65]), "z over 64");
+        assert!(!made([1, 1, 1024]), "z over 64 within 1024 threads");
+        assert!(!made([32, 32, 2]), "over 1024 threads in all");
+        assert!(made([1024, 1, 1]));
+        assert!(made([1, 1, 64]));
+        assert!(made([32, 32, 1]));
+        assert!(made([8, 8, 16]));
     }
 
     #[test]
@@ -1494,7 +1980,14 @@ mod tests {
             refused(&|p| put(p, G_PS_IN_CONTROL, 9)),
             "more interpolants than controls"
         );
-        assert!(refused(&|p| put(p, G_PS_IN_CONTROL, 2 | 1 << 15)), "wave32");
+        assert!(
+            refused(&|p| put(p, G_PS_IN_CONTROL, 2 | 1 << 14)),
+            "BC_OPTIMIZE_DISABLE"
+        );
+        assert!(
+            refused(&|p| put(p, G_PS_IN_CONTROL, 2 | 1 << 16)),
+            "a bit above PS_W32_EN"
+        );
         assert!(
             refused(&|p| put(p, G_INPUT_CNTL, 5)),
             "a parameter not exported"
@@ -1515,6 +2008,12 @@ mod tests {
             refused(&|p| put(p, G_DB_SHADER_CONTROL, 0x110)),
             "a coverage export"
         );
+        for bit in [9, 10, 16] {
+            assert!(
+                refused(&|p| put(p, G_DB_SHADER_CONTROL, 1 << bit)),
+                "DB_SHADER_CONTROL bit {bit}"
+            );
+        }
         assert!(
             refused(&|p| put(p, G_DB_SHADER_CONTROL, 0x11)),
             "depth export without its format"
@@ -1525,6 +2024,269 @@ mod tests {
             "unknown output bits"
         );
         assert!(refused(&|p| put(p, G_DEPTH_BIAS + 4, 1)), "depth bias");
+    }
+
+    /// The reason a packet is refused for, with the state piece `state`.
+    fn why(packet: &[u8], state: &[u8]) -> Refusal {
+        Graphics::parse(packet, state, true).unwrap_err()
+    }
+
+    #[test]
+    fn a_pixel_program_in_waves_of_32() {
+        let mut packet = graphics_packet(true, 2, &[(0, false), (1, false)]);
+        put(&mut packet, G_PS_IN_CONTROL, 2 | PS_W32_EN);
+        let g = Graphics::parse(&packet, &state_piece(&ELEMENTS), true).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let ps = checked(&fill(
+            g.pixel(code.len(), meta.len()).unwrap(),
+            &code,
+            &meta,
+        ))
+        .unwrap();
+        // 4 granules of 8 where the waves have 32 lanes, not of 4.
+        assert!(!ps.wave64);
+        assert_eq!(ps.vgprs, 32);
+        // The vertex program stays in waves of 64.
+        let vs = checked(&fill(
+            g.vertex(code.len(), meta.len()).unwrap(),
+            &code,
+            &meta,
+        ))
+        .unwrap();
+        assert!(vs.wave64);
+        // Only the pixel program carries the marker that says it was made from
+        // pieces, and the marker owns no user SGPR.
+        let marked = |p: &NativeProgram| {
+            p.layout
+                .iter()
+                .filter(|e| e.root == RootType::Other(PIXEL_PIECES))
+                .count()
+        };
+        assert_eq!(marked(&ps), 1);
+        assert_eq!(marked(&vs), 0);
+        assert!(ps.layout.iter().all(|e| e.root != RootType::Other(PIXEL_PIECES) || e.sgprs == 0));
+    }
+
+    #[test]
+    fn a_pixel_input_that_is_a_constant() {
+        // Input 0 reads parameter 1, input 1 is the constant (0, 0, 0, 1),
+        // input 2 the constant (1, 1, 1, 1).
+        let mut packet = graphics_packet(true, 2, &[(1, false), (0, false), (0, false)]);
+        put(&mut packet, G_INPUT_CNTL + 4, CONSTANT_OFFSET | 1 << 8);
+        put(&mut packet, G_INPUT_CNTL + 8, CONSTANT_OFFSET | 3 << 8);
+        let g = Graphics::parse(&packet, &state_piece(&ELEMENTS), true).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let ps = checked(&fill(
+            g.pixel(code.len(), meta.len()).unwrap(),
+            &code,
+            &meta,
+        ))
+        .unwrap();
+        let StageIo::Ps { inputs, .. } = &ps.io else {
+            panic!("{:?}", ps.io)
+        };
+        assert_eq!(
+            inputs.iter().map(|i| (i.attr, i.row, i.flat)).collect::<Vec<_>>(),
+            [
+                (0, 1, false),
+                (1, PsInput::constant_row(1), false),
+                (2, PsInput::constant_row(3), false)
+            ]
+        );
+        // The pixel stage's signature names parameter 1 alone.
+        let bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        assert_eq!(u32_at(c.part(FourCC::ISG1).unwrap().data, 0), Ok(1));
+        // A constant with another field set, or flat, is refused by name.
+        for (bit, reason) in [
+            (1u32 << 10, "SPI_PS_INPUT_CNTL FLAT_SHADE (bit 10) with the constant offset"),
+            (1 << 19, "SPI_PS_INPUT_CNTL FP16_INTERP_MODE (bit 19)"),
+            (1 << 12, "SPI_PS_INPUT_CNTL PRIM_ATTR (bit 12)"),
+        ] {
+            let mut p = packet.clone();
+            put(&mut p, G_INPUT_CNTL + 4, CONSTANT_OFFSET | bit);
+            assert_eq!(why(&p, &state_piece(&ELEMENTS)), reason);
+        }
+        // An offset past the constant one is no parameter.
+        let mut p = packet.clone();
+        put(&mut p, G_INPUT_CNTL + 4, 0x21);
+        assert_eq!(
+            why(&p, &state_piece(&ELEMENTS)),
+            "SPI_PS_INPUT_CNTL OFFSET (bits 0-5) of 0x21 or more"
+        );
+    }
+
+    #[test]
+    fn integer_targets_take_the_integer_exports() {
+        // R8G8B8A8_UINT (30) and R8G8B8A8_SINT (32).
+        let state = |format: u8| {
+            let mut s = state_piece(&ELEMENTS);
+            s[S_TARGETS] = format;
+            s
+        };
+        let packet = |col: u32| {
+            let mut p = graphics_packet(true, 1, &[(0, false)]);
+            put(&mut p, G_COL_FORMAT, col);
+            p
+        };
+        // The 16-bit float export is for float targets alone.
+        assert!(Graphics::parse(&packet(4), &state(28), true).is_ok());
+        assert_eq!(
+            why(&packet(4), &state(30)),
+            "SPI_SHADER_COL_FORMAT FP16_ABGR (4) for an integer render target"
+        );
+        // The 16-bit integer exports go with the signedness of the target.
+        assert!(Graphics::parse(&packet(7), &state(30), true).is_ok());
+        assert!(Graphics::parse(&packet(8), &state(32), true).is_ok());
+        assert!(Graphics::parse(&packet(7), &state(32), true).is_err());
+        assert!(Graphics::parse(&packet(8), &state(30), true).is_err());
+        assert!(Graphics::parse(&packet(7), &state(28), true).is_err());
+        // The 32-bit export of an unsigned target declares an unsigned
+        // output; the 16-bit ones declare 16-bit integers.
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let component = |col: u32, format: u8| {
+            let g = Graphics::parse(&packet(col), &state(format), true).unwrap();
+            let bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+            let c = crate::Container::parse(&bytes).unwrap();
+            u32_at(c.part(FourCC::OSG1).unwrap().data, 8 + 16).unwrap()
+        };
+        assert_eq!(component(9, 30), 1);
+        assert_eq!(component(9, 32), 2);
+        assert_eq!(component(9, 28), 3);
+        assert_eq!(component(7, 30), 4);
+        assert_eq!(component(8, 32), 5);
+        assert_eq!(component(4, 28), 6);
+        // The formats that have no host form are refused by name.
+        assert_eq!(
+            why(&packet(5), &state(28)),
+            "SPI_SHADER_COL_FORMAT UNORM16_ABGR (5)"
+        );
+        assert_eq!(
+            why(&packet(6), &state(28)),
+            "SPI_SHADER_COL_FORMAT SNORM16_ABGR (6)"
+        );
+        assert_eq!(
+            why(&packet(10), &state(28)),
+            "SPI_SHADER_COL_FORMAT of 10 or more, which has no format"
+        );
+    }
+
+    #[test]
+    fn clip_distance_registers_are_read_by_their_fields() {
+        let vec0 = CL_CCDIST0_VEC;
+        let vec1 = CL_CCDIST1_VEC;
+        // None, then up to four in the first vector, then up to eight.
+        assert_eq!(clip_distances(4, 0), Ok(0));
+        assert_eq!(clip_distances(0x44, 1 | vec0), Ok(1));
+        assert_eq!(clip_distances(0x44, 0xf | vec0), Ok(4));
+        assert_eq!(clip_distances(0x444, 0x1f | vec0 | vec1), Ok(5));
+        assert_eq!(clip_distances(0x444, 0xff | vec0 | vec1), Ok(8));
+        // The registers must agree with each other.
+        let disagree = "SPI_SHADER_POS_FORMAT that disagrees with PA_CL_VS_OUT_CNTL";
+        assert_eq!(clip_distances(0x44, 0), Err(disagree));
+        assert_eq!(clip_distances(4, 1 | vec0), Err(disagree));
+        assert_eq!(clip_distances(0x44, 0x1f | vec0 | vec1), Err(disagree));
+        assert!(clip_distances(0x44, 1).unwrap_err().contains("CCDIST0_VEC_ENA"));
+        assert!(clip_distances(0x44, vec0).unwrap_err().contains("CCDIST0_VEC_ENA"));
+        assert!(clip_distances(0x44, 0x1f | vec0).unwrap_err().contains("CCDIST0_VEC_ENA"));
+        // A gap in the enables is not a count.
+        assert!(clip_distances(0x44, 0b101 | vec0).unwrap_err().contains("count up"));
+        // A position format that is not four components.
+        assert!(clip_distances(3, 0).unwrap_err().contains("POS0_EXPORT_FORMAT"));
+        assert!(clip_distances(0, 0).unwrap_err().contains("POS0_EXPORT_FORMAT"));
+        // What is not settled is refused by its field.
+        let named = |bits: u32, field: &str| {
+            let why = clip_distances(0x44, 1 | vec0 | bits).unwrap_err();
+            assert!(why.contains(field), "{bits:#x}: {why}");
+        };
+        named(1 << 8, "CULL_DIST_ENA");
+        named(1 << 15, "CULL_DIST_ENA");
+        named(1 << 16, "USE_VTX_POINT_SIZE");
+        named(1 << 19, "VIEWPORT_INDX");
+        named(1 << 21, "VS_OUT_MISC_VEC_ENA");
+        named(1 << 24, "VS_OUT_MISC_SIDE_BUS_ENA");
+        named(1 << 25, "above bit 24");
+        named(1 << 31, "above bit 24");
+        // The one value captured: a clip and a cull distance 0, a vector
+        // and the side bus.
+        let seen = 0x0140_0101;
+        assert!(clip_distances(0x44, seen).unwrap_err().contains("CULL_DIST_ENA"));
+    }
+
+    #[test]
+    fn clip_distances_reach_the_vertex_signature() {
+        // One parameter and five distances.
+        let mut packet = graphics_packet(true, 1, &[(0, false)]);
+        put(&mut packet, G_POS_FORMAT, 0x444);
+        put(&mut packet, G_VS_OUT_CNTL, 0x1f | CL_CCDIST0_VEC | CL_CCDIST1_VEC);
+        let g = Graphics::parse(&packet, &state_piece(&ELEMENTS), true).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let bytes = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        let part = c.part(FourCC::OSG1).unwrap().data;
+        let count = u32_at(part, 0).unwrap() as usize;
+        let rows: Vec<(u32, u32, u32, u8)> = (0..count)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let word = |k: usize| u32_at(part, at + 4 * k).unwrap();
+                (word(2), word(3), word(5), part[at + 24])
+            })
+            .collect();
+        // (index, system value, register, mask): the parameter, the
+        // position (register 1), then the distances after it.
+        assert_eq!(
+            rows,
+            [(0, 0, 0, 0xf), (0, 1, 1, 0xf), (0, 2, 2, 0xf), (1, 2, 3, 0x1)]
+        );
+        // None without them.
+        let plain = Graphics::parse(
+            &graphics_packet(true, 1, &[(0, false)]),
+            &state_piece(&ELEMENTS),
+            true,
+        )
+        .unwrap();
+        let bytes = fill(plain.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        assert_eq!(u32_at(c.part(FourCC::OSG1).unwrap().data, 0), Ok(2));
+        // The pixel stage's inputs do not list them.
+        let bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        assert_eq!(u32_at(c.part(FourCC::ISG1).unwrap().data, 0), Ok(1));
+    }
+
+    #[test]
+    fn input_elements_with_values_are_refused_by_their_word() {
+        let packet = graphics_packet(false, 0, &[]);
+        let at = |word: usize| S_BLOCK + 17 + 4 * word;
+        for (word, field) in [(0, "word 0"), (2, "word 2"), (4, "word 4"), (5, "word 5")] {
+            let mut s = state_piece(&ELEMENTS);
+            put(&mut s, at(word), 1);
+            let reason = Graphics::parse(&packet, &s, false).unwrap_err();
+            assert!(reason.contains(field), "{reason}");
+        }
+        // The format and the offset are read, wherever the others stand.
+        let mut s = state_piece(&ELEMENTS);
+        put(&mut s, at(1), 2);
+        put(&mut s, at(3), 8);
+        let g = Graphics::parse(&packet, &s, false).unwrap();
+        assert_eq!((g.elements[0].format, g.elements[0].offset), (2, 8));
+    }
+
+    #[test]
+    fn a_description_shows_the_element_words() {
+        let packet = graphics_packet(false, 0, &[]);
+        let mut s = state_piece(&ELEMENTS);
+        put(&mut s, S_BLOCK + 17 + 8, 7);
+        let text = Graphics::describe(&packet, &s);
+        assert!(text.contains("element=[0, 6, 7, 0, 0, 0]"), "{text}");
+        assert_eq!(text.matches("element=").count(), 3);
+        // Cut pieces say what is there and nothing more.
+        let _ = Graphics::describe(&packet[..0x20], &s[..S_BLOCK + 9]);
+        let _ = Graphics::describe(&[], &[]);
     }
 
     #[test]
