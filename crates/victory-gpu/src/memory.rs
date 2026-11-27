@@ -106,6 +106,9 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+/// Pages given a place in one frame for structures the builder's calls
+/// named that shaders found empty (64 MiB: several top levels of 12 MB).
+const NAMED: u64 = 1024;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 /// Frames after an arena could not be had before another is asked for.
@@ -224,6 +227,11 @@ struct Stats {
     sized: [u64; 2],
     /// Times an arena could not be had.
     no_arena: u64,
+    /// Of the pages shaders found empty: those below 4 GiB (not memory of
+    /// the title's the directory covers: an offset on a base that read 0),
+    /// those inside a structure the builder's calls named, and those of the
+    /// rest that were given a place from the budgets.
+    fault_kinds: [u64; 3],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -724,10 +732,44 @@ impl Memory {
         }
         pages.sort_unstable();
         let mut made = 0;
+        // Pages given a place this frame because a structure the builder's
+        // calls named lies on them, and the end of the last such structure
+        // (the pages come sorted: a structure's other pages need no second
+        // look).
+        let (mut named, mut named_until) = (0u64, 0u64);
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if page < 0x1_0000 {
+                self.stats.fault_kinds[0] += 1;
+                continue;
+            }
+            if self.copy_of(page).is_some() {
+                continue;
+            }
+            // A structure the builder was told to build or copy there: the
+            // title's own word that the memory is a structure's, so it is
+            // not a pointer gone astray and comes out of neither budget.
+            // (Run rt-7: the budget for the run, 2,048 pages, was spent in
+            // the first minute of the world and no page was given a place
+            // after it, `made=0` in every line, while shaders went on
+            // finding 300 to 1,400 pages a frame empty.) All of it, so that
+            // its other pages do not each cost a frame of zeros.
+            if page * PAGE < named_until {
+                continue;
+            }
+            if named < NAMED
+                && let Some((start, len)) = structure_extent_over(page)
+            {
+                let before = self.pages.len();
+                self.ready(start, len);
+                named += (self.pages.len() - before) as u64;
+                named_until = start + len;
+                self.stats.fault_kinds[1] += 1;
+                continue;
+            }
+            if made < FAULTS && self.faulted < FAULTS_ALL && self.map(page) {
                 made += 1;
                 self.faulted += 1;
+                self.stats.fault_kinds[2] += 1;
                 self.bring(page, page + 1);
             }
         }
@@ -767,6 +809,17 @@ impl Memory {
             if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
                 let page = word / PAGE;
                 self.bring(page, page + 1);
+                // Where the builder's calls said how long the structure is:
+                // its other pages that have no place yet (those that have
+                // one are kept up to date where they are named, and are not
+                // looked at again here: a top level names thousands).
+                if let Some(len) = structure_extent_from(word) {
+                    for other in page + 1..(word + len).div_ceil(PAGE) {
+                        if self.copy_of(other).is_none() && self.map(other) {
+                            self.bring(other, other + 1);
+                        }
+                    }
+                }
             }
         }
     }
@@ -814,7 +867,9 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; of the pages that had no copy, \
+             per frame: {:.1} below 4 GiB (an offset on a base that read 0), {:.1} in structures the builder's calls named (given a place, all of each), \
+             {:.1} others given a place from the budgets",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -836,7 +891,10 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            s.fault_kinds[0] as f64 / frames,
+            s.fault_kinds[1] as f64 / frames,
+            s.fault_kinds[2] as f64 / frames,
         );
         // Where the threads' time went (all threads' together, a frame).
         let ms = |micros: u64| micros as f64 / 1000.0 / frames;
@@ -941,6 +999,16 @@ pub fn structure_extent_from(at: u64) -> Option<u64> {
     let extents = EXTENTS.read().unwrap_or_else(|e| e.into_inner());
     let (&start, &len) = extents.range(..=at).next_back()?;
     (at < start + len).then(|| start + len - at)
+}
+
+/// The extent that has bytes on `page` ([`structure_extent`]), as its start
+/// and length, if one does. (Extents do not overlap; one that begins on the
+/// page is taken before one that reaches into it from below.)
+fn structure_extent_over(page: u64) -> Option<(u64, u64)> {
+    let (from, end) = (page * PAGE, (page + 1) * PAGE);
+    let extents = EXTENTS.read().unwrap_or_else(|e| e.into_inner());
+    let (&start, &len) = extents.range(..end).next_back()?;
+    (start + len > from).then_some((start, len))
 }
 
 /// The builder was told to copy the structure at `source` to `dest`
