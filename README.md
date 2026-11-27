@@ -1,3 +1,63 @@
+# VIctory-NVIDIA-RT
+
+A fork of [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) with the work from
+[pull request #18](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/18): higher frame rates,
+32:9 and HDR10, a one-click launcher with every option, and the groundwork for the title's ray
+tracing on the RTX cores.
+
+**Download:** [latest test build](https://github.com/Kemerd/VIctory-NVIDIA-RT/releases) (`victory.exe` + `PLAY.cmd`).
+Put both next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`.
+
+| RTX 5090, 2560x1440, DLSS Quality, open world, no frame generation | official settings | this fork (fast) |
+|---|---|---|
+| median | 11.8 fps | **21.9 fps** |
+| best | 18.3 fps | **31.9 fps** |
+
+## The launcher, `PLAY.cmd`
+
+Enter starts with the recommended settings, or with your last ones. **C** walks through eight choices:
+
+1. **Resolution:** 2560x1440, 1920x1080 upscaled to 1440, 3840x2160, **5120x1440 (32:9)**, **3440x1440 (21:9)**, 2560x1080, or any width x height.
+2. **Console profile:** Series X (sharper) or Series S (faster).
+3. **DLSS:** Quality, Balanced, Performance, DLAA or off.
+4. **Frame generation:** ready to switch on in F1, **2x to 6x** from the start (3x and up need an RTX 50), or not loaded.
+5. **HDR10** on or off (turn Windows HDR on first).
+6. **Frame cap:** none, 30, 60, 120, 144 or any.
+7. **Interface on ultrawide screens:** kept 16:9 in the middle, or stretched.
+8. **Speed:** fast (recommended), plain (the official release's settings), or fast with the title's own ray tracing (experimental, 5-8 fps).
+
+The choices are remembered; `PLAY.cmd last` starts with no questions. The launcher's resolution, DLSS, frame
+generation and HDR choices win over the ones the F1 menu saved; every other F1 choice is kept.
+
+## What this fork adds
+
+- **Pipelines from pieces.** The title builds many pipelines from loose pieces (console code, metadata and
+  register packets) instead of finished containers. They are now assembled and translated, so those draws happen.
+  A stage that does not translate refuses its pipeline when it is created and the title falls back, so it is never
+  worse than before. Graphics only for now; compute from pieces is being fixed.
+- **The submitting thread in parallel:** one refresh step per list instead of about 52,000 single steps a frame,
+  title writes that clear only the refreshes they overlap, merges that read only the 4 KiB parts written, and
+  `ExecuteCommandLists` on a thread of its own.
+- **Faster loading:** pipelines with static samplers are stored as a sampler table and kept in the pipeline
+  library, instead of about 1,100 being made again by the driver every run (1.4 s each).
+- **32:9 and HDR10.** The display mode is patched wider, so the camera, culling and motion vectors are made for
+  the wide picture; the interface stays 16:9 in the middle. The upload memory that crashed 32:9 runs is fixed.
+- **Ray tracing.** The title's own builder calls are interposed (`VICTORY_RT_NATIVE=1`). It works, at 5-8 fps.
+  Next: a builder of our own and the title's two traversal loop shapes on RayQuery, then DLSS Ray Reconstruction.
+
+## Building it
+
+```powershell
+git clone https://github.com/Kemerd/VIctory-NVIDIA-RT
+cd VIctory-NVIDIA-RT
+.\Get-NVIDIA-DLSS.cmd
+powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -Fast
+```
+
+Everything below is the upstream README.
+
+---
+
 # VIctory on NVIDIA
 
 ## Quick start: how to run it
