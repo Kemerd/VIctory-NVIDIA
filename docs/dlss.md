@@ -493,8 +493,12 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
   plugin sees no present; it frees nothing it retired (what DLSS let go of when
   the title's upscaler is destroyed stays allocated until the process ends).
   `VICTORY_STREAMLINE_PRESENT=1` gives it the presents.
-- HDR output (a 16-bit float swap chain) is not supported by frame generation
-  (status 4).
+- HDR output as a 16-bit float (scRGB) swap chain stays unsupported by frame
+  generation (status 4). `VICTORY_HDR=1` presents HDR10 instead (R10G10B10A2,
+  G2084 with Rec.2020 primaries), which Streamline's guide supports. With it,
+  the planes this layer converts or blends (an interface plane, SDR planes) are
+  not in the back buffer's colour space, so they are not tagged as hudless or
+  interface and frame generation reads the composed frame. Not run yet.
 - Video memory: the title's FidelityFX context stays allocated beside DLSS's;
   frame generation needs about 0.5 GB more at 1440p.
 - Latency: frame generation holds a frame back; it is meant for a base frame

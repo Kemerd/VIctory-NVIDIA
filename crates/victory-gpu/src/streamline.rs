@@ -1901,6 +1901,12 @@ pub(crate) struct Planes<'a> {
     pub base: (&'a ID3D12Resource, u32),
     pub overlay: Option<(&'a ID3D12Resource, u32)>,
     pub size: [u32; 2],
+    /// The back buffer is HDR10 and holds a conversion or a blend of the
+    /// title's planes, so they are not in its colour space and are not
+    /// tagged (the frame generation guide wants the hudless colour and the
+    /// interface in the back buffer's colour space, and
+    /// Blend(Hudless, UI) = FinalColor).
+    pub hdr_blend: bool,
 }
 
 /// What [`present_begins`] began, for [`present_ends`].
@@ -1932,7 +1938,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     }
     // Where the interface is no plane of its own (Series X): the copy of
     // this texture taken in front of the title's interface composite.
-    let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
+    let hudless = if planes.overlay.is_none() && !planes.hdr_blend && hudless_wanted() { hudless_for(planes.base.0) } else { None };
     let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
     let began = std::time::Instant::now();
@@ -2023,7 +2029,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             // go).
             resources.push((abi::Resource::texture(copy.as_raw(), COPY_DEST), abi::BUFFER_HUDLESS_COLOR, planes.size));
             HUD_COUNTS[HUD_TAGGED].fetch_add(1, Relaxed);
-        } else if hudless_wanted() {
+        } else if hudless_wanted() && !planes.hdr_blend {
             HUD_COUNTS[HUD_MISSING].fetch_add(1, Relaxed);
         }
         let tags: Vec<abi::ResourceTag> = resources
@@ -2043,6 +2049,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             back_buffer = ?planes.size,
             interface_plane = planes.overlay.is_some(),
             interface_free_copy = hudless.is_some(),
+            hdr_blend = planes.hdr_blend,
             depth_state = format_args!("{:#x}", resources[0].0.state),
             motion_state = format_args!("{:#x}", resources[1].0.state),
             near = constants.camera_near,

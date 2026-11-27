@@ -9796,6 +9796,8 @@ impl Host {
 
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
     /// over it (Series S two-plane presentation), and returns them to their states.
+    /// The planes' colour spaces are not known on this way in
+    /// ([`Host::present_planes_with`] takes them).
     pub(crate) fn present_planes(
         &self,
         texture: &ID3D12Resource,
@@ -9803,19 +9805,73 @@ impl Host {
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
     ) -> Option<bool> {
+        self.present_planes_with(texture, state, overlay, [crate::hdr::UNKNOWN_SPACE; 2], frame)
+    }
+
+    /// [`Host::present_planes`] with the colour space the title gave each
+    /// plane (`spaces`: the console's value for the base plane and the
+    /// overlay, or `hdr::UNKNOWN_SPACE`). They only matter with `VICTORY_HDR`:
+    /// then the swap chain is HDR10 and every plane but a single one that is
+    /// already PQ goes through the composer. Saved frames are not written in
+    /// that mode (`capture` refuses frames that are not 8-bit).
+    pub(crate) fn present_planes_with(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        spaces: [u32; 2],
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
+        // SAFETY: a live overlay resource.
+        let over_desc = overlay.map(|(over, _)| unsafe { over.GetDesc() });
         let planes = overlay.and_then(|(over, over_state)| {
-            // SAFETY: a live overlay resource.
-            let over_desc = unsafe { over.GetDesc() };
             Some((
                 over,
                 D3D12_RESOURCE_STATES(over_state as i32),
                 crate::compose::view(&desc)?,
-                crate::compose::view(&over_desc)?,
+                crate::compose::view(over_desc.as_ref()?)?,
             ))
         });
-        let format = if planes.is_some() {
+        // HDR10 output (`VICTORY_HDR`, off by default): the swap chain is
+        // R10G10B10A2 whatever the planes are, and anything that is not a
+        // single plane already in PQ is converted by the composer.
+        let hdr = crate::hdr::active();
+        let over_format = over_desc.as_ref().map_or(desc.Format, |d| d.Format);
+        if crate::hdr::asked() {
+            crate::hdr::note_planes(1 + overlay.is_some() as u32, spaces, [desc.Format, over_format]);
+        }
+        let base_space = crate::hdr::plane_space(spaces[0], desc.Format);
+        let over_space = crate::hdr::plane_space(spaces[1], over_format);
+        let hdr_compose = hdr && !(overlay.is_none() && crate::hdr::passthrough(base_space, desc.Format));
+        // The base plane's view when it is converted alone (no overlay).
+        // (also when only the overlay's view failed: the title's frame still shows)
+        let single = if hdr_compose && planes.is_none() {
+            crate::compose::view(&desc)
+        } else {
+            None
+        };
+        if hdr_compose && planes.is_none() && single.is_none() {
+            // a plain copy of an unrelated format into the HDR10 buffer would be invalid
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    format = desc.Format.0,
+                    overlay_format = over_format.0,
+                    "HDR10 output cannot convert these planes; nothing shown"
+                );
+            }
+            return None;
+        }
+        // (overlay if any, base view, overlay view): what the composer is given.
+        let compose_in = match planes {
+            Some((over, over_state, base_fmt, over_fmt)) => Some((Some((over, over_state)), base_fmt, over_fmt)),
+            None => single.map(|base_fmt| (None, base_fmt, base_fmt)),
+        };
+        let format = if hdr {
+            DXGI_FORMAT_R10G10B10A2_UNORM
+        } else if planes.is_some() {
             DXGI_FORMAT_R8G8B8A8_UNORM
         } else {
             let Some(format) = swap_format(desc.Format) else {
@@ -9837,13 +9893,17 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        if planes.is_some() && p.composer.is_none() {
+        if compose_in.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    // a lone plane that must be converted has no plainer way to be shown
+                    if overlay.is_none() {
+                        return None;
+                    }
+                    return self.present_planes_with(texture, state_u32, None, spaces, frame);
                 }
             }
         }
@@ -9862,6 +9922,10 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    // a format change may reset the colour space on some drivers (a guess); setting it again is cheap
+                    if hdr {
+                        crate::hdr::set_swap_chain(&p.swap_chain);
+                    }
                     tracing::info!(
                         width,
                         height,
@@ -9877,13 +9941,16 @@ impl Host {
                 }
             }
         }
-        if planes.is_some() && p.composer.is_none() {
+        if compose_in.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
                 Err(e) => {
                     tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
                     drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+                    if overlay.is_none() {
+                        return None;
+                    }
+                    return self.present_planes_with(texture, state_u32, None, spaces, frame);
                 }
             }
         }
@@ -9919,15 +9986,19 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
-            let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
-                copy.keep(over);
+            let composed = if let Some((over_in, base_fmt, over_fmt)) = compose_in {
+                if let Some((over, _)) = over_in {
+                    copy.keep(over);
+                }
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
-                        pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+                    if let Some((over, over_state)) = over_in {
+                        if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                            pre.push(transition(over, over_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+                        }
                     }
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
                     list.ResourceBarrier(&pre);
@@ -9936,15 +10007,24 @@ impl Host {
                         self,
                         compose_slot,
                         list,
-                        [(texture, base_fmt), (over, over_fmt)],
+                        [(texture, base_fmt), (over_in.map_or(texture, |o| o.0), over_fmt)],
                         &back,
                         (width, height),
+                        hdr.then(|| crate::hdr::Compose {
+                            base: base_space,
+                            over: over_space,
+                            over_on: over_in.is_some(),
+                            paper_nits: crate::hdr::paper_white_nits(),
+                        }),
                     ) {
                         copy.close();
                         drop(back);
                         drop(presenter);
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        if overlay.is_none() {
+                            return None;
+                        }
+                        return self.present_planes_with(texture, state_u32, None, spaces, frame);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !ONCE.swap(true, Ordering::Relaxed) {
@@ -9952,17 +10032,25 @@ impl Host {
                             frame,
                             width,
                             height,
+                            hdr,
                             base_format = base_fmt.0,
                             overlay_format = over_fmt.0,
-                            "display output: compositing two planes (overlay active)"
+                            "{}",
+                            if hdr && over_in.is_none() {
+                                "display output: converting one plane to HDR10"
+                            } else {
+                                "display output: compositing two planes (overlay active)"
+                            }
                         );
                     }
                     let mut post = Vec::with_capacity(3);
                     if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
                     }
-                    if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
-                        post.push(transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, over_state));
+                    if let Some((over, over_state)) = over_in {
+                        if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                            post.push(transition(over, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, over_state));
+                        }
                     }
                     post.push(transition(
                         &back,
@@ -10071,12 +10159,25 @@ impl Host {
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
             // Frame generation: the frame's markers, constants and tags.
+            // Planes we converted or blended are not in the back buffer's
+            // colour space, so they must not be tagged (the guide wants the
+            // hudless and interface tags in the same space as the back buffer).
+            let hdr_blend = composed && hdr && (overlay.is_some() || !crate::hdr::passthrough(base_space, desc.Format));
+            if hdr_blend {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        "HDR10 output converts or blends the planes: frame generation reads the composed frame, without the interface tagged"
+                    );
+                }
+            }
             let presenting = crate::streamline::present_begins(
                 frame,
                 crate::streamline::Planes {
                     base: (texture, state_u32),
-                    overlay: overlay.filter(|_| composed),
+                    overlay: overlay.filter(|_| composed && !hdr_blend),
                     size: [width, height],
+                    hdr_blend,
                 },
             );
             let called = crate::streamline::present_called(&presenting);
@@ -10158,6 +10259,10 @@ impl Host {
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
                 ),
             };
+            // HDR10 output (`VICTORY_HDR`): colour space and metadata for the chain just made
+            if crate::hdr::active() {
+                crate::hdr::set_swap_chain(&swap_chain);
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");

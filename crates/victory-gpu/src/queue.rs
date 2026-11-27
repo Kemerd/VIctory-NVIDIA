@@ -737,6 +737,30 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
     let resource = usize::from_ne_bytes(pointer) as This;
     crate::resource::is_resource(resource).then_some(resource)
 }
+
+/// The console's colour space for plane `index`, read at the 72-byte retail
+/// stride. The field's offset and its use of DXGI_COLOR_SPACE_TYPE values are
+/// a guess from the struct comment. Older single-plane callers pass only the
+/// 24-byte prefix, so the bytes may be garbage there; `hdr::plane_space`
+/// treats numbers it does not know by the plane's format. Gives
+/// `hdr::UNKNOWN_SPACE` for null parameters or an unreadable address.
+#[cfg(windows)]
+fn plane_colour_space(parameters: *const Plane, index: usize) -> u32 {
+    if parameters.is_null() {
+        return crate::hdr::UNKNOWN_SPACE;
+    }
+    let address = parameters
+        .cast::<RetailPlane>()
+        .wrapping_add(index)
+        .cast::<u8>()
+        .wrapping_add(std::mem::offset_of!(RetailPlane, color_space));
+    // fault-safe, like overlay_resource: the title's memory may not be mapped
+    let mut word = [0; 4];
+    if !crate::host::read_into(address, &mut word) {
+        return crate::hdr::UNKNOWN_SPACE;
+    }
+    u32::from_ne_bytes(word)
+}
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 /// (The token names the frame for Reflex's markers, with `VICTORY_REFLEX`.)
@@ -977,6 +1001,17 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // the colour space of each plane, for the host's HDR10 composition; with
+    // `VICTORY_HDR` off nothing is read and the host sees unknown spaces
+    #[cfg(windows)]
+    let spaces = if crate::hdr::asked() {
+        [
+            if planes > 0 { plane_colour_space(plane_parameters, 0) } else { crate::hdr::UNKNOWN_SPACE },
+            if planes > 1 { plane_colour_space(plane_parameters, 1) } else { crate::hdr::UNKNOWN_SPACE },
+        ]
+    } else {
+        [crate::hdr::UNKNOWN_SPACE; 2]
+    };
     // `VICTORY_REFLEX`: this present is bound to the frame it shows, here in
     // the title's order (the host's present may come later, on the line's
     // thread, when the title has begun its next frame): by the frame token
@@ -1074,7 +1109,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, spaces },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1110,7 +1145,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, spaces },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1144,6 +1179,9 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    /// The title's colour space number for each plane (`hdr::UNKNOWN_SPACE`
+    /// when absent or with `VICTORY_HDR` off).
+    spaces: [u32; 2],
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1157,7 +1195,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes_with(texture, state, overlay, what.spaces, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]

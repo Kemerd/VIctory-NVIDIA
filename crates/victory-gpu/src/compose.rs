@@ -11,14 +11,49 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "StaticConstants(b0, num32BitConstants=1), DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "RootConstants(b0, num32BitConstants=6), DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 // The share of the screen width the interface may use (its aspect over the
 // output's): 0 leaves both planes full-frame exactly as before; below 1 the
 // interface is kept at its console aspect and the world keeps the bars.
-cbuffer Fit : register(b0) { float ui_fit; };
+// The rest is the HDR10 output (VICTORY_HDR): out_pq 0 keeps the original
+// gamma-space blend; 1 blends in linear light and writes PQ/Rec.2020.
+// Spaces: 0 gamma 2.2 / Rec.709, 1 linear scRGB (1.0 = 80 nits), 2 PQ / Rec.2020,
+// 3 linear Rec.709 with 1.0 = paper white (what an _SRGB view samples as).
+cbuffer Fit : register(b0) { float ui_fit; uint out_pq; uint base_space; uint over_space; float paper_nits; uint over_on; };
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
+static const float m1 = 2610.0 / 16384.0;
+static const float m2 = 2523.0 / 4096.0 * 128.0;
+static const float c1 = 3424.0 / 4096.0;
+static const float c2 = 2413.0 / 4096.0 * 32.0;
+static const float c3 = 2392.0 / 4096.0 * 32.0;
+// Rec.709 primaries to Rec.2020, row-major, applied as mul(M, c).
+static const float3x3 p709_to_p2020 = float3x3(
+    0.6274039, 0.3292830, 0.0433131,
+    0.0690973, 0.9195404, 0.0113623,
+    0.0163914, 0.0880133, 0.8955953);
+// One colour of a plane to linear light in Rec.2020, in nits.
+float3 decode(float3 c, uint space) {
+    // half-float planes may carry negatives or NaN; neither is light
+    c = isnan(c) ? float3(0, 0, 0) : max(c, 0);
+    if (space == 2) {
+        float3 p = pow(saturate(c), 1.0 / m2);
+        return pow(max(p - c1, 0) / (c2 - c3 * p), 1.0 / m1) * 10000.0;
+    }
+    if (space == 1) {
+        return mul(p709_to_p2020, c * 80.0);
+    }
+    if (space == 3) {
+        return mul(p709_to_p2020, c * paper_nits);
+    }
+    // dxgi's G22 is a pure 2.2 power, not the piecewise srgb curve
+    return mul(p709_to_p2020, pow(c, 2.2) * paper_nits);
+}
+float3 pq_encode(float3 nits) {
+    float3 p = pow(saturate(nits / 10000.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
 [RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
@@ -39,7 +74,29 @@ float4 ps(V v) : SV_Target {
         inside = (ouv.x >= 0.0 && ouv.x <= 1.0) ? 1.0 : 0.0;
     }
     float4 o = over.SampleLevel(smooth_, ouv, 0) * inside;
-    return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    if (out_pq == 0) {
+        return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
+    }
+    float a = over_on != 0 ? saturate(o.a) : 0;
+    float3 over_nits = float3(0, 0, 0);
+    if (over_on != 0) {
+        if (over_space == 1 || over_space == 3) {
+            // linear light is homogeneous: the premultiplied value decodes
+            // as it is, additive pixels (alpha 0, colour above 0) included
+            over_nits = decode(o.rgb, over_space);
+        } else {
+            // the interface plane is premultiplied; a gamma curve over a
+            // premultiplied value would darken its edges, so decode the
+            // straight colour and scale. whatever premultiplied colour is
+            // beyond what the alpha covers is additive light, as in the SDR
+            // branch, and is decoded on its own.
+            float3 covered = saturate(o.rgb / max(a, 1e-4));
+            float3 extra = max(o.rgb - covered * a, 0);
+            over_nits = decode(covered, over_space) * a + decode(extra, over_space);
+        }
+    }
+    float3 scene_nits = decode(s.rgb, base_space);
+    return float4(pq_encode(over_nits + scene_nits * (1 - a)), 1);
 }
 "#;
 
@@ -150,6 +207,7 @@ impl Composer {
         planes: [(&ID3D12Resource, DXGI_FORMAT); 2],
         back: &ID3D12Resource,
         (width, height): (u32, u32),
+        hdr: Option<crate::hdr::Compose>,
     ) -> windows::core::Result<()> {
         while self.views.len() <= slot {
             let heap = unsafe {
@@ -208,7 +266,22 @@ impl Composer {
                 }
                 _ => 0.0,
             };
-            list.SetGraphicsRoot32BitConstant(0, fit.to_bits(), 0);
+            // the six constants of the shader's Fit block; all zero but the fit
+            // with hdr off, which leaves the shader on its original path. with
+            // hdr on and no interface plane the caller passes the base twice.
+            let constants: [u32; 6] = match hdr {
+                Some(h) => [
+                    fit.to_bits(),
+                    1,
+                    h.base as u32,
+                    h.over as u32,
+                    h.paper_nits.to_bits(),
+                    h.over_on as u32,
+                ],
+                None => [fit.to_bits(), 0, 0, 0, 0, 0],
+            };
+            // SAFETY: the pointer is to six live u32, as many as the root signature declares.
+            list.SetGraphicsRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             list.SetGraphicsRootDescriptorTable(1, gpu);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
@@ -334,6 +407,7 @@ mod tests {
                     [(&base, format), (&overlay, format)],
                     &output,
                     (3, 1),
+                    None,
                 )
                 .unwrap();
             cmds.ResourceBarrier(&[crate::host::transition(
@@ -361,6 +435,113 @@ mod tests {
                 );
             }
             eprintln!("D3D12 display-plane readback RGBA: {pixels:?}");
+        }
+    }
+
+    /// the encoder the shader implements, for the expected code of a constant.
+    fn pq_encode(nits: f32) -> f32 {
+        let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+        let (c1, c2, c3) = (3424.0 / 4096.0, 2413.0 / 4096.0 * 32.0, 2392.0 / 4096.0 * 32.0);
+        let p = (nits / 10000.0f32).clamp(0.0, 1.0).powf(m1);
+        ((c1 + c2 * p) / (1.0 + c3 * p)).powf(m2)
+    }
+
+    #[test]
+    fn encodes_sdr_white_as_paper_white_pq_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping hdr10 compose readback: no D3D12 device");
+            return;
+        };
+        let texture = |format: DXGI_FORMAT| -> ID3D12Resource {
+            let mut resource = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            // SAFETY: a valid description and an out pointer of ours.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        None,
+                        &mut resource,
+                    )
+                    .unwrap()
+            };
+            resource.unwrap()
+        };
+        let sdr = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let out = DXGI_FORMAT_R10G10B10A2_UNORM;
+        let mut compositor = Composer::new(host, out).unwrap();
+        let list = host.new_list().unwrap();
+        let (base, output) = (texture(sdr), texture(out));
+        let cmds = &list.list;
+        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        // SAFETY: an open list over textures made above, alive to the end.
+        unsafe {
+            cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[1.0, 1.0, 1.0, 1.0], None);
+            cmds.ResourceBarrier(&[crate::host::transition(
+                &base,
+                target,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+            let hdr = crate::hdr::Compose {
+                base: crate::hdr::Space::Gamma22,
+                over: crate::hdr::Space::Gamma22,
+                over_on: false,
+                paper_nits: 203.0,
+            };
+            // no interface plane: the base stands in for both views
+            compositor
+                .record(
+                    host,
+                    0,
+                    cmds,
+                    [(&base, sdr), (&base, sdr)],
+                    &output,
+                    (1, 1),
+                    Some(hdr),
+                )
+                .unwrap();
+            cmds.ResourceBarrier(&[crate::host::transition(
+                &output,
+                target,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let (buffer, footprint) =
+                crate::capture::read_back(&host.device, cmds, &output).unwrap();
+            list.close();
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().unwrap();
+            let mut mapped = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let start = mapped.cast::<u8>().add(footprint.Offset as usize);
+            let word = u32::from_le_bytes(std::slice::from_raw_parts(start, 4).try_into().unwrap());
+            buffer.Unmap(0, None);
+            // white through the 709 to 2020 matrix keeps rows summing to one,
+            // so the red channel lands on the paper white level
+            let red = (word & 0x3ff) as f32;
+            let expected = pq_encode(203.0) * 1023.0;
+            assert!(
+                (red - expected).abs() <= 2.0,
+                "red code {red}, expected {expected}"
+            );
         }
     }
 }
