@@ -355,6 +355,27 @@ fn note_top_up(m: &Memory) {
     TOP_UP.store(make || ahead, std::sync::atomic::Ordering::Release);
 }
 
+/// Whether the builder's root view on a page held already is taken as the
+/// title's without asking the kernel again (`VICTORY_MEMORY_ASK_RUNS=1`, off
+/// by default), and the root views' time on the time line is split.
+///
+/// Asking is two kernel questions under the mutex (committed, and the write
+/// watch for one page), each list's first naming of the view, though the
+/// page has been held for minutes. Landing asks committed again at the
+/// submission, and the next look at the page asks the write watch with a
+/// later number, so nothing is missed; a held page the title gave back is
+/// no longer counted as turned down. Expected: about 7-10 us per held root
+/// view (QueryWorkingSetEx on 16 pages 5-7 us, a write watch asking about
+/// 2 us, measured apart from the game), 1-2 ms a frame of the list threads'
+/// time in the steady state; no measured share of the streaming frame until
+/// a run with the split says otherwise. The other questions per run of
+/// pages (one for the run, not one a page) are not made: through the
+/// guards they could protect memory that is not the title's.
+fn ask_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_ASK_RUNS").is_some_and(|v| v == "1"))
+}
+
 /// Whether the next arena is made ahead, by a thread of its own
 /// (`VICTORY_MEMORY_ARENAS_AHEAD=1`, off by default; with it unset no
 /// thread is started and [`Memory::another`] makes every arena as before).
@@ -580,6 +601,11 @@ struct Stats {
     /// With [`arenas_ahead`]: arenas taken from the thread's slot, and
     /// arenas made on a recording thread under the mutex.
     arenas_made: [u64; 2],
+    /// With [`ask_runs`]: microseconds in `possible` and its calls, of them
+    /// the microseconds in the root views' section; microseconds there in
+    /// `named_in_upload` and in bringing up; root views whose page was held
+    /// and not asked about.
+    asks: [u64; 6],
     /// Of the pages shaders found empty: those below 4 GiB (not memory of
     /// the title's the directory covers: an offset on a base that read 0),
     /// those inside a structure the builder's calls named, and those of the
@@ -667,6 +693,17 @@ impl Memory {
     /// this frame, and the title's GPU memory. (A shader's pointer, or a
     /// constant taken for an address, may be anything.)
     fn possible(&mut self, page: u64) -> bool {
+        if !ask_runs() {
+            return self.possible_now(page);
+        }
+        let started = std::time::Instant::now();
+        let ours = self.possible_now(page);
+        self.stats.asks[0] += started.elapsed().as_micros() as u64;
+        self.stats.asks[1] += 1;
+        ours
+    }
+
+    fn possible_now(&mut self, page: u64) -> bool {
         // Not the last entry: addresses past the directory read it, and it
         // stays empty.
         if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
@@ -1332,6 +1369,21 @@ impl Memory {
             s.sized[1] as f64 / frames,
             s.no_arena,
         );
+        if ask_runs() {
+            let [all, calls, views, upload, up, held] = s.asks;
+            tracing::info!(
+                "title memory by address, root views split per frame (VICTORY_MEMORY_ASK_RUNS=1): {:.2} ms asking whether pages are \
+                 the title's ({:.1} askings), {:.2} ms of it in the root views; there {:.2} ms naming memory in upload buffers, \
+                 {:.2} ms bringing up, {:.2} ms the rest; {:.1} held pages of the builder's views not asked about",
+                ms(all),
+                calls as f64 / frames,
+                ms(views),
+                ms(upload),
+                ms(up),
+                ms(s.held[3].saturating_sub(views + upload + up)),
+                held as f64 / frames
+            );
+        }
         if quiet() != Quiet::Off {
             use std::sync::atomic::Ordering::Relaxed;
             let [reads, builds, judged, did, waited] = [0, 1, 2, 3, 4].map(|i| QUIET_STATS[i].swap(0, Relaxed));
@@ -1702,13 +1754,21 @@ pub(crate) fn ready(
     });
     let mut came = [held(m) - before, 0, 0, 0];
     section(m, 2);
+    // (`possible`'s time in this section, for [`ask_runs`]'s line.)
+    let asked_before = m.stats.asks[0];
+    // With [`ask_runs`] a page held already is not asked about again.
+    let held_page = |m: &mut Memory, page: u64| {
+        let held = ask_runs() && m.pages.contains_key(&page);
+        m.stats.asks[5] += u64::from(held);
+        held
+    };
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
         if builds
             && first_use(view_key(at))
             && crate::shadow::in_buffer(at, 1).is_none()
-            && m.possible(at / PAGE)
+            && (held_page(m, at / PAGE) || m.possible(at / PAGE))
         {
             // What it needs, as far as it is known now; the rest when the
             // list is submitted ([`Memory::land`]).
@@ -1736,7 +1796,11 @@ pub(crate) fn ready(
                     note_top_up(m);
                 }
             });
+            let started = ask_runs().then(std::time::Instant::now);
             m.bring_up(list);
+            if let Some(started) = started {
+                m.stats.asks[4] += started.elapsed().as_micros() as u64;
+            }
             m.stats.brought_up += 1;
         }
         if builds && written.contains(&at) && first_use(written_key(at)) {
@@ -1769,7 +1833,11 @@ pub(crate) fn ready(
         match crate::shadow::in_buffer(at, 1) {
             Some(_) => {
                 m.ready(at, 1);
+                let started = ask_runs().then(std::time::Instant::now);
                 m.named_in_upload(at);
+                if let Some(started) = started {
+                    m.stats.asks[3] += started.elapsed().as_micros() as u64;
+                }
                 came[3] += held(m).saturating_sub(before);
             }
             None => {
@@ -1785,6 +1853,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    m.stats.asks[2] += m.stats.asks[0] - asked_before;
     section(m, 3);
     let key = std::ptr::from_ref(heap) as usize;
     let run = HEAPS.read().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
