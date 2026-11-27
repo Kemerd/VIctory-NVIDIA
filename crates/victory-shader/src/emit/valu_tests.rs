@@ -2520,6 +2520,14 @@ fn v_ldexp_f32_scales_exactly_in_every_range() {
         0i32, 1, -1, 23, -23, 126, 127, 128, -126, -127, -128, -149, -150, -151, -200, 200, 254,
         300, -300, 1000, -1000, i32::MAX, i32::MIN,
     ];
+    // The console runs its programs with fp32 denormals flushed, in and out.
+    // The word at +0x44 of every program record (FSSM) is 0xC0 in all 2,296
+    // saved programs of every stage; as a MODE register value (FP_ROUND[3:0],
+    // FP_DENORM[7:4]) that is denorm32 = 0 (flush) and denorm16_64 = 3 (keep),
+    // the default of Mesa's ACO (`enum fp_denorm`, `struct float_mode` in
+    // aco_ir.h). So a denormal source reads as a zero of its sign and a
+    // denormal result is a zero of its sign, as the card does.
+    let flush = |x: f32| if x.is_subnormal() { 0.0f32.copysign(x) } else { x };
     // One rounding of the exact scaled value; f64 holds it exactly.
     let want = |x: u32, n: i32| {
         let x = f32::from_bits(x);
@@ -2527,7 +2535,7 @@ fn v_ldexp_f32_scales_exactly_in_every_range() {
             return None;
         }
         let n = n.clamp(-300, 300);
-        Some(((x as f64) * 2.0f64.powi(n)) as f32)
+        Some(flush((flush(x) as f64 * 2.0f64.powi(n)) as f32))
     };
     let mut cases = Vec::new();
     for &x in &xs {
