@@ -15,16 +15,17 @@ Put both next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`
 
 ## The launcher, `PLAY.cmd`
 
-Enter starts with the recommended settings, or with your last ones. **C** walks through eight choices:
+Enter starts with the recommended settings, or with your last ones. **C** walks through nine choices:
 
 1. **Resolution:** 2560x1440, 1920x1080 upscaled to 1440, 3840x2160, **5120x1440 (32:9)**, **3440x1440 (21:9)**, 2560x1080, or any width x height.
-2. **Console profile:** Series X, the default and the one to use. Series S (1280x720 inside, much softer) is only for weaker cards.
-3. **DLSS:** Quality, Balanced, Performance, DLAA or off.
-4. **Frame generation:** ready to switch on in F1, **2x to 6x** from the start (3x and up need an RTX 50), or not loaded.
-5. **HDR10** on or off (turn Windows HDR on first).
-6. **Frame cap:** none, 30, 60, 120, 144 or any.
-7. **Interface on ultrawide screens:** kept 16:9 in the middle, or stretched.
-8. **Speed:** fast (recommended), plain (the official release's settings), or fast with the title's own ray tracing (experimental, 5-8 fps).
+2. **Window:** fullscreen with no border (default) or in a window.
+3. **Console profile:** Series X, the default and the one to use. Series S (1280x720 inside, much softer) is only for weaker cards.
+4. **DLSS:** Quality, Balanced, Performance, DLAA or off.
+5. **Frame generation:** ready to switch on in F1, **2x to 6x** from the start (3x and up need an RTX 50), or not loaded.
+6. **HDR10** on or off (turn Windows HDR on first).
+7. **Frame cap:** none, 30, 60, 120, 144 or any.
+8. **Interface on ultrawide screens:** kept 16:9 in the middle, or stretched.
+9. **Speed:** fast (recommended), plain (the official release's settings), or fast with the title's own ray tracing (experimental, 5-8 fps).
 
 The choices are remembered; `PLAY.cmd last` starts with no questions. The launcher's resolution, DLSS, frame
 generation and HDR choices win over the ones the F1 menu saved; every other F1 choice is kept.

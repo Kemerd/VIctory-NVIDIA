@@ -28,6 +28,7 @@ set "C_FPS=1000"
 set "C_FAST=1"
 set "C_RT=0"
 set "C_UI=band"
+set "C_WIN=full"
 if exist "%LAST%" call "%LAST%"
 
 if /i "%~1"=="last" goto :go
@@ -47,7 +48,7 @@ if /i not "%A%"=="C" goto :go
 
 rem ---- 1. resolution ----
 cls
-echo 1/8  Resolution (output)
+echo 1/9  Resolution (output)
 echo   1. 2560x1440  16:9                        (recommended)
 echo   2. 1920x1080 rendered, upscaled to 2560x1440
 echo   3. 3840x2160  16:9  (4K)
@@ -70,9 +71,19 @@ if "%A%"=="7" (
   set /p C_WIDE=Width x height, for example 3840x1600:
 )
 
-rem ---- 2. console profile ----
+rem ---- 2. window ----
 cls
-echo 2/8  Console profile
+echo 2/9  Window
+echo   1. Fullscreen, no border   (recommended; fills the whole screen)
+echo   2. In a window
+set "A="
+set /p A=Choice [1]:
+set "C_WIN=full"
+if "%A%"=="2" set "C_WIN=window"
+
+rem ---- 3. console profile ----
+cls
+echo 3/9  Console profile
 echo   1. Series X   (default: the full-detail profile)
 echo   2. Series S   (only for weaker cards: 1280x720 inside, much softer)
 set "A="
@@ -82,7 +93,7 @@ if "%A%"=="2" set "C_CONSOLE=s"
 
 rem ---- 3. DLSS ----
 cls
-echo 3/8  DLSS upscaling
+echo 4/9  DLSS upscaling
 echo   1. Quality       (recommended)
 echo   2. Balanced
 echo   3. Performance
@@ -98,7 +109,7 @@ if "%A%"=="5" set "C_DLSS=off"
 
 rem ---- 4. frame generation ----
 cls
-echo 4/8  DLSS frame generation   (needs DLSS on; RTX 40 or later; 3x-6x need an RTX 50)
+echo 5/9  DLSS frame generation   (needs DLSS on; RTX 40 or later; 3x-6x need an RTX 50)
 echo   1. Ready, off   (switch it on in the F1 menu while playing; recommended)
 echo   2. 2x
 echo   3. 3x
@@ -118,7 +129,7 @@ if "%A%"=="7" set "C_FG=none"
 
 rem ---- 5. HDR ----
 cls
-echo 5/8  HDR10   (turn Windows HDR on first)
+echo 6/9  HDR10   (turn Windows HDR on first)
 echo   1. Off
 echo   2. On
 set "A="
@@ -128,7 +139,7 @@ if "%A%"=="2" set "C_HDR=1"
 
 rem ---- 6. frame rate cap ----
 cls
-echo 6/8  Frame rate cap
+echo 7/9  Frame rate cap
 echo   1. None        (recommended)
 echo   2. 30   (the game's own rate)
 echo   3. 60
@@ -146,7 +157,7 @@ if "%A%"=="6" set /p C_FPS=Frames a second, 1 to 1000:
 
 rem ---- 7. interface on wide screens ----
 cls
-echo 7/8  Menus and interface on ultrawide screens   (16:9 screens: no difference)
+echo 8/9  Menus and interface on ultrawide screens   (16:9 screens: no difference)
 echo   1. Kept 16:9 in the middle, black bars   (recommended)
 echo   2. Stretched over the whole width
 set "A="
@@ -156,7 +167,7 @@ if "%A%"=="2" set "C_UI=stretch"
 
 rem ---- 8. speed and experiments ----
 cls
-echo 8/8  Speed settings
+echo 9/9  Speed settings
 echo   1. Fast: pipelines from pieces, parallel submitting thread   (recommended)
 echo   2. Plain: the official release's settings only
 echo   3. Fast + the game's own ray tracing   (EXPERIMENTAL: works, but 5-8 fps)
@@ -179,6 +190,7 @@ if not exist "%HOME_V%" mkdir "%HOME_V%" >nul 2>nul
   echo set "C_FAST=%C_FAST%"
   echo set "C_RT=%C_RT%"
   echo set "C_UI=%C_UI%"
+  echo set "C_WIN=%C_WIN%"
 ) > "%LAST%" 2>nul
 
 :go
@@ -190,6 +202,7 @@ if not "%C_FG%"=="ready" if not "%C_FG%"=="none" set "ARGS=!ARGS! --framegen %C_
 if not "%C_WIDE%"=="" set "ARGS=!ARGS! --set VICTORY_DISPLAY_WIDE=%C_WIDE%"
 set "ARGS=!ARGS! --set VICTORY_HDR=%C_HDR%"
 if "%C_UI%"=="stretch" set "ARGS=!ARGS! --set VICTORY_UI_LETTERBOX=0"
+if "%C_WIN%"=="full" (set "ARGS=!ARGS! --set VICTORY_FULLSCREEN=1") else (set "ARGS=!ARGS! --set VICTORY_FULLSCREEN=0")
 if "%C_RT%"=="1" set "ARGS=!ARGS! --set VICTORY_RT_NATIVE=1"
 rem the official release's loading fix, always
 set "ARGS=!ARGS! --set VICTORY_PIPELINE_SAMPLER_TABLE=1"
@@ -200,7 +213,7 @@ rem rate choices, and those would win over this launcher's: drop them, keep
 rem every other F1 choice.
 set "SETS=%HOME_V%\victory-settings.txt"
 if exist "%SETS%" (
-  findstr /v /b /i /c:"VICTORY_MENU_RES=" /c:"VICTORY_MENU_DLSS=" /c:"VICTORY_MENU_FRAMEGEN=" /c:"VICTORY_MENU_FPS=" /c:"VICTORY_MENU_CONSOLE=" /c:"VICTORY_HDR=" /c:"VICTORY_DISPLAY_WIDE=" /c:"VICTORY_RT_NATIVE=" /c:"VICTORY_UI_LETTERBOX=" "%SETS%" > "%SETS%.tmp" 2>nul
+  findstr /v /b /i /c:"VICTORY_MENU_RES=" /c:"VICTORY_MENU_DLSS=" /c:"VICTORY_MENU_FRAMEGEN=" /c:"VICTORY_MENU_FPS=" /c:"VICTORY_MENU_CONSOLE=" /c:"VICTORY_HDR=" /c:"VICTORY_DISPLAY_WIDE=" /c:"VICTORY_RT_NATIVE=" /c:"VICTORY_UI_LETTERBOX=" /c:"VICTORY_FULLSCREEN=" "%SETS%" > "%SETS%.tmp" 2>nul
   if exist "%SETS%.tmp" move /y "%SETS%.tmp" "%SETS%" >nul
 )
 
@@ -242,9 +255,12 @@ if "%C_HDR%"=="1" set "S_HDR=on"
 set "S_SPEED=plain"
 if "%C_FAST%"=="1" set "S_SPEED=fast"
 if "%C_RT%"=="1" set "S_SPEED=fast + ray tracing (experimental)"
+set "S_WIN=fullscreen, no border"
+if "%C_WIN%"=="window" set "S_WIN=in a window"
 set "S_UI=16:9 in the middle"
 if "%C_UI%"=="stretch" set "S_UI=stretched"
 echo   Resolution      !S_RES!
+echo   Window          !S_WIN!
 echo   Console         Series %C_CONSOLE%
 echo   DLSS            %C_DLSS%
 echo   Frame gen       !S_FG!
