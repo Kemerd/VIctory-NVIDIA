@@ -3839,6 +3839,7 @@ pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
 mod font;
+mod lean;
 mod menu;
 mod panel;
 mod place;
@@ -7814,7 +7815,12 @@ impl HostList {
                         }
                     }
                     let _step = crate::timeline::span("a step of ours");
+                    // (Counted for the lists' steps line: the part of them
+                    // that is neither refreshes nor copies, which was one
+                    // number with the walk over the steps.)
+                    let ours = std::time::Instant::now();
                     work();
+                    lean::ours(ours.elapsed());
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
                     if matches!(step, Step::Run(_)) {
@@ -7834,9 +7840,16 @@ impl HostList {
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
                     batch.flush_one(shadow);
+                    // With [`lean::declare_across`]: a range an earlier list
+                    // of this submission declared to the copy is not
+                    // declared again, unless title memory was written since.
+                    let repeat = lean::declare_across() && !batch.declared.first(std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    lean::declared(repeat);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    if !repeat {
+                        shadow.writing(*address, *len);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
@@ -8026,6 +8039,7 @@ fn submit_split_line(frames: f64) {
         ms[14],
         ms[15],
     );
+    lean::line(frames);
     let [first, again] = [0, 1].map(|i| HEAP_SYNC_FIRST[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if first + again > 0.0 {
         tracing::info!(
@@ -8170,6 +8184,9 @@ struct Batch {
     /// [`Batch::refresh_front`]'s walk over the steps.
     ranges: Vec<(usize, usize)>,
     touches: Vec<Touch>,
+    /// Ranges shaders write, declared to their copies since the submission
+    /// last wrote title memory ([`lean::declare_across`]).
+    declared: lean::Declared,
 }
 
 thread_local! {
@@ -8418,6 +8435,7 @@ impl Batch {
         self.spans_at.clear();
         self.ranges.clear();
         self.touches.clear();
+        self.declared.clear();
         SPARE_BATCH.set(Some(self));
     }
 
@@ -8533,6 +8551,7 @@ impl Batch {
         self.flush();
         self.ahead.clear();
         self.textures.clear();
+        self.declared.clear();
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8594,7 +8613,8 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        // A few copies and no texture: tried here first ([`lean::spread`]).
+        lean::spread(spans.len() + due.len(), !many && due.is_empty(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
                 due[i].refresh();
@@ -8648,7 +8668,8 @@ impl Batch {
         }
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
+        let small = due.len() <= 256;
+        lean::spread(due.len(), small, move |i| {
             let (shadow, from, to) = &due[i];
             if !shadow.nothing_new(*from, *to - *from) {
                 Self::update(shadow, *from, *to);
@@ -8756,7 +8777,9 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
+                // Up to FEW copies (the retain above has run): tried here
+                // first ([`lean::spread`]); the heap's thousands are not.
+                lean::spread(refreshes.len(), refreshes.len() <= FEW, move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);

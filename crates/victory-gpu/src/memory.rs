@@ -118,6 +118,86 @@ fn faults_all() -> usize {
     })
 }
 
+/// `VICTORY_MEMORY_DIRTY=1` (off): a list's submission asks the write watch
+/// about the arenas that were written since, not about all of them.
+///
+/// Where the bytes are: an arena is memory of ours (title address space the
+/// title never touches) with a copy on the card; this module writes it, under
+/// its mutex, from title memory (`bring`, `take`) and nobody else does. Every
+/// list that holds by-address memory used to refresh every arena whole at its
+/// submission, and the submission asks the kernel once per refreshed copy,
+/// 23 arenas to a list and 16 lists to a frame: 7 to 8 ms of the submitting
+/// thread a frame (the same for no written page and for 250, 42 to 45 us a
+/// copy; verified over four runs, 13 arenas +4.3 ms, 25 +8). The hops are
+/// the same as before (title -> arena -> staging -> card); only the asking
+/// for arenas nobody wrote goes.
+///
+/// A list cannot know at its recording which arenas will have been written
+/// by its submission: a page a later dispatch of the same list brings, a
+/// page another list brings meanwhile and the packed structures `land`
+/// unpacks at the submission itself all come after its `bring_up` (run
+/// light-8 showed the cost of missing one). So the writers note the pages
+/// they wrote ([`Dirty`]), and each list holds a step that, when the
+/// submission reaches it, takes the notes and brings exactly those runs of
+/// pages up to date ([`settle`]): one after every `land`, one for the rest
+/// of the list. Copies that are not arenas (title buffers, windows of title
+/// memory) are written by the title and are refreshed whole as before.
+fn dirty_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DIRTY").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_MEMORY_LEAN=1` (off): [`ready`] asks the kernel less, and not
+/// under the mutex. A root view's page that has a place already is not asked
+/// about again (`possible` is a working-set query and a write-watch asking,
+/// 130 to 430 of them a frame for pages held), and the pages a call names
+/// that have none are asked about before the mutex is taken: a recording
+/// thread that stands in `watch::writes` behind the submitting thread's
+/// asking (about 11 ms a frame with ray tracing) no longer holds every other
+/// recording thread behind it. Differs from before only for title memory
+/// that was decommitted after it was given a place: it is no longer found
+/// out here, its deferred landing finds out (`land` looks itself).
+fn lean_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_LEAN").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_MEMORY_BUFFER_FAULTS=1` (off): a page shaders found empty that
+/// lies whole in a title buffer goes to [`Memory::map`] whatever the budgets
+/// are, and comes out of neither. Mapping it numbers the buffer's copy and
+/// gives every page of the buffer its entry, no arena page, so the budgets
+/// that keep stray pointers from taking the arenas have nothing to guard;
+/// run 5 had pages of buffers of 8 to 94 MB found empty for ever once the
+/// run's 2,048 were spent.
+fn buffer_faults_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_BUFFER_FAULTS").is_some_and(|v| v == "1"))
+}
+
+/// Why [`Memory::map`] refused a page, for the report: a page outside what
+/// the directory covers, one turned down earlier in the frame, memory that
+/// is not committed, memory that is not write-watched, a title buffer that
+/// has no copy, a copy that cannot be numbered, a window of title memory
+/// that could not be made, no page left to hold, no arena to be had.
+const WHYS: usize = 9;
+const WHY_RANGE: usize = 0;
+const WHY_AGAIN: usize = 1;
+const WHY_UNCOMMITTED: usize = 2;
+const WHY_UNWATCHED: usize = 3;
+const WHY_NO_COPY: usize = 4;
+const WHY_NO_NUMBER: usize = 5;
+const WHY_NO_WINDOW: usize = 6;
+const WHY_FULL: usize = 7;
+const WHY_NO_ARENA: usize = 8;
+
+/// The most runs of pages one arena is brought up in by one [`settle`]: each
+/// is a kernel asking of its own, and joined across the smallest gaps they
+/// cost the gap's pages (that were never taken, and go up as zeros) instead.
+const RUNS: usize = 16;
+
+/// Pages a call's pre-asking looks at at most ([`ask_ahead_of_the_mutex`]).
+const PRE: usize = 64;
+
 /// Pages given a place in one frame for structures the builder's calls
 /// named that shaders found empty (64 MiB: several top levels of 12 MB).
 const NAMED: u64 = 1024;
@@ -519,6 +599,55 @@ struct Packed {
     header: u64,
 }
 
+/// The pages of arenas this module wrote since [`settle`] last took them up
+/// (with `VICTORY_MEMORY_DIRTY`): per copy's number, the page numbers inside
+/// the arena. Written and taken under the mutex.
+#[derive(Default)]
+struct Dirty {
+    on: bool,
+    pages: HashMap<usize, std::collections::BTreeSet<u32>>,
+}
+
+impl Dirty {
+    /// `len` bytes at `offset` of copy `copy` were written (after the write).
+    fn mark(&mut self, copy: usize, offset: u64, len: u64) {
+        if !self.on || len == 0 {
+            return;
+        }
+        let pages = self.pages.entry(copy).or_default();
+        for page in offset / PAGE..=(offset + len - 1) / PAGE {
+            pages.insert(page as u32);
+        }
+    }
+
+    /// Everything noted, as runs of pages per copy; nothing is noted after.
+    fn take(&mut self) -> Vec<(usize, Vec<(u32, u32)>)> {
+        let mut all: Vec<_> = self.pages.drain().filter(|(_, pages)| !pages.is_empty()).map(|(copy, pages)| (copy, runs_of(&pages, RUNS))).collect();
+        // (The copies in the order they were made: the same order each time.)
+        all.sort_unstable_by_key(|run| run.0);
+        all
+    }
+}
+
+/// The pages as runs `[first, end)`, at most `most` of them: the smallest
+/// gaps are closed first.
+fn runs_of(pages: &std::collections::BTreeSet<u32>, most: usize) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &page in pages {
+        match runs.last_mut() {
+            Some(run) if run.1 == page => run.1 += 1,
+            _ => runs.push((page, page + 1)),
+        }
+    }
+    let most = most.max(1);
+    while runs.len() > most {
+        let Some(at) = (1..runs.len()).min_by_key(|&i| runs[i].0 - runs[i - 1].1) else { break };
+        runs[at - 1].1 = runs[at].1;
+        runs.remove(at);
+    }
+    runs
+}
+
 struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
@@ -556,6 +685,13 @@ struct Memory {
     /// With [`arenas_ahead`]: an arena the thread made, its memory and its
     /// copy, not numbered yet; [`Memory::another`] takes it.
     ahead: Option<(usize, Arc<Shadow>)>,
+    /// Per copy's number: whether it is an arena (memory only this module
+    /// writes).
+    arena_flags: Vec<bool>,
+    /// Arena pages written and not yet brought up ([`settle`]).
+    dirty: Dirty,
+    /// Why [`Memory::map`] last said no (one of the `WHY_` numbers).
+    why: usize,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -613,6 +749,12 @@ struct Stats {
     /// without one because the budget for the run was spent, because the
     /// frame's was, and because the memory is not the title's.
     fault_kinds: [u64; 6],
+    /// Pages shaders found empty that [`Memory::map`] refused, by the
+    /// reason (the `WHY_` numbers).
+    refusals: [u64; WHYS],
+    /// Pages whole in a title buffer that went to `map` outside the budgets
+    /// (`VICTORY_MEMORY_BUFFER_FAULTS`): given a place, refused.
+    buffered: [u64; 2],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -645,6 +787,7 @@ impl Memory {
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        DIRECTORY.store(entries, std::sync::atomic::Ordering::Release);
         Some(Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
@@ -665,6 +808,9 @@ impl Memory {
             refused: Default::default(),
             no_arena_before: 0,
             ahead: None,
+            arena_flags: Vec::new(),
+            dirty: Dirty { on: dirty_on(), ..Default::default() },
+            why: 0,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -706,12 +852,27 @@ impl Memory {
     fn possible_now(&mut self, page: u64) -> bool {
         // Not the last entry: addresses past the directory read it, and it
         // stays empty.
-        if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
+        if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 {
+            self.why = WHY_RANGE;
             return false;
         }
-        let at = (page * PAGE) as usize;
-        let ours = crate::texture::committed(at as *const u8, PAGE as usize)
-            && crate::watch::writes(at, at + PAGE as usize, true).is_some();
+        if self.refused.contains(&page) {
+            self.why = WHY_AGAIN;
+            return false;
+        }
+        // With `VICTORY_MEMORY_LEAN` the call may have asked already, before
+        // it took the mutex ([`ask_ahead_of_the_mutex`]).
+        let refusal = match asked_before(page) {
+            Some(answer) => {
+                LEAN[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                answer
+            }
+            None => not_ours(page),
+        };
+        let ours = refusal.is_none();
+        if let Some(why) = refusal {
+            self.why = why;
+        }
         if !ours {
             self.refused.insert(page);
             self.stats.unknown += 1;
@@ -755,11 +916,11 @@ impl Memory {
         let start = page * PAGE;
         if crate::shadow::in_buffer(start, PAGE).is_some() {
             let Some(shadow) = crate::shadow::find(start, PAGE) else {
-                return false;
+                return self.refuse(WHY_NO_COPY);
             };
             let fresh = !self.numbers.contains_key(&(Arc::as_ptr(&shadow) as usize));
             let Some(n) = self.number(shadow.clone()) else {
-                return false;
+                return self.refuse(WHY_NO_NUMBER);
             };
             // Every page the copy holds whole, not only the one asked for.
             // shortcut: a page of a title buffer inside this one that has a
@@ -793,25 +954,36 @@ impl Memory {
                 fill(self.entry(page), n, 0);
                 return true;
             }
-            return false;
+            return self.refuse(WHY_NO_WINDOW);
         }
         if self.pages.len() >= MOST {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
-            return false;
+            return self.refuse(WHY_FULL);
         }
         if let Some((copy, at)) = self.free.pop() {
             self.hold(page, at, copy);
             return true;
         }
         if !self.another() {
-            return false;
+            return self.refuse(WHY_NO_ARENA);
         }
         let Some((copy, at)) = self.free.pop() else {
-            return false;
+            return self.refuse(WHY_NO_ARENA);
         };
         self.hold(page, at, copy);
         true
+    }
+
+    /// `false`, with the reason [`Memory::map`] gave it (for the report).
+    fn refuse(&mut self, why: usize) -> bool {
+        self.why = why;
+        false
+    }
+
+    /// Whether copy `n` is an arena: memory only this module writes.
+    fn is_arena(&self, n: usize) -> bool {
+        self.arena_flags.get(n).copied().unwrap_or(false)
     }
 
     /// Another arena's pages.
@@ -865,6 +1037,10 @@ impl Memory {
             return failed(self, "no copy of it on the host", 0);
         };
         self.arenas.push((n, at));
+        if self.arena_flags.len() <= n {
+            self.arena_flags.resize(n + 1, false);
+        }
+        self.arena_flags[n] = true;
         // The lowest first.
         self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
         true
@@ -1006,6 +1182,7 @@ impl Memory {
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
+            let was = self.stats.changed;
             let mut title = [0u8; PIECE];
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
@@ -1014,6 +1191,12 @@ impl Memory {
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
                 self.stats.changed += merge(&title, ours, never) as u64 * 4;
+            }
+            // Written now (a page taken for the first time whole, or one that
+            // had dwords differ): the submission brings it up
+            // ([`settle`]), after the bytes are in.
+            if never || self.stats.changed != was {
+                self.dirty.mark(held.copy, base as u64, PAGE);
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
@@ -1135,6 +1318,9 @@ impl Memory {
                     note_landed(shadow, held.at + at, held.at + at + n);
                     LANDED_BYTES[0].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                // (After the write, under the mutex: [`settle`] takes the
+                // notes under it too.)
+                self.dirty.mark(held.copy, (base + at) as u64, n as u64);
             }
             at += n;
         }
@@ -1205,6 +1391,19 @@ impl Memory {
                 self.stats.fault_kinds[1] += 1;
                 continue;
             }
+            // Whole in a title buffer (`VICTORY_MEMORY_BUFFER_FAULTS`): it
+            // takes no arena page, so neither budget has anything to guard.
+            // One page numbers the buffer's copy and gives all its pages
+            // their entries.
+            if buffer_faults_on() && crate::shadow::in_buffer(page * PAGE, PAGE).is_some() {
+                if self.map(page) {
+                    self.stats.buffered[0] += 1;
+                } else {
+                    self.stats.buffered[1] += 1;
+                    self.stats.refusals[self.why.min(WHYS - 1)] += 1;
+                }
+                continue;
+            }
             if self.faulted >= faults_all() {
                 self.stats.fault_kinds[3] += 1;
             } else if made >= FAULTS {
@@ -1216,6 +1415,7 @@ impl Memory {
                 self.bring(page, page + 1);
             } else {
                 self.stats.fault_kinds[5] += 1;
+                self.stats.refusals[self.why.min(WHYS - 1)] += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
@@ -1290,12 +1490,27 @@ impl Memory {
 
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
-    fn bring_up(&self, list: &HostList) {
+    /// `landed`: a landing was just deferred, whose writes come at the
+    /// submission, after the recording.
+    ///
+    /// With `VICTORY_MEMORY_DIRTY` the arenas are not refreshed whole: a step
+    /// brings up the pages written by then ([`settle`]), after every landing
+    /// and once for the rest of the list. The directory and the copies of the
+    /// title's memory (buffers, windows) are the title's to write, and stay
+    /// as they were.
+    fn bring_up(&self, list: &HostList, landed: bool) {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
+        let tracked = self.dirty.on;
+        for (n, shadow) in self.copies.iter().enumerate() {
+            if tracked && self.is_arena(n) {
+                continue;
+            }
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
+        }
+        if tracked && !self.arenas.is_empty() && (landed || list.first_use(usize::MAX - (7 << 33))) {
+            list.defer_host(settle);
         }
     }
 
@@ -1420,8 +1635,207 @@ impl Memory {
                 if self.ahead.is_some() { "is" } else { "is not" }
             );
         }
+        // Why `map` refused the pages shaders found empty, and what the
+        // three switches did (all counts over the frames since the last
+        // line; a switch that is off counts nothing).
+        use std::sync::atomic::Ordering::Relaxed;
+        let per = |n: u64| n as f64 / frames;
+        let lean = [0, 1, 2, 3].map(|i| LEAN[i].swap(0, Relaxed));
+        let settled = [0, 1, 2, 3, 4, 5, 6].map(|i| SETTLED[i].swap(0, Relaxed));
+        tracing::info!(
+            "title memory by address, per frame: pages that shaders found empty and `map` refused: {:.1} outside the directory, {:.1} turned down earlier              in the frame, {:.1} not committed, {:.1} not write-watched, {:.1} in a title buffer with no copy, {:.1} whose copy has no number,              {:.1} windows of title memory not made, {:.1} with no page left, {:.1} with no arena;              VICTORY_MEMORY_BUFFER_FAULTS ({}): {:.1} pages whole in title buffers given a place outside the budgets, {:.1} refused;              VICTORY_MEMORY_LEAN ({}): {:.1} pages asked about before the mutex, {:.1} answers used under it, {:.1} root views held and not asked about,              {:.1} named pages already placed; VICTORY_MEMORY_DIRTY ({}): {:.1} settling steps, {:.1} of them with nothing written, {:.1} arenas brought up,              {:.1} runs of pages, {:.1} KB copied, {:.2} ms on the submitting thread, {:.1} arena askings spared",
+            per(s.refusals[WHY_RANGE]),
+            per(s.refusals[WHY_AGAIN]),
+            per(s.refusals[WHY_UNCOMMITTED]),
+            per(s.refusals[WHY_UNWATCHED]),
+            per(s.refusals[WHY_NO_COPY]),
+            per(s.refusals[WHY_NO_NUMBER]),
+            per(s.refusals[WHY_NO_WINDOW]),
+            per(s.refusals[WHY_FULL]),
+            per(s.refusals[WHY_NO_ARENA]),
+            if buffer_faults_on() { "on" } else { "off" },
+            per(s.buffered[0]),
+            per(s.buffered[1]),
+            if lean_on() { "on" } else { "off" },
+            per(lean[0]),
+            per(lean[1]),
+            per(lean[2]),
+            per(lean[3]),
+            if dirty_on() { "on" } else { "off" },
+            per(settled[0]),
+            per(settled[1]),
+            per(settled[2]),
+            per(settled[3]),
+            settled[4] as f64 / 1024.0 / frames,
+            settled[5] as f64 / 1000.0 / frames,
+            per(settled[6]),
+        );
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// The directory's entries, for reading without the mutex
+/// ([`placed_in`]); 0 until it is made, and it is never made again.
+static DIRECTORY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What `VICTORY_MEMORY_LEAN` did since the last report: pages asked about
+/// before the mutex was taken, answers that spared a kernel asking under
+/// it, root views whose page has a place and were not asked about, pages
+/// that had one already and were not asked about before the mutex.
+static LEAN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// What `VICTORY_MEMORY_DIRTY` did since the last report, over all
+/// submissions: steps run, steps that found nothing written, arenas brought
+/// up (one asking each at least), runs of pages, bytes they copied,
+/// microseconds they took, and arenas not asked about that the whole
+/// refreshes would have asked.
+static SETTLED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Whether `page` has a copy in the directory's entries `entries`, read
+/// without the mutex: an aligned dword that is written whole under it, and
+/// an answer that is a moment old is as good as one a moment earlier (it
+/// only decides that a question is not asked).
+fn placed_in(entries: usize, page: u64) -> bool {
+    if entries == 0 || page >= u64::from(MEMORY_PAGES) {
+        return false;
+    }
+    // SAFETY: an entry of the directory, which lives as long as the process;
+    // a volatile read of a dword the writers store whole.
+    unsafe { ((entries as *const u32).add(page as usize * 2).read_volatile() & !MEMORY_READ_ONLY) != 0 }
+}
+
+/// Why the kernel says `page` is not title memory we can give a place:
+/// `None` if it is.
+fn not_ours(page: u64) -> Option<usize> {
+    let at = (page * PAGE) as usize;
+    if !crate::texture::committed(at as *const u8, PAGE as usize) {
+        return Some(WHY_UNCOMMITTED);
+    }
+    crate::watch::writes(at, at + PAGE as usize, true).is_none().then_some(WHY_UNWATCHED)
+}
+
+thread_local! {
+    /// The kernel's answers for the pages the call on this thread names
+    /// (page, [`not_ours`]), made before it took the mutex.
+    static ASKED: std::cell::RefCell<Vec<(u64, Option<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What [`ask_ahead_of_the_mutex`] found out of `page`: `None` if it did not
+/// ask about it.
+fn asked_before(page: u64) -> Option<Option<usize>> {
+    ASKED.with(|asked| asked.borrow().iter().find(|a| a.0 == page).map(|a| a.1))
+}
+
+/// Drops the answers when the call is through.
+struct Answers;
+
+impl Drop for Answers {
+    fn drop(&mut self) {
+        ASKED.with(|asked| asked.borrow_mut().clear());
+    }
+}
+
+/// The pages a call of [`ready`] may ask [`Memory::possible`] about, the
+/// first [`PRE`] of them: the pages of each root view's address as far as
+/// the builder's calls gave it length (else as far as the call will make
+/// ready), and the page of each address the constants hold. `extent`: the
+/// bytes from an address to the end of the structure the builder's calls
+/// named there.
+fn pages_named(addresses: &[u64], constants: &[u32], builds: bool, extent: impl Fn(u64) -> Option<u64>) -> Vec<u64> {
+    let mut pages: Vec<u64> = Vec::new();
+    let mut add = |page: u64| {
+        if pages.len() < PRE && !pages.contains(&page) {
+            pages.push(page);
+        }
+    };
+    for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
+        let len = extent(at).unwrap_or(if builds { VIEW } else { PAGE }).max(1);
+        // (At most [`PRE`] are kept, whatever the length.)
+        for page in (at / PAGE..=at.saturating_add(len - 1) / PAGE).take(PRE) {
+            add(page);
+        }
+    }
+    for (i, &c) in constants.iter().enumerate() {
+        if let Some(&high) = constants.get(i + 1)
+            && (1..=0x1F).contains(&high)
+            && c >= 0x1_0000
+        {
+            add((u64::from(c) | u64::from(high) << 32) / PAGE);
+        }
+        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
+            add((u64::from(c) << 8) / PAGE);
+        }
+    }
+    pages
+}
+
+/// With `VICTORY_MEMORY_LEAN`, before [`ready`] takes the mutex: asks the
+/// kernel (committed, write-watched: a working-set query and a watch asking,
+/// ms of waiting behind the submitting thread's own asking) about the pages
+/// the call names that have no place yet, so that [`Memory::possible`] finds
+/// the answers made. A page that is not asked about here is asked about
+/// under the mutex, as before. The answers are those of a moment ago; the
+/// memory may change in between, as it may between the asking and the use
+/// under the mutex.
+fn ask_ahead_of_the_mutex(addresses: &[u64], constants: &[u32], builds: bool) -> Answers {
+    let entries = DIRECTORY.load(std::sync::atomic::Ordering::Acquire);
+    let mut found = Vec::new();
+    for page in pages_named(addresses, constants, builds, structure_extent_from) {
+        if !(0x1_0000..u64::from(MEMORY_PAGES) - 1).contains(&page) {
+            continue;
+        }
+        if placed_in(entries, page) {
+            LEAN[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        found.push((page, not_ours(page)));
+        LEAN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ASKED.with(|asked| *asked.borrow_mut() = found);
+    Answers
+}
+
+/// A step of a list that holds by-address memory (`VICTORY_MEMORY_DIRTY`),
+/// run when the list is submitted, on the submitting thread: the pages of
+/// arenas written since the last one are brought up to date, each arena once
+/// over the runs of its pages that were written, and an arena nobody wrote
+/// is not asked about. The notes are taken under the mutex and the asking is
+/// done outside it.
+fn settle() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let (work, arenas) = {
+        let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = guard.as_mut() else { return };
+        let work: Vec<(Arc<Shadow>, Vec<(u32, u32)>)> = m
+            .dirty
+            .take()
+            .into_iter()
+            .filter_map(|(copy, runs)| Some((m.copies.get(copy)?.clone(), runs)))
+            .collect();
+        (work, m.arenas.len())
+    };
+    SETTLED[0].fetch_add(1, Relaxed);
+    SETTLED[6].fetch_add(arenas.saturating_sub(work.len()) as u64, Relaxed);
+    if work.is_empty() {
+        SETTLED[1].fetch_add(1, Relaxed);
+        return;
+    }
+    let mut bytes = 0;
+    for (shadow, runs) in &work {
+        let (start, len) = shadow.span();
+        for &(first, end) in runs {
+            let from = start as usize + first as usize * PAGE as usize;
+            let to = (start as usize + end as usize * PAGE as usize).min((start + len) as usize);
+            if from < to {
+                bytes += shadow.update(from, to - from) as u64;
+            }
+        }
+        SETTLED[3].fetch_add(runs.len() as u64, Relaxed);
+    }
+    SETTLED[2].fetch_add(work.len() as u64, Relaxed);
+    SETTLED[4].fetch_add(bytes, Relaxed);
+    SETTLED[5].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
 }
 
 /// What the recording threads spend in the structure builder's dispatches
@@ -1683,6 +2097,12 @@ pub(crate) fn ready(
         did.set(did.get() | first);
         first
     };
+    // With `VICTORY_MEMORY_LEAN`: what the kernel is asked about the pages
+    // this call names, it is asked before the mutex is taken, and the
+    // answers are dropped when the call is through. (After the quiet
+    // return above: a call that needs nothing under the lock asks nothing.)
+    let lean = lean_on();
+    let _answers = lean.then(|| ask_ahead_of_the_mutex(addresses, constants, builds));
     // (Timed in sections for the report's line: see `Stats::held`.)
     let asked = std::time::Instant::now();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1768,7 +2188,14 @@ pub(crate) fn ready(
         if builds
             && first_use(view_key(at))
             && crate::shadow::in_buffer(at, 1).is_none()
-            && (held_page(m, at / PAGE) || m.possible(at / PAGE))
+            && (held_page(m, at / PAGE)
+                || if lean && m.copy_of(at / PAGE).is_some() {
+                    // It has a place: the kernel need not be asked again.
+                    LEAN[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    true
+                } else {
+                    m.possible(at / PAGE)
+                })
         {
             // What it needs, as far as it is known now; the rest when the
             // list is submitted ([`Memory::land`]).
@@ -1797,7 +2224,7 @@ pub(crate) fn ready(
                 }
             });
             let started = ask_runs().then(std::time::Instant::now);
-            m.bring_up(list);
+            m.bring_up(list, true);
             if let Some(started) = started {
                 m.stats.asks[4] += started.elapsed().as_micros() as u64;
             }
@@ -1888,7 +2315,7 @@ pub(crate) fn ready(
     // half of them, run light-8).
     let first_read = first_use(READ);
     if first_use(copies_key(m.copies.len())) {
-        m.bring_up(list);
+        m.bring_up(list, false);
     }
     if first_read {
         list.keep(&m.faults.0);
@@ -2196,6 +2623,102 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+    }
+
+    fn pages(of: &[u32]) -> std::collections::BTreeSet<u32> {
+        of.iter().copied().collect()
+    }
+
+    #[test]
+    fn pages_written_come_out_as_runs() {
+        assert_eq!(runs_of(&pages(&[]), 4), vec![]);
+        assert_eq!(runs_of(&pages(&[7]), 4), vec![(7, 8)]);
+        // Pages that touch are one run; a gap of any size is two.
+        assert_eq!(runs_of(&pages(&[3, 4, 5, 9, 1023]), 4), vec![(3, 6), (9, 10), (1023, 1024)]);
+    }
+
+    #[test]
+    fn runs_past_the_most_are_joined_across_the_smallest_gaps() {
+        // Gaps of 1, 5 and 90 pages: with two runs left, the first two join.
+        let wide = pages(&[0, 2, 8, 99]);
+        assert_eq!(runs_of(&wide, 4), vec![(0, 1), (2, 3), (8, 9), (99, 100)]);
+        assert_eq!(runs_of(&wide, 3), vec![(0, 3), (8, 9), (99, 100)]);
+        assert_eq!(runs_of(&wide, 2), vec![(0, 9), (99, 100)]);
+        assert_eq!(runs_of(&wide, 1), vec![(0, 100)]);
+        // A most of nothing is one run, not a loop that cannot end.
+        assert_eq!(runs_of(&wide, 0), vec![(0, 100)]);
+    }
+
+    #[test]
+    fn a_dirty_note_covers_every_page_a_write_touches() {
+        let mut dirty = Dirty { on: true, ..Default::default() };
+        // 16 bytes that straddle two pages, and a write of nothing.
+        dirty.mark(3, PAGE - 8, 16);
+        dirty.mark(3, 5 * PAGE, 0);
+        // A whole page of another copy.
+        dirty.mark(1, 2 * PAGE, PAGE);
+        // The copies come in the order of their numbers; notes are taken once.
+        assert_eq!(dirty.take(), vec![(1, vec![(2, 3)]), (3, vec![(0, 2)])]);
+        assert!(dirty.take().is_empty());
+        // A write after a take is noted again.
+        dirty.mark(3, 0, 1);
+        assert_eq!(dirty.take(), vec![(3, vec![(0, 1)])]);
+    }
+
+    #[test]
+    fn nothing_is_noted_with_the_switch_off() {
+        let mut dirty = Dirty::default();
+        dirty.mark(0, 0, PAGE);
+        assert!(dirty.take().is_empty());
+        assert!(dirty.pages.is_empty());
+    }
+
+    #[test]
+    fn the_directory_is_read_without_the_mutex() {
+        // Entries of (number, offset); a closed page (read only) is placed too.
+        let mut entries = vec![0u32; 8];
+        entries[2] = 5;
+        entries[4] = 2 | MEMORY_READ_ONLY;
+        let at = entries.as_ptr() as usize;
+        assert!(!placed_in(at, 0));
+        assert!(placed_in(at, 1));
+        assert!(placed_in(at, 2));
+        assert!(!placed_in(at, 3));
+        // No directory yet, and a page past it.
+        assert!(!placed_in(0, 1));
+        assert!(!placed_in(at, u64::from(MEMORY_PAGES)));
+    }
+
+    #[test]
+    fn the_pages_a_call_names_are_those_of_its_views_and_constants() {
+        let high = 3u64 << 32;
+        let none = |_: u64| None;
+        // Below 4 GiB is no title memory; a view reads a page, a builder's
+        // view the guess, and a known length reaches as far as it says.
+        assert_eq!(pages_named(&[0x1000], &[], false, none), Vec::<u64>::new());
+        assert_eq!(pages_named(&[high], &[], false, none), vec![high / PAGE]);
+        assert_eq!(pages_named(&[high], &[], true, none).len() as u64, VIEW / PAGE);
+        let known = |at: u64| (at == high).then_some(3 * PAGE + 1);
+        assert_eq!(pages_named(&[high], &[], false, known), (0..4).map(|i| high / PAGE + i).collect::<Vec<_>>());
+        // An address in two constants, and one in 256-byte units (builder only).
+        let constants = [0x0002_0000, 1, 0x0100_0000];
+        assert_eq!(pages_named(&[], &constants, false, none), vec![(0x0002_0000 | 1 << 32) / PAGE]);
+        assert_eq!(pages_named(&[], &constants, true, none), vec![(0x0002_0000 | 1 << 32) / PAGE, (0x0100_0000u64 << 8) / PAGE]);
+        // A page named twice is asked once, and no call asks about more than PRE.
+        assert_eq!(pages_named(&[high, high], &[], false, none).len(), 1);
+        assert_eq!(pages_named(&[high], &[], false, |_| Some(1 << 40)).len(), PRE);
+    }
+
+    #[test]
+    fn answers_made_before_the_mutex_are_found_and_then_dropped() {
+        assert_eq!(asked_before(0x1_0007), None);
+        ASKED.with(|asked| *asked.borrow_mut() = vec![(0x1_0007, None), (0x1_0008, Some(WHY_UNCOMMITTED))]);
+        let answers = Answers;
+        assert_eq!(asked_before(0x1_0007), Some(None));
+        assert_eq!(asked_before(0x1_0008), Some(Some(WHY_UNCOMMITTED)));
+        assert_eq!(asked_before(0x1_0009), None);
+        drop(answers);
+        assert_eq!(asked_before(0x1_0007), None);
     }
 
     #[test]
