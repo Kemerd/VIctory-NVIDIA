@@ -110,6 +110,13 @@ if ($Fast) {
     $settings.VICTORY_REFRESH_PROBE_TEXTURES = '1'
     # Where its time goes (stats lines only)
     $settings.VICTORY_REFRESH_SPLIT = '1'; $settings.VICTORY_WAIT_SPLIT = '1'; $settings.VICTORY_DSTORAGE_STATS = '1'
+    # Graphics pipelines from the title's pieces; a stage that does not translate refuses its pipeline,
+    # so the title falls back. Compute from pieces stays off until its layout is right (grey world).
+    $settings.VICTORY_PIPELINE_PIECES = '1'; $settings.VICTORY_PIPELINE_PIECES_REFUSE_UNTRANSLATED = '1'
+    $settings.VICTORY_PIPELINE_PIECES_ONLY = 'graphics'
+    # The submitting thread: refresh sets, refreshes kept across title writes, page parts, sending on its own thread
+    $settings.VICTORY_REFRESH_SET = '1'; $settings.VICTORY_TITLE_WRITE_RANGE = '1'
+    $settings.VICTORY_UNDER_PARTS = '1'; $settings.VICTORY_SEND_THREAD = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
