@@ -195,22 +195,34 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     if copies.is_empty() {
         return false;
     }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
-                .iter()
-                .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
-            Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
-            Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
-            _ => false,
-        })
-    })
+    let _walk = lean::walking(lean::Walk::CopiedRead);
+    // a set seen again in this call asks the same question as its first
+    // occurrence, so it contributes nothing the second time.
+    let mut once = sets::Once::default();
+    for list in runs {
+        for step in list.deferred().copies.iter() {
+            let hit = match step {
+                Step::Refresh(..) | Step::RefreshSet(_) => sets::refreshes(step, &mut once).any(|(shadow, at, len)| {
+                    copies
+                        .iter()
+                        .any(|w| w.from < at + len && at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow)))
+                }),
+                Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
+                Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
+                _ => false,
+            };
+            if hit {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Does {
+pub(super) enum Does {
     Copy { dst: usize, src: usize, len: usize, asked: bool },
     /// `to`: its memory can be given the bytes on the card.
     Fill { src: usize, len: usize, asked: bool, to: bool },
@@ -413,13 +425,30 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+pub(super) fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+    let _walk = lean::walking(lean::Walk::DoesOf);
     let mut does = Vec::new();
+    // a set stands in a submission many times; its refreshes are the same
+    // every time, so only its first occurrence adds entries.
+    let mut once = sets::Once::default();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
+            if let Step::RefreshSet(set) = step {
+                if once.first(set) {
+                    for m in set.members() {
+                        does.push(Does::Refresh {
+                            shadow: Arc::as_ptr(&m.shadow) as usize,
+                            from: m.at,
+                            to: m.at + m.len,
+                        });
+                        steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+                    }
+                }
+                continue;
+            }
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -454,12 +483,33 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 },
                 Step::Run(_) => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Step::RefreshSet(_) | Step::GpuWrite(..) | Step::Host(..) => continue,
             });
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
     }
     (does, steps)
+}
+
+/// The refreshes of host copies in `runs` as (copy address, from, to),
+/// sorted and without repeats. `sets::begin` compares this between the set
+/// form and the naive expansion in check mode.
+pub(super) fn refresh_does(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
+    refreshes_of(does_of(&[], runs).0)
+}
+
+/// The sorted, deduplicated refreshes among `does`.
+fn refreshes_of(does: Vec<Does>) -> Vec<(usize, usize, usize)> {
+    let mut out: Vec<_> = does
+        .into_iter()
+        .filter_map(|d| match d {
+            Does::Refresh { shadow, from, to } => Some((shadow, from, to)),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -996,6 +1046,22 @@ mod tests {
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
+    }
+
+    /// Only refreshes come out, in order, once each.
+    #[test]
+    fn refresh_list_is_sorted_and_deduplicated() {
+        let does = vec![
+            Does::Refresh { shadow: 9, from: 10, to: 20 },
+            copy(1, 2, 3, false),
+            Does::Refresh { shadow: 3, from: 50, to: 60 },
+            fill(5, 6, true),
+            Does::Run,
+            Does::Refresh { shadow: 9, from: 10, to: 20 },
+            Does::Refresh { shadow: 3, from: 0, to: 5 },
+        ];
+        assert_eq!(refreshes_of(does), vec![(3, 0, 5), (3, 50, 60), (9, 10, 20)]);
+        assert!(refreshes_of(vec![Does::Run, copy(1, 2, 3, true)]).is_empty());
     }
 
     fn fill(src: usize, len: usize, asked: bool) -> Does {

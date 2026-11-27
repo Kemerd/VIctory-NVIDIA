@@ -154,6 +154,107 @@ fn compute_container(d: &ComputeDesc) -> Result<Vec<u8>, Refusal> {
     filled(draft, d.code, d.metadata)
 }
 
+/// `VICTORY_PIPELINE_PIECES=1`, read once (device.rs makes the pipelines
+/// from pieces under the same switch).
+pub(crate) fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES").is_ok_and(|v| v == "1"))
+}
+
+/// Whether `container` is one made from pieces (it has their part).
+pub(crate) fn is_pieces(container: &[u8]) -> bool {
+    victory_shader::Container::parse(container)
+        .is_ok_and(|c| c.part(victory_shader::FourCC::PIECES).is_some())
+}
+
+/// The list of containers from pieces that did not translate, kept beside
+/// the library. A stage that does not translate leaves its pipeline with no
+/// host pipeline, and every draw of it is dropped; the title was told the
+/// pipeline exists and never falls back. A pipeline refused at creation
+/// answers as with the switch off, and the title goes without it.
+const UNTRANSLATED: &str = "pieces-untranslated.bin";
+
+/// `VICTORY_PIPELINE_PIECES_REFUSE_UNTRANSLATED=1`, read once, off by
+/// default, and only with `VICTORY_PIPELINE_PIECES=1`: a stage that did not
+/// translate in an earlier run of this translator is refused at creation,
+/// and the ones that fail now are added to the list. The run that first
+/// meets such a stage still drops its draws; the next one does not make it.
+fn refusing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        enabled()
+            && std::env::var("VICTORY_PIPELINE_PIECES_REFUSE_UNTRANSLATED").is_ok_and(|v| v == "1")
+    })
+}
+
+/// The keys in the file `path` (32 bytes each, a torn end ignored); empty
+/// if there is no such file.
+fn load_untranslated(path: &std::path::Path) -> std::collections::HashSet<[u8; 32]> {
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let (keys, _) = bytes.as_chunks::<32>();
+    keys.iter().copied().collect()
+}
+
+/// Adds `key` to the file `path`. Only ever appended to, under a lock: the
+/// workers that translate write from several threads.
+fn append_untranslated(path: &std::path::Path, key: &[u8; 32]) {
+    use std::io::Write;
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(key));
+    if let Err(e) = written {
+        tracing::warn!(error = %e, "the list of pieces that did not translate was not written");
+    }
+}
+
+/// The keys known from earlier runs: empty unless refusing is on.
+fn untranslated() -> &'static std::sync::RwLock<std::collections::HashSet<[u8; 32]>> {
+    static KNOWN: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<[u8; 32]>>> =
+        std::sync::OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let keys = super::library::folder()
+            .filter(|_| refusing())
+            .map(|dir| load_untranslated(&dir.join(UNTRANSLATED)))
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            tracing::info!(stages = keys.len(), "pieces that did not translate in earlier runs are refused");
+        }
+        std::sync::RwLock::new(keys)
+    })
+}
+
+/// Worker side of a failed translation: keeps `container`'s key for the next
+/// run when it is one from pieces and refusing is on.
+pub(crate) fn note_untranslated(container: &[u8]) {
+    if !refusing() || !is_pieces(container) {
+        return;
+    }
+    if let Some(dir) = super::library::folder() {
+        let _ = std::fs::create_dir_all(&dir);
+        append_untranslated(&dir.join(UNTRANSLATED), &crate::shader_cache::untranslated_key(container));
+    }
+}
+
+/// Refuses a description with a stage that did not translate in an earlier
+/// run. Title thread: an empty list costs nothing, otherwise one BLAKE3 per
+/// stage and a lookup.
+fn refuse_untranslated<'a>(stages: impl Iterator<Item = &'a [u8]>) -> Result<(), Refusal> {
+    let known = untranslated().read().unwrap_or_else(|e| e.into_inner());
+    if known.is_empty() {
+        return Ok(());
+    }
+    for stage in stages {
+        if known.contains(&crate::shader_cache::untranslated_key(stage)) {
+            return Err("a stage that did not translate in an earlier run of this translator");
+        }
+    }
+    Ok(())
+}
+
 /// Device method 0x218: a compute pipeline from the pieces `desc` names,
 /// or why it is not made.
 pub(crate) fn compute(
@@ -164,7 +265,9 @@ pub(crate) fn compute(
     let d: ComputeDesc = described(desc, size_of::<ComputeDesc>())
         .ok_or("a description that is not there to read")?;
     rooted(d.root)?;
-    let shader = shader_of("compute", Cow::Owned(compute_container(&d)?));
+    let container = compute_container(&d)?;
+    refuse_untranslated(std::iter::once(container.as_slice()))?;
+    let shader = shader_of("compute", Cow::Owned(container));
     Ok(hand_out(vec![shader], None, iid, out))
 }
 
@@ -262,6 +365,7 @@ pub(crate) fn graphics(
     let d: GraphicsDesc = described(desc, 0x68).ok_or("a description that is not there to read")?;
     rooted(d.root)?;
     let (stages, state) = graphics_parts(&d)?;
+    refuse_untranslated(stages.iter().map(|(_, bytes)| bytes.as_slice()))?;
     let shaders: Vec<Arc<Shader>> = stages
         .into_iter()
         .map(|(stage, bytes)| shader_of(stage, Cow::Owned(bytes)))
@@ -629,6 +733,7 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+    use std::io::Write;
 
     fn put(to: &mut [u8], at: usize, v: u32) {
         to[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -1109,5 +1214,56 @@ mod tests {
             "no captured description in {}",
             folder.display()
         );
+    }
+
+    /// A stage known not to translate is refused at creation (the title
+    /// then goes without the pipeline, as with the switch off), and made
+    /// again once it is no longer on the list.
+    #[test]
+    fn a_stage_that_did_not_translate_is_refused() {
+        // another group size than the test above, so that no other test
+        // shares this container while its key is on the list
+        let mut packet = compute_packet();
+        packet[0x0c..0x12].copy_from_slice(&[4, 0, 4, 0, 1, 0]);
+        let piece = [0u8; 0x14];
+        let code = [0x00, 0x00, 0x81, 0xbf, 0, 0, 0, 0];
+        let meta = metadata(0x403, 0x18, 2);
+        let d = ComputeDesc {
+            root: root() as u64,
+            packet: pair(&packet),
+            pipeline: pair(&piece),
+            code: pair(&code),
+            metadata: pair(&meta),
+        };
+        let iid = super::super::PIPELINE_IIDS[0];
+        let key = crate::shader_cache::untranslated_key(&compute_container(&d).unwrap());
+        untranslated().write().unwrap().insert(key);
+        let mut out = std::ptr::null();
+        assert!(compute((&raw const d).cast(), &iid, &mut out).is_err());
+        assert!(out.is_null());
+        untranslated().write().unwrap().remove(&key);
+        assert_eq!(compute((&raw const d).cast(), &iid, &mut out), Ok(S_OK));
+        assert!(!out.is_null());
+    }
+
+    /// The list on disk is only added to, reads back whole keys, and cuts
+    /// a torn end.
+    #[test]
+    fn the_list_of_untranslated_stages_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(UNTRANSLATED);
+        assert!(load_untranslated(&path).is_empty());
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        append_untranslated(&path, &a);
+        append_untranslated(&path, &b);
+        append_untranslated(&path, &a);
+        // a write that stopped half way
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[9u8; 7])
+            .unwrap();
+        assert_eq!(load_untranslated(&path), [a, b].into_iter().collect());
     }
 }

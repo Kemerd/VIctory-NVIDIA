@@ -73,6 +73,7 @@ use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::descriptor::host::HostHeap;
+use crate::host::sets::{CopySet, Member};
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
@@ -668,6 +669,11 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
+    /// The set of copies a list brings up to date, made for the number of
+    /// copies it holds. Copies only ever grow in number, and a copy's span and
+    /// whether it is an arena do not change after it is numbered, so a set
+    /// stays right while the count is the same.
+    set: Option<Arc<CopySet>>,
     /// Places of title buffers' copies among `copies`.
     numbers: HashMap<usize, usize>,
     /// Arenas: place in `copies`, address.
@@ -806,6 +812,7 @@ impl Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
+            set: None,
             numbers: HashMap::new(),
             arenas: Vec::new(),
             pages: HashMap::new(),
@@ -1515,6 +1522,49 @@ impl Memory {
         }
     }
 
+    /// The members `bring_up` refreshes, in copy-number order: every copy
+    /// except an arena when the dirty journal brings those up itself.
+    fn set_members(&self) -> Vec<Member> {
+        let tracked = self.dirty.on;
+        let mut members = Vec::with_capacity(self.copies.len());
+        for (n, shadow) in self.copies.iter().enumerate() {
+            if tracked && self.is_arena(n) {
+                continue;
+            }
+            // refresh clamps the length to the span and the address is its
+            // start, so the span's length is the member's length
+            let (start, len) = shadow.span();
+            members.push(Member { shadow: shadow.clone(), at: start as usize, len: len as usize });
+        }
+        members
+    }
+
+    /// The set of copies a list brings up, kept while the number of copies
+    /// stays the same. Its contract is checked at runtime by
+    /// `VICTORY_REFRESH_SET_CHECK=1` and the walks are tested in host/sets.rs;
+    /// a test here would need a `Shadow`, which needs a buffer.
+    fn copy_set(&mut self) -> Arc<CopySet> {
+        if let Some(set) = &self.set
+            && set.copies() == self.copies.len()
+        {
+            if !crate::host::sets::check() {
+                return set.clone();
+            }
+            // check mode: rebuild and compare, same copies, spans and order
+            let fresh = self.set_members();
+            let old = set.members();
+            let same = fresh.len() == old.len()
+                && fresh.iter().zip(old).all(|(a, b)| Arc::ptr_eq(&a.shadow, &b.shadow) && a.at == b.at && a.len == b.len);
+            if same {
+                return set.clone();
+            }
+            crate::host::sets::mismatch("a refresh set was out of date for the copies it was made for");
+        }
+        let set = Arc::new(CopySet::new(self.copies.len(), self.set_members()));
+        self.set = Some(set.clone());
+        set
+    }
+
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
     /// `landed`: a landing was just deferred, whose writes come at the
@@ -1525,16 +1575,26 @@ impl Memory {
     /// and once for the rest of the list. The directory and the copies of the
     /// title's memory (buffers, windows) are the title's to write, and stay
     /// as they were.
-    fn bring_up(&self, list: &HostList, landed: bool) {
+    ///
+    /// With `VICTORY_REFRESH_SET` every copy is one step, `Step::RefreshSet`,
+    /// which stands for the same refreshes in the same order.
+    fn bring_up(&mut self, list: &HostList, landed: bool) {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
         let tracked = self.dirty.on;
-        for (n, shadow) in self.copies.iter().enumerate() {
-            if tracked && self.is_arena(n) {
-                continue;
+        if crate::host::sets::on() {
+            // one step for all the copies, which the walks expand to the
+            // same refreshes the loop below would have pushed
+            let set = self.copy_set();
+            list.defer_refresh_set(&set);
+        } else {
+            for (n, shadow) in self.copies.iter().enumerate() {
+                if tracked && self.is_arena(n) {
+                    continue;
+                }
+                let (start, len) = shadow.span();
+                shadow.refresh(list, start, len);
             }
-            let (start, len) = shadow.span();
-            shadow.refresh(list, start, len);
         }
         if tracked && !self.arenas.is_empty() && (landed || list.first_use(usize::MAX - (7 << 33))) {
             list.defer_host(settle);

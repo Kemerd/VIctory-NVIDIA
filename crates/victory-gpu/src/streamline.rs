@@ -1807,6 +1807,12 @@ static HUDLESS_WANTED: AtomicBool = AtomicBool::new(false);
 static SHOWN: [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
 static SHOWN_NEXT: AtomicU32 = AtomicU32::new(0);
 
+/// Whether the host texture `texture` is one the title presents ([`SHOWN`]).
+pub(crate) fn presented(texture: &ID3D12Resource) -> bool {
+    let address = texture.as_raw() as usize;
+    SHOWN.iter().any(|s| s.load(Relaxed) == address)
+}
+
 /// A copy of a presented texture taken in front of the interface composite.
 struct Copied {
     id: u64,

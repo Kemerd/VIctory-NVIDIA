@@ -3781,6 +3781,7 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.note_unbuilt("dispatch", [x, y, z]);
             #[cfg(feature = "diagnostics")]
             {
                 crate::pipeline::note_drop(self.pipeline as This);
@@ -4879,6 +4880,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.note_unbuilt("draw", [vertices, instances, 1]);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -4907,10 +4909,99 @@ impl State {
         crate::streamline::before_target_draw(list, target as This, p, triangle);
     }
 
+    /// With `VICTORY_PIPELINE_PIECES=1`: names once per pipeline from pieces
+    /// what its dropped draw or dispatch (`what`, with its counts) was aimed
+    /// at, when it has no host pipeline: the topology and every target's
+    /// size and format, and whether the target is a texture the title
+    /// presents. A scene composite that was lost shows as a presented
+    /// target of the output's size drawn with one triangle.
+    fn note_unbuilt(&self, what: &str, n: [u32; 3]) {
+        if !crate::pipeline::pieces::enabled() || crate::pipeline::host_pipeline(self.pipeline as This).is_some() {
+            return;
+        }
+        crate::pipeline::note_unbuilt(self.pipeline as This, || {
+            let targets: Vec<String> = self
+                .targets
+                .iter()
+                .map(|&t| match crate::resource::host_resource(t as This) {
+                    Some(texture) => {
+                        // SAFETY: `texture` is a live host resource held by its title resource.
+                        let d = unsafe { texture.GetDesc() };
+                        format!(
+                            "{}x{} format {} presented {}",
+                            d.Width,
+                            d.Height,
+                            d.Format.0,
+                            crate::streamline::presented(texture)
+                        )
+                    }
+                    None => "no host texture".to_owned(),
+                })
+                .collect();
+            format!(
+                "{what} {}x{}x{}, topology {}, depth {}, targets [{}]",
+                n[0],
+                n[1],
+                n[2],
+                self.topology,
+                self.depth != 0,
+                targets.join("; ")
+            )
+        });
+    }
+
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+    }
+
+    /// Width, height and format of the draw's one render target, as the title made it (`crate::resource::texture_kind`, from our record of the title's description: no GetDesc, so it is cheap per draw); `None` for no target, several, or a buffer.
+    fn single_target_kind(&self) -> Option<(u64, u32, u32)> {
+        let &[target] = self.targets.as_slice() else {
+            return None;
+        };
+        crate::resource::texture_kind(target as This)
+    }
+
+    /// whether the bound pipeline's one-triangle draw is the title's interface composite.
+    /// `Some(true)`: the title's own hashes (`crate::streamline::INTERFACE_COMPOSITE`, all of
+    /// which must be among the stages), trusted as before.
+    /// `Some(false)`: by shape (`HostPipeline::over`) when the draw's one target is the
+    /// output's size (`output_sized` with `crate::dxgi::display_size()`).
+    /// `None`: anything else.
+    /// a shape fits more than the composite (a layer blended over another inside the
+    /// interface's own target), and the presented texture is not known at draw time (the
+    /// present learns it, in queue.rs and pipeline/host.rs), so the shape also has to draw
+    /// into a target of the output's size. the output's format is not known here either;
+    /// `name_taken` logs the taken target's size and format so a run shows whether it would
+    /// tell them apart. a shape-only draw that fails the target says so once, with the
+    /// target's kind, so a run explains a band that never fired.
+    fn interface_composite(&self, pipeline: &HostPipeline) -> Option<bool> {
+        let stock = crate::streamline::INTERFACE_COMPOSITE
+            .iter()
+            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == *hash));
+        if stock {
+            return Some(true);
+        }
+        if !pipeline.over {
+            return None;
+        }
+        let kind = self.single_target_kind();
+        let output = crate::dxgi::display_size();
+        if output_sized(kind, output) {
+            return Some(false);
+        }
+        static WHY: std::sync::Once = std::sync::Once::new();
+        WHY.call_once(|| {
+            tracing::info!(
+                pipeline = %pipeline.name,
+                target = ?kind,
+                output = ?output,
+                "a one-triangle draw of the interface composite's shape draws into a target that is not the output's size, so it is left alone (a layer blended inside the interface's own target); target is width, height, format"
+            )
+        });
+        None
     }
 
     /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
@@ -4918,7 +5009,9 @@ impl State {
     /// in output pixels, but some screens project it against the legacy
     /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
     /// the projection lands on the output-sized target. The scissor and target
-    /// stay output-sized. From DexNom's fork (`State::native_frontend_viewport`,
+    /// stay output-sized. The draw is found by the title's hashes or by the
+    /// composite's shape (`interface_composite`), the same draw
+    /// `interface_band` places. From DexNom's fork (`State::native_frontend_viewport`,
     /// GPL-3.0-or-later).
     fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4937,9 +5030,10 @@ impl State {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
-        if !pipeline.stages.iter().any(|stage| stage.shader.hash == "0602c2384acbb3b2")
-            || !pipeline.stages.iter().any(|stage| stage.shader.hash == "a78d088fa55aa495")
-        {
+        // the same rule as interface_band, so the pair of draws agrees: the
+        // title's hashes, or the composite's shape into an output-sized target
+        // (the hashes are ours-or-the-title's depending on VICTORY_PIPELINE_PIECES)
+        if self.interface_composite(pipeline).is_none() {
             return None;
         }
         let Root::Table(table) = self.roots_ref(false).first()? else {
@@ -4973,7 +5067,8 @@ impl State {
     /// `compose::ui_band`): where the title's interface composite (one
     /// triangle into the presented texture: the pair of
     /// `streamline::INTERFACE_COMPOSITE`, or a pipeline of its shape,
-    /// `HostPipeline::over`) goes. Answers the band's left edge, its width
+    /// `HostPipeline::over`, taken only into a target of the output's size)
+    /// goes. Answers the band's left edge, its width
     /// and the scissor for this draw (the title's first rect cut to the
     /// band), or `None` for any other draw and whenever the switches are off.
     /// Called for one-triangle draws.
@@ -4991,20 +5086,14 @@ impl State {
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
         let (w, h) = crate::dxgi::display_size();
-        // the composite is the title's pair of programs, or any pipeline of
-        // its shape: with VICTORY_PIPELINE_PIECES=1 the stage containers are
-        // ours, so the pair has other hashes there (the 2026-11-27 runs with
-        // it bound a pair that matched nothing, and the band never fired)
-        let stock = crate::streamline::INTERFACE_COMPOSITE
-            .iter()
-            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == *hash));
-        if !stock && !pipeline.over {
-            return None;
-        }
+        // the composite is the title's pair of programs, or a pipeline of its
+        // shape drawing into an output-sized target (`interface_composite`):
+        // with VICTORY_PIPELINE_PIECES=1 the stage containers are ours, so the
+        // pair has other hashes there (the 2026-11-27 runs with it bound a
+        // pair that matched nothing, and the band never fired)
+        let stock = self.interface_composite(pipeline)?;
         // each pipeline taken is named once, with where it draws, so that a
-        // run says which draws this took for the interface (a shape can fit
-        // more than the composite: a layer blended over another inside the
-        // interface's own target would be shrunk too)
+        // run says which draws this took for the interface
         self.name_taken(pipeline, stock, w, h);
         // the composite is ours; if its viewport is not the whole output the
         // interface stays stretched, and the log says why once
@@ -5093,7 +5182,7 @@ impl State {
             output = ?(w, h),
             viewports = ?viewports,
             scissors = self.scissors.len(),
-            "a one-triangle draw is taken for the interface composite (VICTORY_UI_LETTERBOX): by the title's hashes, or by its shape (premultiplied over, one target); target is width, height, format"
+            "a one-triangle draw is taken for the interface composite (VICTORY_UI_LETTERBOX): by the title's hashes, or by its shape (premultiplied over, one output-sized target); target is width, height, format"
         );
     }
 
@@ -5227,6 +5316,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            self.note_unbuilt("indexed", [indices, instances, 1]);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -5617,6 +5707,26 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// whether `kind` (width, height, format, as `crate::resource::texture_kind` answers) is a
+/// target of the `output` size. kept apart from `State::interface_composite` so it can be
+/// tested without a device.
+fn output_sized(kind: Option<(u64, u32, u32)>, output: (u32, u32)) -> bool {
+    kind.is_some_and(|(w, h, _)| w == u64::from(output.0) && h == output.1)
+}
+
+#[cfg(test)]
+mod interface_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_output_sized_target_is_taken_by_shape() {
+        assert!(output_sized(Some((5120, 1440, 28)), (5120, 1440)));
+        assert!(!output_sized(Some((3840, 2160, 28)), (5120, 1440)));
+        assert!(!output_sized(Some((5120, 1080, 28)), (5120, 1440)));
+        assert!(!output_sized(None, (5120, 1440)));
     }
 }
 

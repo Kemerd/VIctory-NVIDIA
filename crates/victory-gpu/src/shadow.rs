@@ -1740,6 +1740,26 @@ fn workers() -> &'static Workers {
     workers
 }
 
+/// Since the last frame line, of [`wide`] calls with two jobs or more:
+/// [0] calls, [1] nanoseconds this thread worked before the join, [2]
+/// nanoseconds it waited at the join.
+static WIDE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Logs and clears [`WIDE`], per frame; nothing if no call was counted.
+pub(crate) fn wide_line(frames: f64) {
+    let c: [u64; 3] = std::array::from_fn(|i| WIDE[i].swap(0, Ordering::Relaxed));
+    if c[0] == 0 {
+        return;
+    }
+    let frames = frames.max(1.0);
+    tracing::info!(
+        "fork-joins on the kept threads, per frame (every caller of the kept threads: refreshes, snapshots, merges): {:.1} calls, this thread worked {:.2} ms before the join and waited {:.2} ms at it",
+        c[0] as f64 / frames,
+        c[1] as f64 / 1e6 / frames,
+        c[2] as f64 / 1e6 / frames
+    );
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -1751,6 +1771,9 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // Split in two for [`WIDE`]: what this thread did itself, and what it
+    // stood for after that.
+    let began = std::time::Instant::now();
     // Helpers woken: one for each job beyond the one this thread takes
     // first, at most all of them. All were woken for every call (4 for 2
     // jobs), and those that found nothing went back to sleep; a helper busy
@@ -1788,11 +1811,17 @@ fn wide(jobs: Vec<Job>) {
             None => break,
         }
     }
+    let worked = began.elapsed();
     spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
     let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
     }
+    drop(n);
+    let waited = began.elapsed().saturating_sub(worked);
+    WIDE[0].fetch_add(1, Ordering::Relaxed);
+    WIDE[1].fetch_add(worked.as_nanos() as u64, Ordering::Relaxed);
+    WIDE[2].fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
@@ -2169,9 +2198,55 @@ fn back_piece(
     Some((first, n))
 }
 
-/// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: [0]
+/// pages compared, [1] changed runs put in, [2] their bytes, [3] bytes of
+/// title memory read, [4] bytes of the pages looked at that the journal shows
+/// written since the copy took them (a page never taken counts whole). [4] is
+/// counted only while [`under_parts`] or [`refresh_split`] is on, because it
+/// costs a journal read; [3] near [4] with [2] unchanged says the parts cut
+/// the reading and nothing else.
+static MERGED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether `VICTORY_UNDER_PARTS=1`: off by default. With it a page the copy
+/// took before is read in [`Shadow::merge_under_writes`] only for the 4 KiB
+/// parts `crate::watch::parts_written` shows written since (the journal gives
+/// every part when it does not know, and `VICTORY_PAGE_PARTS=0` makes it
+/// so); a page never taken is read whole as before. The merge line should
+/// show bytes read near bytes in written parts, and the changed runs
+/// unchanged. Read once.
+fn under_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_UNDER_PARTS"))
+}
+
+/// The address ranges `(a, b)` of the maximal runs of set bits of `parts`
+/// (bit k is the 4 KiB part at `page * PAGE + k * KERNEL_PAGE`), cut to
+/// `[from, to)`, adjacent parts as one range, empty ranges left out.
+fn part_ranges(page: usize, parts: u16, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let base = page * PAGE;
+    // Every part: the page's one range, without walking the bits.
+    if parts == u16::MAX {
+        let (a, b) = (base.max(from), (base + PAGE).min(to));
+        return if a < b { vec![(a, b)] } else { Vec::new() };
+    }
+    let mut ranges = Vec::new();
+    let mut k = 0;
+    while k < 16 {
+        if parts & (1 << k) == 0 {
+            k += 1;
+            continue;
+        }
+        let first = k;
+        while k < 16 && parts & (1 << k) != 0 {
+            k += 1;
+        }
+        let (a, b) = ((base + first * KERNEL_PAGE).max(from), (base + k * KERNEL_PAGE).min(to));
+        if a < b {
+            ranges.push((a, b));
+        }
+    }
+    ranges
+}
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2192,9 +2267,60 @@ pub(crate) fn stale_why() -> &'static str {
     WHY[STALE_WHY.load(Ordering::Relaxed).min(3)]
 }
 
+/// Of [`Shadow::merge_under_writes`]: title bytes `title`, read at address
+/// `lo`, compared with the reference's `held` (the same length, the copy's
+/// bytes from offset `lo - start`) and put in. The runs that changed, as
+/// offsets from `lo`, and an error if there were more to copy one by one than
+/// `left`. `data` is the copy's mapping and `id` the copy's number.
+///
+/// Of a copy in the card's memory the changed runs go into the reference
+/// only (they go up before the next submission); of the others into the
+/// copy and the reference, so the compare after the card ran takes them for
+/// the title's and not the shaders'.
+#[allow(clippy::too_many_arguments)]
+fn compare_piece(
+    card: bool,
+    id: u64,
+    start: usize,
+    data: *mut u8,
+    lo: usize,
+    title: &[u8],
+    held: &mut [u8],
+    left: &std::sync::atomic::AtomicI64,
+) -> Result<Vec<(usize, usize)>, ()> {
+    let at = lo - start;
+    if card {
+        // Whole words go up as pairs, all of them in one
+        // dispatch: only what is a copy of its own counts.
+        let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
+        let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
+        let copies = runs.iter().filter(own).count() as i64;
+        if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
+            return Err(());
+        }
+        let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
+        for &(r, m) in &runs {
+            held[r..r + m].copy_from_slice(&title[r..r + m]);
+        }
+        if let Some(was) = was {
+            crate::host::upcheck::note(id, at, &was, held);
+        }
+        return Ok(runs);
+    }
+    let runs = changed_runs(title, held);
+    for &(r, m) in &runs {
+        // SAFETY: inside the copy's mapping. The card may be
+        // writing the copy beside these bytes; they are
+        // written here and nothing around them.
+        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), data.add(at + r), m) };
+        held[r..r + m].copy_from_slice(&title[r..r + m]);
+    }
+    Ok(runs)
+}
+
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 5] {
+    std::array::from_fn(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -3084,6 +3210,76 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
         }
     }
     out
+}
+
+#[cfg(test)]
+mod merge_piece_tests {
+    use super::{KERNEL_PAGE, PAGE, changed_runs, compare_piece, part_ranges, word_runs};
+    use std::sync::atomic::AtomicI64;
+
+    #[test]
+    fn no_parts_no_ranges() {
+        assert!(part_ranges(3, 0, 0, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn every_part_is_the_page() {
+        assert_eq!(part_ranges(2, u16::MAX, 0, usize::MAX), vec![(2 * PAGE, 3 * PAGE)]);
+    }
+
+    #[test]
+    fn parts_apart_are_two_ranges_and_adjacent_parts_one() {
+        let base = 5 * PAGE;
+        assert_eq!(
+            part_ranges(5, 0b101, 0, usize::MAX),
+            vec![(base, base + KERNEL_PAGE), (base + 2 * KERNEL_PAGE, base + 3 * KERNEL_PAGE)]
+        );
+        assert_eq!(part_ranges(5, 0b11000, 0, usize::MAX), vec![(base + 3 * KERNEL_PAGE, base + 5 * KERNEL_PAGE)]);
+    }
+
+    #[test]
+    fn ranges_are_cut_to_the_bounds() {
+        let base = 4 * PAGE;
+        let (from, to) = (base + 100, base + 3 * KERNEL_PAGE + 50);
+        assert_eq!(part_ranges(4, 0b1111, from, to), vec![(from, to)]);
+        assert_eq!(part_ranges(4, u16::MAX, from, to), vec![(from, to)]);
+    }
+
+    #[test]
+    fn a_range_outside_the_bounds_is_dropped() {
+        let base = 4 * PAGE;
+        assert!(part_ranges(4, 0b1, base + KERNEL_PAGE, base + PAGE).is_empty());
+        assert!(part_ranges(4, u16::MAX, base + PAGE, base + 2 * PAGE).is_empty());
+    }
+
+    /// One piece compared as a whole page is: the runs the compare functions
+    /// give, the reference taken up to the title's bytes, none left over.
+    #[test]
+    fn a_piece_gives_the_runs_of_the_compare_functions() {
+        let was: Vec<u8> = (0..PAGE).map(|i| (i % 251) as u8).collect();
+        let mut title = was.clone();
+        for at in [0usize, 7, 8, 4096, 4097, PAGE - 1] {
+            title[at] ^= 0xff;
+        }
+        let lo = 3 * PAGE;
+        // The copy's mapping and its reference, of the same length, begin at the
+        // address `start`.
+        let start = lo - PAGE;
+        let mut data = vec![0u8; 3 * PAGE];
+        let mut held = was.clone();
+        let left = AtomicI64::new(i64::MAX);
+        let runs = compare_piece(false, 1, start, data.as_mut_ptr(), lo, &title, &mut held, &left).unwrap();
+        assert_eq!(runs, changed_runs(&title, &was));
+        assert_eq!(held, title);
+        for &(r, m) in &runs {
+            assert_eq!(data[PAGE + r..PAGE + r + m], title[r..r + m]);
+        }
+        let mut held = was.clone();
+        let runs = compare_piece(true, 1, start, data.as_mut_ptr(), lo, &title, &mut held, &left).unwrap();
+        let direct = if crate::host::words_under() { word_runs(lo, &title, &was) } else { changed_runs(&title, &was) };
+        assert_eq!(runs, direct);
+        assert_eq!(held, title);
+    }
 }
 
 #[cfg(test)]
@@ -4020,13 +4216,29 @@ impl Shadow {
                 note_stale(1);
                 return true;
             };
-            let stale: Vec<usize> = {
+            // With each stale page's value of `copied` (0: never taken),
+            // read under the same lock as the list.
+            let (stale, took): (Vec<usize>, Vec<u64>) = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                let stale = stale_pages_in(base, &copied, a, e, &written);
+                let took = stale.iter().map(|&page| copied.get(page - base).copied().unwrap_or(0)).collect();
+                (stale, took)
             };
             if stale.is_empty() {
                 continue;
             }
+            // The parts of each page the title wrote since the copy took it:
+            // all of them for a page never taken, which has nothing to
+            // compare by. Asked only when read from or counted, as it costs
+            // a journal read.
+            let counted = under_parts() || refresh_split();
+            let parts: Vec<u16> = if counted {
+                let seen: Vec<(usize, u64)> = (0..stale.len()).filter(|&i| took[i] != 0).map(|i| (stale[i], took[i])).collect();
+                let mut answers = crate::watch::parts_written(&seen).into_iter();
+                (0..stale.len()).map(|i| if took[i] == 0 { u16::MAX } else { answers.next().unwrap_or(u16::MAX) }).collect()
+            } else {
+                vec![u16::MAX; stale.len()]
+            };
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
             // title memory is read until the title's bytes are in: with
@@ -4061,7 +4273,13 @@ impl Shadow {
                     // copy's offsets, and these are in a declared range; the
                     // locks held above keep out what else writes them, and
                     // no two pages are the same.
-                    let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left) };
+                    let runs = unsafe {
+                        self.merge_page_under_writes(lo, hi - lo, held as *mut u8, &left, if under_parts() { parts[i] } else { u16::MAX })
+                    };
+                    if counted {
+                        let bytes: usize = part_ranges(stale[i], parts[i], lo, hi).iter().map(|&(x, y)| y - x).sum();
+                        MERGED[4].fetch_add(bytes as u64, Ordering::Relaxed);
+                    }
                     match runs {
                         Ok(runs) => *done[i].lock().unwrap_or_else(|e| e.into_inner()) = runs,
                         Err(()) => over.store(true, Ordering::Relaxed),
@@ -4112,8 +4330,14 @@ impl Shadow {
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
     /// page, compared with the reference, which begins at `held`, and put in.
-    /// The runs that changed, none if it cannot be read, and an error if
-    /// there were more to copy one by one than `left`.
+    /// The runs that changed (offsets from `lo`), none if it cannot be read,
+    /// and an error if there were more to copy one by one than `left`.
+    ///
+    /// With `parts` not all set (`under_parts`), only the 4 KiB parts it
+    /// names are read and compared, each range of them as one piece; the
+    /// bytes of the others were not written since the copy took the page and
+    /// are the copy's already. A range that cannot be read leaves the whole
+    /// page as it is, as an unreadable page does.
     ///
     /// # Safety
     /// The reference holds the copy's length, and nothing else writes these
@@ -4124,47 +4348,46 @@ impl Shadow {
         n: usize,
         held: *mut u8,
         left: &std::sync::atomic::AtomicI64,
+        parts: u16,
     ) -> Result<Option<Vec<(usize, usize)>>, ()> {
         thread_local! {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
-            let title = &mut title[..n];
-            if !crate::host::read_into(lo as *const u8, title) {
-                return Ok(None);
+            let start = self.start as usize;
+            let card = self.card.is_some();
+            if parts == u16::MAX {
+                let title = &mut title[..n];
+                if !crate::host::read_into(lo as *const u8, title) {
+                    return Ok(None);
+                }
+                MERGED[0].fetch_add(1, Ordering::Relaxed);
+                MERGED[3].fetch_add(n as u64, Ordering::Relaxed);
+                // SAFETY: the caller's.
+                let held = unsafe { std::slice::from_raw_parts_mut(held.add(lo - start), n) };
+                return compare_piece(card, self.id, start, self.data, lo, title, held, left).map(Some);
             }
             MERGED[0].fetch_add(1, Ordering::Relaxed);
-            let at = lo - self.start as usize;
-            // SAFETY: the caller's.
-            let held = unsafe { std::slice::from_raw_parts_mut(held.add(at), n) };
-            if self.card.is_some() {
-                // Whole words go up as pairs, all of them in one
-                // dispatch: only what is a copy of its own counts.
-                let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
-                let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
-                let copies = runs.iter().filter(own).count() as i64;
-                if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
-                    return Err(());
+            let ranges = part_ranges(lo / PAGE, parts, lo, lo + n);
+            // Each range is read to its own place in the buffer, and none is
+            // compared until all can be read: one that cannot be leaves the
+            // page as it is.
+            for &(a, b) in &ranges {
+                if !crate::host::read_into(a as *const u8, &mut title[a - lo..b - lo]) {
+                    return Ok(None);
                 }
-                let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
-                for &(r, m) in &runs {
-                    held[r..r + m].copy_from_slice(&title[r..r + m]);
-                }
-                if let Some(was) = was {
-                    crate::host::upcheck::note(self.id, at, &was, held);
-                }
-                return Ok(Some(runs));
             }
-            let runs = changed_runs(title, held);
-            for &(r, m) in &runs {
-                // SAFETY: inside the copy's mapping. The card may be
-                // writing the copy beside these bytes; they are
-                // written here and nothing around them.
-                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                held[r..r + m].copy_from_slice(&title[r..r + m]);
+            MERGED[3].fetch_add(ranges.iter().map(|&(a, b)| (b - a) as u64).sum(), Ordering::Relaxed);
+            let mut all = Vec::new();
+            for &(a, b) in &ranges {
+                // SAFETY: the caller's, for a range inside `[lo, lo + n)`.
+                let held = unsafe { std::slice::from_raw_parts_mut(held.add(a - start), b - a) };
+                let runs = compare_piece(card, self.id, start, self.data, a, &title[a - lo..b - lo], held, left)?;
+                // Offsets from `lo`, as the caller counts them.
+                all.extend(runs.into_iter().map(|(r, m)| (a - lo + r, m)));
             }
-            Ok(Some(runs))
+            Ok(Some(all))
         })
     }
 

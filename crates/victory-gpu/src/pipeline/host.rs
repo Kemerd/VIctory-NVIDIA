@@ -702,7 +702,12 @@ pub(crate) struct HostPipeline {
     /// interface composite, which draw.rs places in the middle of a wide
     /// picture. A shape, not a hash: the stage containers of a pipeline made
     /// from pieces are ours (`VICTORY_PIPELINE_PIECES`), so the same program
-    /// has another hash there. Always false for compute and mesh.
+    /// has another hash there. A shape alone also fits a layer blended
+    /// inside the interface's own target, so draw.rs asks for more than this
+    /// flag before it takes a draw for the composite: the draw's one target
+    /// must be the output's size (`State::interface_composite`, which
+    /// `interface_band` and `native_frontend_viewport` both use). Always
+    /// false for compute and mesh.
     pub(crate) over: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,

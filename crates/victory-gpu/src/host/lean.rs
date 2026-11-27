@@ -16,6 +16,13 @@
 //! - [`ours`] and [`declared`] only count, and only while a switch of this file
 //!   is on ([`counting`], [`declare_across`]): with all unset the steps are not
 //!   timed and nothing is counted.
+//!
+//! The file also holds the counters of the walks the thread makes over a
+//! submission's steps ([`walking`], [`polled`], [`flushed`], [`census`],
+//! [`card_part`]), which are always on and are printed by [`walks_line`], and
+//! the two switches of step 1 ([`title_write_range`], [`title_write_check`]):
+//! a refresh done ahead of the steps stays valid across a title write of ours
+//! that touches none of its pages.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -318,11 +325,321 @@ pub(super) fn line(frames: f64) {
     }
 }
 
+/// Whether a refresh done ahead of a submission's steps stays valid across a
+/// title write of ours that touches none of its pages (`VICTORY_TITLE_WRITE_RANGE=1`,
+/// or `VICTORY_TITLE_WRITE_RANGE_CHECK=1`, which turns it on too; off by default:
+/// a title write clears every refresh done ahead, as before). Read once.
+///
+/// The refreshes ahead copy title memory into our copies before the steps run.
+/// A title write of ours (`Batch::title_written` in host.rs) changes only the
+/// pages it names, so a refresh whose pages it does not overlap has nothing to
+/// redo; clearing them all makes the steps after the write read the same bytes a
+/// second time. With the switch the write names its pages first and only the
+/// refreshes overlapping them are dropped.
+pub(super) fn title_write_range() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TITLE_WRITE_RANGE") || title_write_check())
+}
+
+/// The check of [`title_write_range`] (`VICTORY_TITLE_WRITE_RANGE_CHECK=1`): a
+/// refresh that stood across a title write is tested against the write's pages,
+/// and a standing one the write turns out to have touched is counted by
+/// [`retained_violation`]; the caller then falls back to the old clear for the
+/// rest of the submission. Read once.
+pub(super) fn title_write_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TITLE_WRITE_RANGE_CHECK"))
+}
+
+/// The walks the submitting thread makes over a submission's steps, each with
+/// its own counter in [`WALKED`].
+#[derive(Clone, Copy)]
+pub(super) enum Walk {
+    /// Collecting the spans a copy has to be given.
+    CopySpans,
+    /// Collecting the refreshes due in front of the steps.
+    RefreshFront,
+    /// Refreshing ahead of the steps (`refresh_ahead`).
+    RefreshAhead,
+    /// Running the deferred steps, which includes the steps' own work.
+    RunDeferred,
+    /// Listing what a step does to the card.
+    DoesOf,
+    /// Finding what a step is blocked by.
+    BlockedBy,
+    /// Finding copies that are stale under flights in the air.
+    StaleUnderFlights,
+    /// Reading what a step copied.
+    CopiedRead,
+    /// Deciding which steps can be joined.
+    Joinable,
+}
+
+/// How many [`Walk`]s there are.
+const WALKS: usize = 9;
+
+/// Since the last frame-rate line: for each [`Walk`], the walks made and their
+/// nanoseconds.
+static WALKED: [[AtomicU64; 2]; WALKS] = [const { [const { AtomicU64::new(0) }; 2] }; WALKS];
+
+/// A walk in progress: dropping it counts the walk and the time it took.
+pub(super) struct Walking {
+    /// Which walk this is.
+    walk: Walk,
+    /// When it began.
+    began: std::time::Instant,
+}
+
+/// Begins timing `walk`; the walk ends when the guard is dropped. Two clock
+/// reads a walk is the whole cost, and a frame makes some hundreds of walks, so
+/// the counters stay on without a switch. A step is not timed on its own: the
+/// time of one walk covers all of its steps.
+pub(super) fn walking(walk: Walk) -> Walking {
+    Walking { walk, began: std::time::Instant::now() }
+}
+
+impl Drop for Walking {
+    fn drop(&mut self) {
+        let cell = &WALKED[self.walk as usize];
+        cell[0].fetch_add(1, Ordering::Relaxed);
+        cell[1].fetch_add(self.began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Who asked the shadow whether nothing is new in a range (`Shadow::nothing_new`).
+#[derive(Clone, Copy)]
+pub(super) enum Poll {
+    /// The flush in front of the steps.
+    Front,
+    /// A flush at a title write or at the end of the steps.
+    Barrier,
+    /// The flush of one copy before shaders are given it.
+    One,
+    /// `refresh_ahead`.
+    Ahead,
+    /// The memory module's landed copies, after the steps.
+    Landed,
+}
+
+/// How many [`Poll`] callers there are.
+const POLLS: usize = 5;
+
+/// Since the last frame-rate line: for each [`Poll`], the calls and, only with
+/// `VICTORY_REFRESH_SPLIT=1`, their nanoseconds.
+static POLLED: [[AtomicU64; 2]; POLLS] = [const { [const { AtomicU64::new(0) }; 2] }; POLLS];
+
+/// `shadow.nothing_new(address, len)`, counted under `by`. The call is always
+/// counted (one atomic add); the nanoseconds only with the split switch on, so
+/// that without it no clock is read here.
+pub(super) fn polled(by: Poll, shadow: &crate::shadow::Shadow, address: usize, len: usize) -> bool {
+    let cell = &POLLED[by as usize];
+    cell[0].fetch_add(1, Ordering::Relaxed);
+    if !crate::shadow::refresh_split() {
+        return shadow.nothing_new(address, len);
+    }
+    let began = std::time::Instant::now();
+    let nothing = shadow.nothing_new(address, len);
+    cell[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    nothing
+}
+
+/// What made a flush of refreshes happen.
+#[derive(Clone, Copy)]
+pub(super) enum Cause {
+    /// The flush in front of the steps.
+    Front,
+    /// The flush of one copy.
+    Copy,
+    /// A flush for a placed range.
+    Placed,
+    /// A flush before a run step.
+    Run,
+    /// The flush at the end of the steps.
+    End,
+}
+
+/// How many [`Cause`]s there are.
+const CAUSES: usize = 5;
+
+/// Since the last frame-rate line: for each [`Cause`], the flushes and the
+/// copies in them.
+static FLUSHED: [[AtomicU64; 2]; CAUSES] = [const { [const { AtomicU64::new(0) }; 2] }; CAUSES];
+
+/// Counts one flush with `copies` copies in it.
+pub(super) fn flushed(by: Cause, copies: usize) {
+    let cell = &FLUSHED[by as usize];
+    cell[0].fetch_add(1, Ordering::Relaxed);
+    cell[1].fetch_add(copies as u64, Ordering::Relaxed);
+}
+
+/// The kinds of step a walk over a submission meets.
+#[derive(Clone, Copy)]
+pub(super) enum Kind {
+    Copy,
+    Fill,
+    Refresh,
+    RefreshSet,
+    Run,
+    Host,
+    GpuWrite,
+    Texture,
+    Plane,
+    Placed,
+}
+
+/// How many [`Kind`]s there are.
+pub(super) const KINDS: usize = 10;
+
+/// What the line calls each [`Kind`], in the enum's order.
+const KIND_NAMES: [&str; KINDS] =
+    ["copies", "fills", "refreshes", "refresh sets", "runs", "host steps", "gpu writes", "textures", "planes", "placed"];
+
+/// Since the last frame-rate line: the steps met, by [`Kind`].
+static CENSUS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+
+/// Adds a count of steps per kind. The caller sums over one call to
+/// `run_deferred` and adds once, so the atomics are touched ten times a call.
+pub(super) fn census(kinds: &[u64; KINDS]) {
+    for (cell, n) in CENSUS.iter().zip(kinds) {
+        if *n != 0 {
+            cell.fetch_add(*n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The parts of the sync list that goes ahead of a submission (`card_before`).
+#[derive(Clone, Copy)]
+pub(super) enum CardPart {
+    /// Finding what changed on the CPU side.
+    Dirty,
+    /// Taking it out of the CPU sides.
+    Take,
+    /// Recording the sync list.
+    RecordSync,
+    /// Executing it.
+    ExecuteSync,
+    /// Recording the compare.
+    RecordCompare,
+}
+
+/// How many [`CardPart`]s there are.
+const CARD_PARTS: usize = 5;
+
+/// Since the last frame-rate line: for each [`CardPart`], the calls and their
+/// nanoseconds.
+static CARD: [[AtomicU64; 2]; CARD_PARTS] = [const { [const { AtomicU64::new(0) }; 2] }; CARD_PARTS];
+
+/// Counts a part of `card_before` that began at `began` and has just ended.
+pub(super) fn card_part(part: CardPart, began: std::time::Instant) {
+    let cell = &CARD[part as usize];
+    cell[0].fetch_add(1, Ordering::Relaxed);
+    cell[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Since the last frame-rate line (step 1): refreshes done ahead that a title
+/// write left standing, those it dropped, and the violations the check found.
+static RETAINED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Counts the refreshes done ahead that a title write left standing (`kept`)
+/// and those it dropped (`dropped`).
+pub(super) fn retained(kept: usize, dropped: usize) {
+    RETAINED[0].fetch_add(kept as u64, Ordering::Relaxed);
+    RETAINED[1].fetch_add(dropped as u64, Ordering::Relaxed);
+}
+
+/// Counts a refresh that stood across a title write and that the write then
+/// showed to be affected (the check of step 1).
+pub(super) fn retained_violation() {
+    RETAINED[2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Swaps a table of calls and nanoseconds to zero, per frame: calls and ms.
+fn take_pairs<const N: usize>(table: &[[AtomicU64; 2]; N], frames: f64) -> [[f64; 2]; N] {
+    std::array::from_fn(|i| std::array::from_fn(|j| table[i][j].swap(0, Ordering::Relaxed) as f64 / frames))
+}
+
+/// The counters of this file other than [`line`]'s, per frame, for the
+/// frame-rate line: one line for each family with something in it. The counters
+/// are taken (swapped to zero) whether or not they are printed.
+pub(super) fn walks_line(frames: f64) {
+    let frames = frames.max(1.0);
+    let walked = take_pairs(&WALKED, frames);
+    let polls = take_pairs(&POLLED, frames);
+    let flushes = take_pairs(&FLUSHED, frames);
+    let card = take_pairs(&CARD, frames);
+    let kinds: [f64; KINDS] = std::array::from_fn(|i| CENSUS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let kept: [f64; 3] = std::array::from_fn(|i| RETAINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+
+    if walked.iter().any(|w| w[0] > 0.0) {
+        let names = [
+            "copy spans",
+            "front refreshes",
+            "refreshes ahead",
+            "run_deferred",
+            "does of",
+            "blocked by",
+            "stale under flights",
+            "copied read",
+            "joinable",
+        ];
+        let parts: Vec<String> =
+            names.iter().zip(&walked).map(|(name, w)| format!("{name} {:.1} calls {:.2} ms", w[0], w[1] / 1e6)).collect();
+        tracing::info!(
+            "the walks over a submission's steps, per frame, the submitting thread (run_deferred includes the steps' own work): {}",
+            parts.join("; ")
+        );
+    }
+    if kinds.iter().any(|k| *k > 0.0) {
+        let parts: Vec<String> = KIND_NAMES.iter().zip(&kinds).map(|(name, n)| format!("{n:.0} {name}")).collect();
+        tracing::info!("steps run by run_deferred, per frame, by kind: {}", parts.join(", "));
+    }
+    if polls.iter().any(|p| p[0] > 0.0) {
+        let names = ["in front of the steps", "at a barrier", "of one copy", "ahead", "of landed copies"];
+        let parts: Vec<String> = names.iter().zip(&polls).map(|(name, p)| format!("{name} {:.0} calls", p[0])).collect();
+        let mut text = parts.join(", ");
+        if crate::shadow::refresh_split() {
+            let ms: Vec<String> = names.iter().zip(&polls).map(|(name, p)| format!("{name} {:.2} ms", p[1] / 1e6)).collect();
+            text.push_str(&format!("; time in them: {}", ms.join(", ")));
+        } else {
+            text.push_str("; the milliseconds exist only with VICTORY_REFRESH_SPLIT=1");
+        }
+        tracing::info!("nothing-new polls, per frame, by caller: {text}");
+    }
+    if flushes.iter().any(|f| f[0] > 0.0) {
+        let names = ["in front of the steps", "of one copy", "of placed ranges", "before runs", "at the end"];
+        let parts: Vec<String> =
+            names.iter().zip(&flushes).map(|(name, f)| format!("{name} {:.1} flushes with {:.0} copies", f[0], f[1])).collect();
+        tracing::info!("refresh flushes, per frame, by cause: {}", parts.join("; "));
+    }
+    if card.iter().any(|c| c[0] > 0.0) {
+        let names = ["what changed on the CPU side", "the take out of the CPU sides", "recording the sync list", "executing it", "recording the compare"];
+        let parts: Vec<String> = names.iter().zip(&card).map(|(name, c)| format!("{name} {:.1} calls {:.2} ms", c[0], c[1] / 1e6)).collect();
+        tracing::info!("the sync list ahead of a submission (card_before), per frame: {}", parts.join("; "));
+    }
+    if title_write_range() {
+        tracing::info!(
+            "refreshes done ahead, per frame, at title writes (VICTORY_TITLE_WRITE_RANGE=1): {:.1} left standing, {:.1} dropped, {:.1} violations found by the check",
+            kept[0],
+            kept[1],
+            kept[2]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    /// The counters of the walks are shared by every test in the process, and
+    /// `walks_line` swaps them to zero, so the tests that read them take turns.
+    static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the turn, going on with what a panicked test left.
+    fn counters() -> std::sync::MutexGuard<'static, ()> {
+        COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// A table of how many times each number was called.
     fn tally(n: usize) -> Arc<Vec<AtomicUsize>> {
@@ -424,5 +741,48 @@ mod tests {
         assert!(seen.first(0x1000, 0, 128));
         seen.clear();
         assert!(seen.first(0x1000, 0, 64));
+    }
+
+    #[test]
+    fn a_walk_is_counted_when_its_guard_is_dropped() {
+        let _turn = counters();
+        let before = WALKED[Walk::Joinable as usize][0].load(Ordering::Relaxed);
+        drop(walking(Walk::Joinable));
+        assert!(WALKED[Walk::Joinable as usize][0].load(Ordering::Relaxed) >= before + 1);
+    }
+
+    #[test]
+    fn the_census_adds_each_kind() {
+        let _turn = counters();
+        let before = CENSUS[Kind::Plane as usize].load(Ordering::Relaxed);
+        let mut kinds = [0u64; KINDS];
+        kinds[Kind::Plane as usize] = 3;
+        census(&kinds);
+        assert!(CENSUS[Kind::Plane as usize].load(Ordering::Relaxed) >= before + 3);
+    }
+
+    #[test]
+    fn flushes_and_card_parts_add() {
+        let _turn = counters();
+        let flushes = FLUSHED[Cause::End as usize][0].load(Ordering::Relaxed);
+        let copies = FLUSHED[Cause::End as usize][1].load(Ordering::Relaxed);
+        flushed(Cause::End, 7);
+        assert!(FLUSHED[Cause::End as usize][0].load(Ordering::Relaxed) >= flushes + 1);
+        assert!(FLUSHED[Cause::End as usize][1].load(Ordering::Relaxed) >= copies + 7);
+        let calls = CARD[CardPart::Take as usize][0].load(Ordering::Relaxed);
+        card_part(CardPart::Take, std::time::Instant::now());
+        assert!(CARD[CardPart::Take as usize][0].load(Ordering::Relaxed) >= calls + 1);
+    }
+
+    #[test]
+    fn the_line_runs_on_zeroed_and_filled_counters() {
+        let _turn = counters();
+        walks_line(1.0);
+        drop(walking(Walk::DoesOf));
+        flushed(Cause::Front, 2);
+        retained(3, 1);
+        retained_violation();
+        // Frames below one are clamped, as `line` does.
+        walks_line(0.0);
     }
 }

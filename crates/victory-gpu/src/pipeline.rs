@@ -219,10 +219,63 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
+                // a container from pieces that did not translate is kept
+                // for the next run, which refuses it (`pieces::refuse_untranslated`)
+                if done.is_err() {
+                    pieces::note_untranslated(&self.container);
+                }
                 done.ok()
             })
             .as_ref()
     }
+}
+
+/// With `VICTORY_PIPELINE_PIECES=1`, once per title pipeline (at most 256):
+/// what a draw or dispatch dropped without a host pipeline was aimed at, if
+/// one of the pipeline's stages is a container from pieces. `shape` says
+/// what was drawn and where, and is built only for a pipeline not yet
+/// named. The translation state is only peeked at: the title's thread must
+/// not wait for a worker's translation.
+#[cfg(windows)]
+pub(crate) fn note_unbuilt(this: This, shape: impl FnOnce() -> String) {
+    if this.is_null() || !pieces::enabled() {
+        return;
+    }
+    let p = pipeline(this);
+    // every pipeline is judged once, and one that is not from pieces is
+    // remembered too, so that its dropped draws do not parse containers again
+    static SEEN: Mutex<Option<HashMap<usize, bool>>> = Mutex::new(None);
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = seen.get_or_insert_with(HashMap::new);
+        if seen.contains_key(&(this as usize)) || seen.len() >= 4096 {
+            return;
+        }
+        let room = seen.values().filter(|&&named| named).count() < 256;
+        let named = room && p.shaders.iter().any(|s| pieces::is_pieces(&s.container));
+        seen.insert(this as usize, named);
+        if !named {
+            return;
+        }
+    }
+    let stages: Vec<String> = p
+        .shaders
+        .iter()
+        .map(|s| {
+            let state = match s.translated.get() {
+                Some(Some(_)) => "translated",
+                Some(None) => "not",
+                None => "pending",
+            };
+            format!("{} {} {state}", s.stage, s.hash)
+        })
+        .collect();
+    tracing::warn!(
+        pipeline = format_args!("{:#x}", this as usize),
+        stages = %stages.join(", "),
+        "a pipeline from pieces has no host pipeline, its draw is dropped: {}",
+        shape()
+    );
 }
 
 #[cfg(windows)]
