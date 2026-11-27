@@ -1787,10 +1787,14 @@ pub fn upscaler_destroyed(context: usize) {
 /// frame 3 on in the 1440p runs with DLSS; `draw::State::native_frontend_viewport`
 /// (DexNom's) names the same draw. draw.rs places the same draw in the middle
 /// of a wide picture (`State::interface_band`), so both read the one pair.
-/// These are the hashes of the title's own containers: with
-/// `VICTORY_PIPELINE_PIECES=1` the composite's stages are containers of ours
-/// with other hashes, and only `interface_band` (which also takes the shape,
-/// `HostPipeline::over`) still finds it.
+/// These are the hashes of the title's own containers. With
+/// `VICTORY_PIPELINE_PIECES=1` the stages are containers of ours with other
+/// hashes, so the draw is matched by the program a stage holds
+/// (`Shader::is`, which resolves the title's container of the same program
+/// from the book of earlier runs): `draw::State::interface_band`,
+/// `draw::State::native_frontend_viewport` and `before_target_draw` all ask
+/// it. `interface_band` also takes a draw by shape (`HostPipeline::over`)
+/// when the book does not know the program.
 pub(crate) const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
 
 /// Whether draws are looked at for the colour without the interface: frame
@@ -1879,7 +1883,7 @@ pub(crate) fn before_target_draw(
     if !SHOWN.iter().any(|s| s.load(Relaxed) == shown) {
         return;
     }
-    let composite = triangle && INTERFACE_COMPOSITE.iter().all(|hash| pipeline.stages.iter().any(|s| s.shader.hash == *hash));
+    let composite = triangle && INTERFACE_COMPOSITE.iter().all(|hash| pipeline.stages.iter().any(|s| s.shader.is(hash)));
     if !composite {
         HUD_COUNTS[HUD_OTHERS].fetch_add(1, Relaxed);
         static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());

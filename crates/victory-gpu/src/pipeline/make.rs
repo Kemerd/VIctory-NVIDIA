@@ -55,10 +55,10 @@ pub(crate) struct Pending {
     queued_ms: AtomicU64,
 }
 
+/// Whether a compute shader of the pipeline carries `name`, a pipeline from
+/// pieces by the book's record of its program (`Shader::has_name`).
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
-    shaders
-        .iter()
-        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+    shaders.iter().any(|s| s.stage == "compute" && s.has_name(name))
 }
 
 /// Shader hashes whose pipelines are left out in every build
@@ -67,6 +67,9 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), translatable for
 /// 32-lane hosts through host waves that meet by spinning, took 11.85 ms of
 /// the card a frame in the first gameplay area (timing run, 2026-11-26).
+/// The hashes are those of the title's own containers, and a pipeline made
+/// from pieces (`VICTORY_PIPELINE_PIECES=1`) is left out when the title's
+/// container of the same program is named (`Shader::is`).
 fn leave_out() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
@@ -94,7 +97,7 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
     !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
         && victory_shader::emit::host_settings()[0] == 32
-        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+        && shaders.iter().any(|s| WATER_LIGHT.iter().any(|h| s.is(h)))
 }
 
 /// Whether the title's own ray tracing is asked for: its structure builder
@@ -111,7 +114,7 @@ pub(super) fn builder_asked() -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
+    if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().iter().any(|h| s.is(h))) {
         return Some("named in VICTORY_LEAVE_OUT, left out");
     }
     if water_light_left_out(shaders) {
@@ -142,19 +145,25 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     None
 }
 
+/// The programs of the first scene's producers, by the hashes of the title's
+/// own containers (`Shader::is` also matches them when made from pieces).
+const SCENE_INPUT: [&str; 6] = [
+    "970c4fbb3b017c0e",
+    "068c90badc86f1fd",
+    "e4a7e088c7780ce8",
+    "ebe4e53f031f5249",
+    "2cc4c197ee29e291",
+    "369cbe906ea72764",
+];
+
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
 /// launch so cutscene lighting, tiling, and bakes never miss their first frame.
 fn scene_input(shaders: &[Arc<Shader>]) -> bool {
     shaders.iter().any(|s| {
-        matches!(
-            s.hash.as_str(),
-            "970c4fbb3b017c0e"
-                | "068c90badc86f1fd"
-                | "e4a7e088c7780ce8"
-                | "ebe4e53f031f5249"
-                | "2cc4c197ee29e291"
-                | "369cbe906ea72764"
-        ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+        SCENE_INPUT
+            .iter()
+            .chain(crate::draw::BAKE_PIXEL_SHADERS.iter())
+            .any(|h| s.is(h))
     })
 }
 

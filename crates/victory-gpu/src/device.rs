@@ -377,7 +377,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     }
     #[cfg(windows)]
     dump_unknown_pipeline(SLOT, calls, desc);
-    // `VICTORY_PIPELINE_PIECES=1` (read once, off by default): make the
+    // `VICTORY_PIPELINE_PIECES=1` (read once in `pipeline::pieces::asked`,
+    // off by default): make the
     // pipeline from the loose pieces the description names
     // (`pipeline::pieces`): a compute pipeline for 0x218, a graphics
     // pipeline for 0x1c8. A description that is not understood well enough
@@ -387,9 +388,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     // before the switch existed.
     #[cfg(windows)]
     {
-        use std::sync::{Mutex, OnceLock};
-        static PIECES: OnceLock<bool> = OnceLock::new();
-        if *PIECES.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES").is_ok_and(|v| v == "1")) {
+        use std::sync::Mutex;
+        if crate::pipeline::pieces::asked() {
             let made = match SLOT {
                 0x218 => crate::pipeline::pieces::compute(desc, _iid, out),
                 _ => crate::pipeline::pieces::graphics(desc, _iid, out),

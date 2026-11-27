@@ -2631,10 +2631,11 @@ impl State {
     /// and structurally detects depth-less 4+ MRT square atlas bakes
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
+    /// The lists name the title's own containers; a pipeline made from pieces
+    /// is taken for its program (`Shader::is`).
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
         if p.stages.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+            BAKE_PIXEL_SHADERS.iter().chain(&BAKE_GEOMETRY_SHADERS).any(|h| s.shader.is(h))
         }) {
             return true;
         }
@@ -4449,7 +4450,7 @@ impl State {
         }
         if compute {
             for (i, c) in CULL.iter().enumerate() {
-                if p.stages.iter().any(|s| s.shader.hash.as_str() == c.0) {
+                if p.stages.iter().any(|s| s.shader.is(c.0)) {
                     census.2[i] += 1;
                 }
             }
@@ -4980,7 +4981,7 @@ impl State {
     fn interface_composite(&self, pipeline: &HostPipeline) -> Option<bool> {
         let stock = crate::streamline::INTERFACE_COMPOSITE
             .iter()
-            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == *hash));
+            .all(|hash| pipeline.stages.iter().any(|stage| stage.shader.is(hash)));
         if stock {
             return Some(true);
         }
@@ -5148,7 +5149,8 @@ impl State {
     }
 
     /// Says once per pipeline (eight at most) that `interface_band` took it
-    /// for the interface composite, by the title's hashes (`stock`) or by its
+    /// for the interface composite, by the title's hashes or the program they hold
+    /// (`stock`, which includes pipelines from pieces) or by its
     /// shape: its shaders and state, the size and format of the target it
     /// draws into and the viewports and scissors in force. The target tells
     /// the draw into the presented texture from a layer drawn inside the

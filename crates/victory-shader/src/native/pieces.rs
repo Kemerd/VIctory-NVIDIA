@@ -1244,6 +1244,75 @@ pub fn check(container: &[u8]) -> Result<(), ShaderError> {
     read(part.data).map(|_| ())
 }
 
+/// The title's own hash of a program, the key its two kinds of container
+/// share. In the title's container it is the 16 bytes after the dword of
+/// flags in the `HASH` part; in a container made from pieces it is the 16
+/// bytes after the tag of the 0x43 record that ends the metadata piece.
+/// This was worked out by comparing the containers of earlier runs, kept
+/// outside the repository: nearly every program made from pieces had a title
+/// container with the same 16 bytes. The code bytes are no key, because the
+/// code piece of a program differs from the title's own code for it (vertex
+/// fetch and export handling, and trailing bytes).
+pub type ProgramHash = [u8; 16];
+
+/// The key of a container made from pieces. `None` for any other container,
+/// or one cut short. Copies nothing and cannot panic on garbled bytes: every
+/// read goes through a bounds check.
+pub fn program_of_pieces(container: &[u8]) -> Option<ProgramHash> {
+    let c = crate::Container::parse(container).ok()?;
+    let part = c.part(FourCC::PIECES)?.data;
+    if part.get(..4) != Some(&MAGIC[..]) {
+        return None;
+    }
+    // the metadata is the third stretch after the header: its place is set by
+    // the sizes of the two before it, as `read` finds it
+    let size = |at: usize| u32_at(part, at).ok().map(|s| s as usize);
+    let (extra, code, meta) = (size(0x20)?, size(0x24)?, size(0x28)?);
+    let from = HEAD.checked_add(extra)?.checked_add(code)?;
+    let meta = part.get(from..from.checked_add(meta)?)?;
+    // the record that ends it holds the hash, if the piece has one
+    let last = meta.get(meta.len().checked_sub(RECORD)?..)?;
+    if last[0] != 0x43 {
+        return None;
+    }
+    last.get(4..20)?.try_into().ok()
+}
+
+/// The key of the title's own container. Reads only the part table and the
+/// one `HASH` part, so a container cut after that part still answers (this is
+/// how the pipeline book's index reads a prefix of each kept container) where
+/// `Container::parse` would refuse it. `None` when no `HASH` part lies inside
+/// what was given.
+pub fn program_of_stock(container: &[u8]) -> Option<ProgramHash> {
+    if container.get(..4) != Some(&b"DXBC"[..]) {
+        return None;
+    }
+    let count = u32_at(container, 0x1c).ok()? as usize;
+    // the same bound `Container::parse` puts on a part table
+    for i in 0..count.min(256) {
+        let Ok(at) = u32_at(container, 0x20 + 4 * i) else {
+            break;
+        };
+        let at = at as usize;
+        let Some(tag) = container.get(at..at.checked_add(4)?) else {
+            continue;
+        };
+        if tag != FourCC::HASH.0 {
+            continue;
+        }
+        // 8 bytes of part header, a dword of flags, then the digest
+        let size = u32_at(container, at.checked_add(4)?).ok()? as usize;
+        if size < 20 {
+            return None;
+        }
+        return container
+            .get(at.checked_add(12)?..at.checked_add(28)?)?
+            .try_into()
+            .ok();
+    }
+    None
+}
+
 /// The program in the data of a part of ours.
 pub(crate) fn program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let (mut program, code) = read(part)?;
@@ -1955,6 +2024,79 @@ mod tests {
             rows(&vs_bytes, FourCC::ISG1),
             [(0, 0, 3, 0), (0, 0, 3, 1), (0, 0, 3, 2)]
         );
+    }
+
+    #[test]
+    fn both_containers_of_a_program_give_one_key() {
+        let digest: ProgramHash = hash()[4..20].try_into().unwrap();
+        // the title's own container: a dword of flags, then the digest
+        let stock_of = |digest: &ProgramHash| {
+            let mut part = vec![0u8; 4];
+            part.extend(digest);
+            crate::dxbc::build(&[
+                (FourCC::SFI0, &[0; 8]),
+                (FourCC::HASH, &part),
+                (FourCC::DXIL, &[7; 5000]),
+            ])
+        };
+        let made_of = |record: [u8; 32]| {
+            let code = code(4);
+            let meta = metadata(COMPUTE_METADATA, code.len(), &[record]);
+            fill(
+                compute(&compute_packet(7), code.len(), meta.len()).unwrap(),
+                &code,
+                &meta,
+            )
+        };
+        let stock = stock_of(&digest);
+        let made = made_of(hash());
+        assert_eq!(program_of_pieces(&made), Some(digest));
+        assert_eq!(program_of_stock(&stock), Some(digest));
+        assert_eq!(program_of_pieces(&made), program_of_stock(&stock));
+        // a container of one kind has no key of the other kind
+        assert_eq!(program_of_pieces(&stock), None);
+        assert_eq!(program_of_stock(&made), None);
+        // a prefix cut right after the HASH part still answers
+        let end = stock.windows(4).position(|w| w == b"HASH").unwrap() + 8 + 20;
+        assert_eq!(program_of_stock(&stock[..end]), Some(digest));
+        assert_eq!(program_of_stock(&stock[..end - 1]), None);
+        // another program has another key, and its two containers still match
+        let mut other = hash();
+        other[10] ^= 0xff;
+        let other_digest: ProgramHash = other[4..20].try_into().unwrap();
+        assert_ne!(other_digest, digest);
+        assert_eq!(program_of_pieces(&made_of(other)), Some(other_digest));
+        assert_eq!(program_of_stock(&stock_of(&other_digest)), Some(other_digest));
+        assert_ne!(program_of_pieces(&made_of(other)), program_of_pieces(&made));
+        // a metadata piece that does not end in the hash record has no key
+        let code = code(4);
+        let meta = metadata(COMPUTE_METADATA, code.len(), &[declaration(0, 2, 1)]);
+        let bare = fill(
+            compute(&compute_packet(7), code.len(), meta.len()).unwrap(),
+            &code,
+            &meta,
+        );
+        assert_eq!(program_of_pieces(&bare), None);
+        // no cut of either container may panic
+        for n in 0..made.len() {
+            let _ = program_of_pieces(&made[..n]);
+            let _ = program_of_stock(&made[..n]);
+        }
+        for n in 0..stock.len() {
+            let _ = program_of_pieces(&stock[..n]);
+            let _ = program_of_stock(&stock[..n]);
+        }
+    }
+
+    #[test]
+    fn a_graphics_stage_gives_the_same_key() {
+        let packet = graphics_packet(false, 0, &[]);
+        let g = Graphics::parse(&packet, &state_piece(&[]), false).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let vs = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let digest: ProgramHash = hash()[4..20].try_into().unwrap();
+        assert_eq!(program_of_pieces(&vs), Some(digest));
     }
 
     #[test]

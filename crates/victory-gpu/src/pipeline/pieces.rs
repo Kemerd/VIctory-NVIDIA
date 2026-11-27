@@ -40,6 +40,17 @@ use super::host::GraphicsState;
 use super::{Shader, hand_out, shader_of};
 use crate::object::{HRESULT, Iid, This};
 
+/// Whether `VICTORY_PIPELINE_PIECES=1` is set: the switch that makes
+/// pipelines from the pieces of the console's two creation methods. Off by
+/// default. It is read here once so that `device::unknown_pipeline` and
+/// `pipeline::use_pipeline_cache` see the same answer; the latter starts
+/// the index of the pipeline book (`known::prime`) that lets a pipeline
+/// from pieces match the stock hash lists.
+pub(crate) fn asked() -> bool {
+    static ASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES").is_ok_and(|v| v == "1"))
+}
+
 /// A piece of a description: where it is in title memory and how long.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
