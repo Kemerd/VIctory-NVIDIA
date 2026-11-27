@@ -535,6 +535,8 @@ pub fn compute(packet: &[u8], code: usize, metadata: usize) -> Result<Draft, Ref
 pub struct Element {
     /// Its semantic name: letters, digits and underscores.
     pub name: String,
+    /// Its semantic index: which of the elements of one name this is.
+    pub index: u32,
     /// DXGI format.
     pub format: u32,
     /// Byte offset in the vertex.
@@ -908,10 +910,11 @@ impl Graphics {
             // Words 0, 2, 4 and 5 lie where D3D12's element description has
             // the semantic index, the slot, the class and the step rate, in
             // that order (words 1 and 3 are where it has the format and the
-            // offset). All were zero wherever seen, so that order is a
-            // guess, and each refusal names the word that carried a value.
+            // offset). Word 0 is the semantic index: a capture has COLOR
+            // twice, with 0 and 1 there and nothing else different. Words 2,
+            // 4 and 5 were zero wherever seen, so that order is a guess, and
+            // each refusal names the word that carried a value.
             for (at, why) in [
-                (0, "an input element with a value in word 0 (the semantic index, by a guess)"),
                 (2, "an input element with a value in word 2 (the slot, by a guess)"),
                 (4, "an input element with a value in word 4 (the class, by a guess)"),
                 (5, "an input element with a value in word 5 (the step rate, by a guess)"),
@@ -920,12 +923,16 @@ impl Graphics {
                     return Err(why);
                 }
             }
+            if words[0] > 31 {
+                return Err("an input element with an implausible semantic index");
+            }
             if words[3] > 0x800 {
                 return Err("an input element at an implausible byte offset");
             }
             elements.push(Element {
                 // (checked ASCII above)
                 name: String::from_utf8_lossy(name).into_owned(),
+                index: words[0],
                 format: words[1],
                 offset: words[3],
             });
@@ -1069,7 +1076,7 @@ impl Graphics {
         for (e, to) in self.elements.iter().zip(extra.chunks_exact_mut(ELEMENT)) {
             to[..e.name.len()].copy_from_slice(e.name.as_bytes());
             // semantic index, format, slot, byte offset
-            for (i, v) in [0, e.format, 0, e.offset].into_iter().enumerate() {
+            for (i, v) in [e.index, e.format, 0, e.offset].into_iter().enumerate() {
                 to[NAME + 4 * i..NAME + 4 * i + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
@@ -1084,7 +1091,7 @@ impl Graphics {
                 let (_, channels) = element_shape(e.format)?;
                 Some(Row {
                     name: &e.name,
-                    index: 0,
+                    index: e.index,
                     system: 0,
                     component: 3,
                     register: i as u32,
@@ -2007,6 +2014,7 @@ mod tests {
             g.elements[1],
             Element {
                 name: "COLOR".into(),
+                index: 0,
                 format: 28,
                 offset: 12
             }
@@ -2535,18 +2543,75 @@ mod tests {
     fn input_elements_with_values_are_refused_by_their_word() {
         let packet = graphics_packet(false, 0, &[]);
         let at = |word: usize| S_BLOCK + 17 + 4 * word;
-        for (word, field) in [(0, "word 0"), (2, "word 2"), (4, "word 4"), (5, "word 5")] {
+        for (word, field) in [(2, "word 2"), (4, "word 4"), (5, "word 5")] {
             let mut s = state_piece(&ELEMENTS);
             put(&mut s, at(word), 1);
             let reason = Graphics::parse(&packet, &s, false).unwrap_err();
             assert!(reason.contains(field), "{reason}");
         }
-        // The format and the offset are read, wherever the others stand.
+        // The index, the format and the offset are read, wherever the others stand.
         let mut s = state_piece(&ELEMENTS);
+        put(&mut s, at(0), 1);
         put(&mut s, at(1), 2);
         put(&mut s, at(3), 8);
         let g = Graphics::parse(&packet, &s, false).unwrap();
-        assert_eq!((g.elements[0].format, g.elements[0].offset), (2, 8));
+        assert_eq!((g.elements[0].index, g.elements[0].format, g.elements[0].offset), (1, 2, 8));
+    }
+
+    /// The input layout of a capture: COLOR twice, with 0 and 1 in word 0
+    /// and nothing else different, then POSITION.
+    fn two_colors() -> Vec<u8> {
+        let mut s = state_piece(&[("COLOR", 28, 0), ("COLOR", 28, 4), ("POSITION", 16, 8)]);
+        // (the count, then the first element: its length, "COLOR\0", six
+        // words; the second element's word 0 follows its length and name)
+        put(&mut s, S_BLOCK + 4 + (4 + 6 + 24) + (4 + 6), 1);
+        s
+    }
+
+    #[test]
+    fn two_elements_of_one_name_differ_by_their_semantic_index() {
+        let packet = graphics_packet(false, 0, &[]);
+        let g = Graphics::parse(&packet, &two_colors(), false).unwrap();
+        let seen: Vec<_> = g.elements.iter().map(|e| (e.name.as_str(), e.index, e.format, e.offset)).collect();
+        assert_eq!(seen, [("COLOR", 0, 28, 0), ("COLOR", 1, 28, 4), ("POSITION", 0, 16, 8)]);
+        // An index no vertex has is refused, one that does is not.
+        let mut s = two_colors();
+        put(&mut s, S_BLOCK + 4 + (4 + 6 + 24) + (4 + 6), 32);
+        let reason = Graphics::parse(&packet, &s, false).unwrap_err();
+        assert!(reason.contains("semantic index"), "{reason}");
+        put(&mut s, S_BLOCK + 4 + (4 + 6 + 24) + (4 + 6), 31);
+        assert!(Graphics::parse(&packet, &s, false).is_ok());
+    }
+
+    #[test]
+    fn the_vertex_part_and_its_signature_keep_the_semantic_index() {
+        let packet = graphics_packet(true, 1, &[(0, false)]);
+        let g = Graphics::parse(&packet, &two_colors(), true).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let bytes = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        // The input signature: name, index and register of each element.
+        let part = c.part(FourCC::ISG1).unwrap().data;
+        let count = u32_at(part, 0).unwrap() as usize;
+        let rows: Vec<(&[u8], u32, u32)> = (0..count)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let word = |k: usize| u32_at(part, at + 4 * k).unwrap();
+                let name = &part[word(1) as usize..];
+                (&name[..name.iter().position(|&c| c == 0).unwrap()], word(2), word(5))
+            })
+            .collect();
+        assert_eq!(rows, [(&b"COLOR"[..], 0, 0), (&b"COLOR"[..], 1, 1), (&b"POSITION"[..], 0, 2)]);
+        // The part's own elements, whose word 0 is the index.
+        let part = checked(&fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta)).unwrap();
+        let StageIo::Vs { fetch, .. } = &part.io else {
+            panic!("{:?}", part.io)
+        };
+        // (told apart by offset, each in the register of its place)
+        assert_eq!(fetch.iter().map(|f| (f.row, f.offset)).collect::<Vec<_>>(), [(0, 0), (1, 4), (2, 8)]);
+        let part = c.part(FourCC::PIECES).unwrap().data;
+        assert_eq!(u32_at(part, HEAD + ELEMENT + NAME), Ok(1));
     }
 
     #[test]
@@ -2596,9 +2661,9 @@ mod tests {
         );
         assert!(refused(&|s| s[S_TOPOLOGY] = 2), "lines");
         assert!(refused(&|s| put(s, S_SAMPLES, 4)), "multisampling");
-        // The element's first word after its name (index, slot, class or
-        // step rate: all must be zero).
-        assert!(refused(&|s| put(s, S_BLOCK + 8 + 9, 1)));
+        // The element's slot word after its name (the index may be set; the
+        // slot, class and step rate must be zero).
+        assert!(refused(&|s| put(s, S_BLOCK + 8 + 9 + 8, 1)));
         // An empty layout is one.
         assert!(Graphics::parse(&packet, &state_piece(&[]), false).is_ok());
     }

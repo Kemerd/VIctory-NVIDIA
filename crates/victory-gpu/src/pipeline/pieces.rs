@@ -527,7 +527,7 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
         .zip(&s.names)
         .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
             SemanticName: PCSTR(name.as_ptr().cast()),
-            SemanticIndex: 0,
+            SemanticIndex: e.index,
             Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
             InputSlot: 0,
             AlignedByteOffset: e.offset,
