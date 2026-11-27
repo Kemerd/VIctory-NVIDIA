@@ -5473,14 +5473,18 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // At most so much on the card's own memory, and while it has room; past
+    // that the side shaders see is in the PC's memory. `VICTORY_MEMORY_CARD_MB`
+    // says how much; unset it is 4 GiB, or a quarter of the card's budget
+    // where that is more (the share the card copies of title buffers have,
+    // [`card_limits`]): a card with 31 GiB was held to the 4 GiB a card with
+    // 11 could spare, and what did not fit was traced through the bus.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
+        let budget = host.video_memory().map_or(0, |[budget, ..]| budget);
+        mb.map_or((4096 << 20).max(budget / 4), |mb| mb << 20)
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
@@ -5491,7 +5495,25 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     };
     let buffer = match on_card {
         Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+        None => {
+            // Said, because nothing else tells of it and it is slow: from
+            // here on every step of every ray through this memory crosses
+            // the bus. (The first of them and every sixteenth after.)
+            static SPILLED: AtomicU64 = AtomicU64::new(0);
+            let n = SPILLED.fetch_add(1, Ordering::Relaxed);
+            if n % 16 == 0 {
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    mb = len >> 20,
+                    asked_so_far_mb = USED.load(Ordering::Relaxed) >> 20,
+                    most_mb = most >> 20,
+                    card_has_room = room,
+                    spilled = n + 1,
+                    "title memory by address: a copy shaders read went to the PC's memory, not the card's (VICTORY_MEMORY_CARD_MB raises the most)"
+                );
+            }
+            host.shared_buffer(len)?.0
+        }
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
