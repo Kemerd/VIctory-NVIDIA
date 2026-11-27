@@ -264,6 +264,21 @@ colour and alpha: its size is not the back buffer's at a 1440p output.
 generation's constants get them in order (near 0.15, far 10000), and the
 projection made of them; DLSS Super Resolution's are as before.
 
+**Notes on 32:9.** `-Res wide` (`VICTORY_DISPLAY_WIDE=5120x1440`) has been
+written and compiled, not run on the title. A first run answers these, and the
+log is where to look:
+
+- How big is the interface target at 5120x1440? If it is 5120x1440 and not
+  3840x2160, the middle band squashes it: set `VICTORY_UI_LETTERBOX=0`.
+- Does the composite take its uv from interpolated vertices or from the pixel
+  position? From vertices, the band shows the whole interface. From the pixel
+  position, it shows only its middle half.
+- Is the camera wide? If the world looks stretched, the title kept a 16:9
+  camera.
+- What does DLSS say is optimal? Read the `render sizes for [5120, 1440]` lines
+  (Quality should come to 3413x960, the log has the real numbers).
+- What does the frame generation line say at that size?
+
 **Windowed and full screen.** With frame generation the system's Alt+Enter is
 not taken for the window (`DXGI_MWA_NO_ALT_ENTER`): Streamline wants frame
 generation off across such a change. When the presented size or format

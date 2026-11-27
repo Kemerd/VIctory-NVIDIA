@@ -105,10 +105,6 @@ pub(crate) struct Composer {
     pso: ID3D12PipelineState,
     views: Vec<ID3D12DescriptorHeap>,
     step: u32,
-    /// The aspect to keep the interface at (`VICTORY_UI_LETTERBOX=16x9`), or
-    /// `None` with everything as it was: unset, the fit constant is 0 and the
-    /// shader takes its original path untouched.
-    ui_aspect: Option<f32>,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Composer {}
@@ -135,6 +131,48 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
         )?;
     }
     code.ok_or_else(windows::core::Error::empty)
+}
+
+/// The aspect the interface is kept at on a wider output (`VICTORY_UI_LETTERBOX=16x9`, or a bare ratio; `0` or anything unparseable: none), read once. Series X's interface composite (`draw.rs`) and Series S's two-plane composer both use it.
+///
+/// unset leaves both paths exactly as they were: no band, so the composer's
+/// fit constant stays 0 and the shader takes its original path.
+pub(crate) fn ui_aspect() -> Option<f32> {
+    static ASPECT: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *ASPECT.get_or_init(|| {
+        std::env::var("VICTORY_UI_LETTERBOX")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim().to_owned();
+                match v.split_once(['x', 'X']) {
+                    Some((w, h)) => {
+                        Some(w.trim().parse::<f32>().ok()? / h.trim().parse::<f32>().ok()?)
+                    }
+                    None => v.parse::<f32>().ok(),
+                }
+            })
+            // a zero, negative, nan or infinite ratio is a way of saying no
+            .filter(|a| a.is_finite() && *a > 0.0)
+    })
+}
+
+/// The pixels of a `width` x `height` output the interface fills when it is kept at its aspect: (left, band width). `None` when no aspect is asked for, or the output is not wider than it.
+pub(crate) fn ui_band(width: u32, height: u32) -> Option<(u32, u32)> {
+    band(ui_aspect()?, width, height)
+}
+
+/// The band maths on its own so it can be tested without the environment. the
+/// band is rounded to whole pixels and centred; an output no wider than the
+/// band has nothing to letterbox.
+fn band(aspect: f32, width: u32, height: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 || !aspect.is_finite() || aspect <= 0.0 {
+        return None;
+    }
+    let band = ((height as f32 * aspect).round() as u32).max(1);
+    if band >= width {
+        return None;
+    }
+    Some(((width - band) / 2, band))
 }
 
 impl Composer {
@@ -176,22 +214,12 @@ impl Composer {
             desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
                 D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
             let pso = device.CreateGraphicsPipelineState(&desc)?;
-            // The interface's aspect to preserve, when asked for: "16x9" or
-            // a bare ratio. Anything unparseable leaves the patch off.
-            let ui_aspect = std::env::var("VICTORY_UI_LETTERBOX").ok().and_then(|v| {
-                let v = v.trim().to_owned();
-                match v.split_once(['x', 'X']) {
-                    Some((w, h)) => Some(w.trim().parse::<f32>().ok()? / h.trim().parse::<f32>().ok()?),
-                    None => v.parse::<f32>().ok(),
-                }
-            });
             Ok(Composer {
                 root,
                 pso,
                 views: Vec::new(),
                 step: device
                     .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
-                ui_aspect,
             })
         }
     }
@@ -255,17 +283,8 @@ impl Composer {
             // The band the interface keeps at its console aspect on this
             // output: its share of the width (< 1 only on a wider screen),
             // 0 to leave the shader on its original path.
-            let fit = match self.ui_aspect {
-                Some(a) if width != 0 => {
-                    let share = a * height as f32 / width as f32; // ui_aspect / screen_aspect
-                    if share < 1.0 && share > 0.0 {
-                        share
-                    } else {
-                        0.0
-                    }
-                }
-                _ => 0.0,
-            };
+            let fit = ui_band(width, height).map_or(0.0, |(_, band)| band as f32 / width as f32);
+            // (the same band maths places the series x interface draw.)
             // the six constants of the shader's Fit block; all zero but the fit
             // with hdr off, which leaves the shader on its original path. with
             // hdr on and no interface plane the caller passes the base twice.
@@ -543,5 +562,31 @@ mod tests {
                 "red code {red}, expected {expected}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::band;
+
+    const WIDE: f32 = 16.0 / 9.0;
+
+    #[test]
+    fn centres_the_interface_on_a_wider_output() {
+        assert_eq!(band(WIDE, 5120, 1440), Some((1280, 2560)));
+        assert_eq!(band(WIDE, 3440, 1440), Some((440, 2560)));
+    }
+
+    #[test]
+    fn leaves_an_output_no_wider_than_the_interface_alone() {
+        assert_eq!(band(WIDE, 2560, 1440), None);
+        assert_eq!(band(WIDE, 1920, 1440), None);
+    }
+
+    #[test]
+    fn refuses_garbled_inputs() {
+        assert_eq!(band(0.0, 5120, 1440), None);
+        assert_eq!(band(f32::NAN, 5120, 1440), None);
+        assert_eq!(band(WIDE, 0, 1440), None);
     }
 }

@@ -89,7 +89,16 @@ pub fn run(
     // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
     // patched image goes to a folder of its own, beside the stock one.
     let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
-    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
+    // `VICTORY_DISPLAY_WIDE=WxH` is read once, here. A bad value is an error
+    // for every run that sets it, not only the 1440p ones.
+    let asked_wide = native_1440p::wide_asked()?;
+    // a wide output is a 1440p-class output (same patch, same Series X
+    // image), so asking for it is asking for the path; before this, `-Res 4k`
+    // or a missing VICTORY_NATIVE_1440P left VICTORY_DISPLAY_WIDE silently
+    // ignored.
+    let native_1440p = render_1080p
+        || asked_wide.is_some()
+        || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
     let images = if native_1440p {
         anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
         if upscaler.is_some() && render_1080p {
@@ -98,7 +107,7 @@ pub fn run(
         // `VICTORY_DISPLAY_WIDE=5120x1440`: the output patched to that size
         // in place of 2560x1440 (`native_1440p::wide_asked`); a patched image
         // of another size goes to a folder of its own (`wide`, empty at 16:9).
-        let (out_w, out_h) = native_1440p::wide_asked()?.unwrap_or((native_1440p::WIDTH, native_1440p::HEIGHT));
+        let (out_w, out_h) = asked_wide.unwrap_or((native_1440p::WIDTH, native_1440p::HEIGHT));
         let is_wide = (out_w, out_h) != (native_1440p::WIDTH, native_1440p::HEIGHT);
         let wide = if is_wide { format!("-{out_w}x{out_h}") } else { String::new() };
         if is_wide && render_1080p {
@@ -110,6 +119,21 @@ pub fn run(
         unsafe {
             std::env::set_var("VICTORY_DISPLAY_MODE", format!("{out_w}x{out_h}"));
             std::env::set_var("VICTORY_NATIVE_1440P", "1");
+            // the interface is a 16:9 canvas; stretched over 32:9 it is
+            // unreadable, so the wide path keeps it at 16:9 in the middle
+            // (`crate::compose::ui_band`, used by draw.rs).
+            // `VICTORY_UI_LETTERBOX=0` (the F1 menu's STRETCHED) leaves it
+            // full width.
+            if is_wide && std::env::var_os("VICTORY_UI_LETTERBOX").is_none() {
+                std::env::set_var("VICTORY_UI_LETTERBOX", "16x9");
+            }
+        }
+        if is_wide {
+            match std::env::var("VICTORY_UI_LETTERBOX").as_deref() {
+                Ok("0") => println!("display        interface stretched over the whole width (VICTORY_UI_LETTERBOX=0)"),
+                Ok(ratio) => println!("display        interface kept at {ratio} in the middle (VICTORY_UI_LETTERBOX)"),
+                Err(_) => {}
+            }
         }
         match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
             Some((mode, Ok(()))) => {
