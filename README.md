@@ -42,6 +42,7 @@ generation and HDR choices win over the ones the F1 menu saved; every other F1 c
   library, instead of about 1,100 being made again by the driver every run (1.4 s each).
 - **32:9 and HDR10.** The display mode is patched wider, so the camera, culling and motion vectors are made for
   the wide picture; the interface stays 16:9 in the middle. The upload memory that crashed 32:9 runs is fixed.
+- **NVIDIA Reflex.** Low latency mode is on by itself whenever frame generation is on, which takes back much of the delay generated frames add. Without frame generation, turn it on (or on + boost) in the F1 menu under REFLEX.
 - **Ray tracing.** The title's own builder calls are interposed (`VICTORY_RT_NATIVE=1`). It works, at 5-8 fps.
   Next: a builder of our own and the title's two traversal loop shapes on RayQuery, then DLSS Ray Reconstruction.
 
