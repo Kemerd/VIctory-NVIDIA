@@ -300,7 +300,7 @@ set "S_UI=16:9 in the middle"
 if "%C_UI%"=="stretch" set "S_UI=stretched"
 echo   Resolution      !S_RES!
 echo   Window          !S_WIN!
-echo   Console         Series %C_CONSOLE%
+if /i "%C_CONSOLE%"=="s" (echo   Console         Series S) else (echo   Console         Series X)
 echo   DLSS            %C_DLSS%
 echo   Frame gen       !S_FG!
 echo   Reflex          !S_REFLEX!

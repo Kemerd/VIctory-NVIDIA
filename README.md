@@ -4,8 +4,10 @@ A fork of [VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA), re
 higher frame rates, 32:9 and HDR10, a one-click launcher with every option, and the groundwork for the title's ray
 tracing on the RTX cores.
 
+![PLAY.cmd, the launcher: resolution, window, console, DLSS, frame generation, Reflex, HDR10, frame cap, wide interface and speed on one screen](https://github.com/Kemerd/VIctory-NVIDIA-RT/releases/download/rt-test-7/launcher.png)
+
 **Download:** [latest test build](https://github.com/Kemerd/VIctory-NVIDIA-RT/releases) (`victory.exe`, `victory-win10.exe` and `PLAY.cmd`).
-Put both next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`.
+Put them next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`.
 
 | RTX 5090, 2560x1440, DLSS Quality, open world, no frame generation | official settings | this fork (fast) |
 |---|---|---|
