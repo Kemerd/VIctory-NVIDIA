@@ -320,8 +320,60 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, and with [`find_copied`] the same
+/// copies by where they start, behind the one lock.
+static CARDED: Mutex<Carded> = Mutex::new(Carded { list: Vec::new(), by_start: BTreeMap::new(), longest: 0 });
+
+/// What [`CARDED`] holds.
+struct Carded {
+    list: Vec<std::sync::Weak<Shadow>>,
+    /// With [`find_copied`]: every copy of `list` by (start, [`Shadow::id`])
+    /// (two live copies can start at one address: a tail and a window of
+    /// the loose copies, a window around a small buffer beside the buffer's
+    /// own copy, a buffer made again while lists hold the old copy), with
+    /// where it ends. Empty without the switch.
+    by_start: BTreeMap<(usize, u64), (usize, std::sync::Weak<Shadow>)>,
+    /// The longest copy `by_start` ever held: a copy that reaches into an
+    /// address starts at most so far below it. Never shrinks.
+    longest: usize,
+}
+
+/// Whether [`send_copied`] finds the copies a title buffer copy touches by
+/// where they start (`VICTORY_SEND_COPIED_FIND=1`, off by default), not by
+/// upgrading every copy in the card's memory and testing its span: 4,029
+/// copies in the frame of the complaint, of which one or two hold a given
+/// destination, and most such copies go to memory no copy holds.
+///
+/// It is thread time of the submitting thread, which does every title
+/// buffer copy recorded on the CPU: about 0.5 ms a frame at 15 copies and
+/// 3 ms at 100, by a bench of the same loop outside the tree (34 us a call
+/// over 4,029 copies, warm). No measurable change of a streaming frame is
+/// to be expected while that thread stands waiting for translation. The
+/// line of the card's copies says what the look costs, in both states.
+fn find_copied() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_COPIED_FIND").is_some_and(|v| v == "1"))
+}
+
+/// Of `by_start` (copies by (start, id), each with its end), those that hold
+/// some of `[dst, dst + len)`: a copy that does starts below `dst + len`
+/// and, being at most `longest` long, at or above `dst - longest`.
+fn overlapping<V>(
+    by_start: &BTreeMap<(usize, u64), (usize, V)>,
+    longest: usize,
+    dst: usize,
+    len: usize,
+) -> impl Iterator<Item = (u64, &V)> {
+    let end = dst.saturating_add(len);
+    by_start
+        .range((dst.saturating_sub(longest), 0)..(end, 0))
+        .filter(move |&(&(start, _), &(stop, _))| start < end && stop > dst)
+        .map(|(&(_, id), (_, v))| (id, v))
+}
+
+/// Since the last frame line, [`send_copied`]'s calls, its nanoseconds and
+/// the copies it found holding the destination.
+pub(crate) static SEND_COPIED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// The copies in the card's memory whose `touched` was set since
 /// [`card_dirty`] last took them (a copy may be on it twice). Before, each
@@ -339,10 +391,18 @@ fn carded(shadow: &Arc<Shadow>) {
     };
     let _ = card.me.set(Arc::downgrade(shadow));
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-    carded.push(Arc::downgrade(shadow));
-    if carded.len() >= 2 * KEPT.load(Ordering::Relaxed).max(1024) {
-        carded.retain(|weak| weak.strong_count() > 0);
-        KEPT.store(carded.len(), Ordering::Relaxed);
+    let carded = &mut *carded;
+    carded.list.push(Arc::downgrade(shadow));
+    if find_copied() {
+        // (Start and length are set once, when the copy is made.)
+        let (start, len) = (shadow.start as usize, shadow.len as usize);
+        carded.by_start.insert((start, shadow.id), (start + len, Arc::downgrade(shadow)));
+        carded.longest = carded.longest.max(len);
+    }
+    if carded.list.len() >= 2 * KEPT.load(Ordering::Relaxed).max(1024) {
+        carded.list.retain(|weak| weak.strong_count() > 0);
+        carded.by_start.retain(|_, (_, weak)| weak.strong_count() > 0);
+        KEPT.store(carded.list.len(), Ordering::Relaxed);
     }
 }
 
@@ -358,13 +418,16 @@ pub(crate) fn live_span_bytes() -> u64 {
 }
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
-/// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+/// bytes and their "before" twins' bytes; then [`SEND_COPIED`], taken.
+pub(crate) fn card_stats() -> [u64; 13] {
+    let mut out = [0u64; 13];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    for (i, stat) in SEND_COPIED.iter().enumerate() {
+        out[10 + i] = stat.swap(0, Ordering::Relaxed);
+    }
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).list.iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -792,23 +855,95 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    let started = std::time::Instant::now();
+    // With the switch the copies are taken under the lock and dealt with
+    // after it: `carded` is called under the loose copies' and the buffers'
+    // locks, and the copies may be let go here.
+    let found = if find_copied() {
+        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        let found: Vec<Arc<Shadow>> =
+            overlapping(&carded.by_start, carded.longest, dst, len).filter_map(|(_, weak)| weak.upgrade()).collect();
+        // Both ways under one holding of the lock: a copy made between two
+        // looks would be a false alarm.
+        #[cfg(feature = "diagnostics")]
+        {
+            let fast: std::collections::BTreeSet<u64> = found.iter().map(|s| s.id).collect();
+            let end = dst.saturating_add(len);
+            let slow: std::collections::BTreeSet<u64> = carded
+                .list
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .filter(|s| (s.start as usize) < end && ((s.start + s.len) as usize) > dst)
+                .map(|s| s.id)
+                .collect();
+            static SAID: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+            if slow.difference(&fast).next().is_some() {
+                SAID[0].call_once(|| tracing::warn!(dst, len, "send_copied: the copies by start missed one the list holds"));
+            }
+            if fast.difference(&slow).next().is_some() {
+                SAID[1].call_once(|| tracing::warn!(dst, len, "send_copied: the copies by start found one the list does not hold"));
+            }
+        }
+        found
+    } else {
+        carded_copies()
+    };
+    let mut hits = 0;
+    for shadow in found {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
             continue;
         }
+        hits += 1;
         let busy: Vec<(usize, usize)> =
             shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
     }
+    SEND_COPIED[0].fetch_add(1, Ordering::Relaxed);
+    SEND_COPIED[1].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SEND_COPIED[2].fetch_add(hits, Ordering::Relaxed);
 }
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).list.iter().filter_map(std::sync::Weak::upgrade).collect()
+}
+
+/// [`overlapping`]: the copies a title buffer copy touches, by their start.
+#[cfg(test)]
+mod overlapping_tests {
+    use super::overlapping;
+    use std::collections::BTreeMap;
+
+    /// A copy that starts below and reaches in is found, one that ends at
+    /// the destination or starts at its end is not, two that start at one
+    /// address are both found, and a destination below the longest copy
+    /// does not wrap.
+    #[test]
+    fn finds_every_copy_that_holds_a_byte() {
+        let mut tree = BTreeMap::new();
+        let mut add = |start: usize, len: usize, id: u64| {
+            tree.insert((start, id), (start + len, id));
+        };
+        add(0x1000, 0x800, 1); // ends exactly at 0x1800
+        add(0x1400, 0x1000, 2); // starts below, reaches in
+        add(0x1800, 0x100, 3); // the same start as 4
+        add(0x1800, 0x10, 4);
+        add(0x1900, 0x100, 5); // starts at the end
+        add(0x10, 0x20, 6); // far below
+        let longest = 0x1000;
+        let mut found: Vec<u64> = overlapping(&tree, longest, 0x1800, 0x100).map(|(id, _)| id).collect();
+        found.sort_unstable();
+        assert_eq!(found, [2, 3, 4]);
+        // Below the longest copy: the walk starts at 0.
+        let low: Vec<u64> = overlapping(&tree, longest, 0x20, 4).map(|(id, _)| id).collect();
+        assert_eq!(low, [6]);
+        assert_eq!(overlapping(&tree, longest, 0x3000, 0x100).count(), 0);
+        assert_eq!(overlapping(&tree, longest, usize::MAX - 8, 0x100).count(), 0);
+    }
 }
 
 /// Ranges in order, those that overlap or touch as one.
