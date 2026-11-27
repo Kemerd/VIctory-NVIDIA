@@ -6908,6 +6908,15 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.cmp(c, p, a, b);
                 (self.s.m.select(c, t, a, b), None)
             }
+            // |S0 - S1| of the wrapped difference (0x80000000, 1 gives 0x7fffffff); SCC is D != 0
+            "s_absdiff_i32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let a = self.s.m.bin(c, Bin::Sub, a, b);
+                let z = self.s.m.i32(0);
+                let neg = self.s.m.cmp(c, pred::SLT, a, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, a);
+                (self.s.m.select(c, neg, n, a), None)
+            }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
                 let z = self.s.m.i32(0);
@@ -14437,6 +14446,16 @@ mod tests {
         let raw = body(20, true);
         let refusal = lowers_valu(&raw).expect_err("a read the skipped lanes make").to_string();
         assert!(refusal.contains("an opaque lane mask"), "{refusal}");
+    }
+
+    #[test]
+    fn the_absolute_difference_of_two_scalars_lowers() {
+        lowers_valu(&[
+            0x9614_0100, // s_absdiff_i32 s20, s0, s1
+            0xBF85_0001, // s_cbranch_scc1 +1 (reads its SCC)
+            0x7E00_0214, // v_mov_b32 v0, s20
+        ])
+        .expect("s_absdiff_i32");
     }
 
     #[test]
