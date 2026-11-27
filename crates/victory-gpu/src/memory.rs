@@ -796,7 +796,13 @@ impl Memory {
         let host = host()?;
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
-        let entries = crate::upload::reserve(bytes as usize)?;
+        // The CPU and the card's shadow copy read it, never a title address,
+        // so a wide output (little room below 2^37) keeps it out of reach.
+        let entries = if crate::upload::wide() {
+            crate::upload::reserve_out_of_reach(bytes as usize)?
+        } else {
+            crate::upload::reserve(bytes as usize)?
+        };
         // (Fresh: nothing wrote it, and it starts as zeros on both sides.)
         let directory = crate::shadow::by_address(entries as u64, bytes, true)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());

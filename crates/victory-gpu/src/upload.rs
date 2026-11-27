@@ -71,8 +71,30 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
 /// there was no hole of 64 MiB left in it in two runs of three (rt-2 and
 /// rt-4), the twentieth arena could not be had, and every builder dispatch
 /// asked for it again.
+///
+/// `VICTORY_DISPLAY_WIDE` (read once, see [`wide`]) tries above 2^37 first: at
+/// 5120x1440 the title's screen-sized memory leaves about 150 MiB of room in
+/// the reachable window, and the arenas of memory by address (64 MiB each,
+/// which no shader finds by address) took 80 MiB of it, so the upload arenas
+/// ran out at the nineteenth and `allocate_upload` answered null to the
+/// structure builder, which then ended the run. Unset, the order is as it was.
 pub(crate) fn reserve_out_of_reach(len: usize) -> Option<usize> {
-    reserve(len).or_else(|| reserve_between(len, 1 << 37, 1 << 40))
+    let [first, second] = out_of_reach_order(wide());
+    reserve_between(len, first.0, first.1).or_else(|| reserve_between(len, second.0, second.1))
+}
+
+/// The two windows [`reserve_out_of_reach`] tries, in order.
+fn out_of_reach_order(wide: bool) -> [(usize, usize); 2] {
+    let (near, far) = ((1 << 32, 1 << 37), (1 << 37, 1 << 40));
+    if wide { [far, near] } else { [near, far] }
+}
+
+/// Whether `VICTORY_DISPLAY_WIDE` is set (the launcher keeps it in the
+/// title's process): a wide output, whose bigger buffers leave the reachable
+/// window short of room. Read once.
+pub(crate) fn wide() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DISPLAY_WIDE").is_some())
 }
 
 /// The last error of this thread, for a log line after a failed call.
@@ -201,6 +223,12 @@ mod tests {
         // SAFETY: the bytes were handed out.
         unsafe { d.start().add(ARENA).write(1) };
         drop(b);
+    }
+
+    #[test]
+    fn wide_tries_above_the_reach_first_and_16_9_is_unchanged() {
+        assert_eq!(out_of_reach_order(false), [(1 << 32, 1 << 37), (1 << 37, 1 << 40)]);
+        assert_eq!(out_of_reach_order(true), [(1 << 37, 1 << 40), (1 << 32, 1 << 37)]);
     }
 
     #[test]
