@@ -4989,9 +4989,19 @@ impl Host {
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
+        // A flight enters the line when it is handed to the send thread, not
+        // when that has put it on the queue, so on the host queue the target
+        // is read first and the thread waited for after: every flight at or
+        // below it was handed over before, and is on the queue by then. Read
+        // the other way round, the fetch could claim to have run behind a
+        // flight it overtook (and a landing would skip what that writes).
         let ahead = match copy_queue {
             Some(_) => 0,
-            None => line().target,
+            None => {
+                let target = line().target;
+                send_thread::wait_idle();
+                target
+            }
         };
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the

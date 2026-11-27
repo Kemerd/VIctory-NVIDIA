@@ -2288,34 +2288,61 @@ fn compare_piece(
     held: &mut [u8],
     left: &std::sync::atomic::AtomicI64,
 ) -> Result<Vec<(usize, usize)>, ()> {
+    let (runs, copies) = piece_runs(card, lo - start, lo, title, held);
+    if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
+        return Err(());
+    }
+    apply_piece(card, id, start, data, lo, title, held, &runs);
+    Ok(runs)
+}
+
+/// The first half of [`compare_piece`], reading only: the runs of `title`
+/// that differ from `held` (offsets from `lo`) and, of a copy in the card's
+/// memory, how many of them are a copy of their own (whole words go up as
+/// pairs, in one dispatch, and count for nothing). `at` is `lo` from the
+/// copy's start. Nothing is written, so a caller with several pieces of one
+/// page can add the counts up and take its budget once before any of them is.
+fn piece_runs(card: bool, at: usize, lo: usize, title: &[u8], held: &[u8]) -> (Vec<(usize, usize)>, i64) {
+    if !card {
+        return (changed_runs(title, held), 0);
+    }
+    let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
+    let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
+    let copies = runs.iter().filter(own).count() as i64;
+    (runs, copies)
+}
+
+/// The second half of [`compare_piece`]: puts `runs` (from [`piece_runs`] of
+/// the same bytes) in, as its doc says for each kind of copy.
+#[allow(clippy::too_many_arguments)]
+fn apply_piece(
+    card: bool,
+    id: u64,
+    start: usize,
+    data: *mut u8,
+    lo: usize,
+    title: &[u8],
+    held: &mut [u8],
+    runs: &[(usize, usize)],
+) {
     let at = lo - start;
     if card {
-        // Whole words go up as pairs, all of them in one
-        // dispatch: only what is a copy of its own counts.
-        let runs = if crate::host::words_under() { word_runs(lo, title, held) } else { changed_runs(title, held) };
-        let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
-        let copies = runs.iter().filter(own).count() as i64;
-        if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
-            return Err(());
-        }
         let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
-        for &(r, m) in &runs {
+        for &(r, m) in runs {
             held[r..r + m].copy_from_slice(&title[r..r + m]);
         }
         if let Some(was) = was {
             crate::host::upcheck::note(id, at, &was, held);
         }
-        return Ok(runs);
+        return;
     }
-    let runs = changed_runs(title, held);
-    for &(r, m) in &runs {
+    for &(r, m) in runs {
         // SAFETY: inside the copy's mapping. The card may be
         // writing the copy beside these bytes; they are
         // written here and nothing around them.
         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), data.add(at + r), m) };
         held[r..r + m].copy_from_slice(&title[r..r + m]);
     }
-    Ok(runs)
 }
 
 /// [`MERGED`], taken.
@@ -4379,11 +4406,27 @@ impl Shadow {
                 }
             }
             MERGED[3].fetch_add(ranges.iter().map(|&(a, b)| (b - a) as u64).sum(), Ordering::Relaxed);
-            let mut all = Vec::new();
+            // The runs of every range first and the budget once for the page,
+            // then the writes: an error halfway would leave the reference
+            // holding runs of the page that the caller never hears of, and
+            // they would never go up.
+            let mut planned = Vec::with_capacity(ranges.len());
+            let mut copies = 0;
             for &(a, b) in &ranges {
                 // SAFETY: the caller's, for a range inside `[lo, lo + n)`.
+                let held = unsafe { std::slice::from_raw_parts(held.add(a - start), b - a) };
+                let (runs, own) = piece_runs(card, a - start, a, &title[a - lo..b - lo], held);
+                copies += own;
+                planned.push(runs);
+            }
+            if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
+                return Err(());
+            }
+            let mut all = Vec::new();
+            for (&(a, b), runs) in ranges.iter().zip(planned) {
+                // SAFETY: the caller's, for a range inside `[lo, lo + n)`.
                 let held = unsafe { std::slice::from_raw_parts_mut(held.add(a - start), b - a) };
-                let runs = compare_piece(card, self.id, start, self.data, a, &title[a - lo..b - lo], held, left)?;
+                apply_piece(card, self.id, start, self.data, a, &title[a - lo..b - lo], held, &runs);
                 // Offsets from `lo`, as the caller counts them.
                 all.extend(runs.into_iter().map(|(r, m)| (a - lo + r, m)));
             }

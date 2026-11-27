@@ -219,11 +219,11 @@ impl Seen {
         }
     }
 
-    /// No refresh holds any more.
+    /// No refresh holds any more. Always recorded, even right after another
+    /// one: a set added between the two took its place after the first, and
+    /// only the second tells it that what was written since is stale again.
     pub(super) fn dropped_all(&mut self) {
-        if self.dropped.last() != Some(&EVERYTHING) {
-            self.dropped.push(EVERYTHING);
-        }
+        self.dropped.push(EVERYTHING);
     }
 
     /// Forgets everything: the batch starts a submission.
@@ -436,12 +436,14 @@ mod tests {
     }
 
     #[test]
-    fn seen_dropped_all_gives_all_and_is_not_repeated() {
+    fn seen_dropped_all_gives_all_each_time_it_is_recorded() {
         let (mut seen, index) = (Seen::default(), three());
         seen.due_in(1, 3, &index);
         seen.dropped_all();
+        assert_eq!(seen.due_in(1, 3, &index), vec![0, 1, 2]);
+        assert_eq!(seen.due_in(1, 3, &index), Vec::<usize>::new());
+        // a second drop after the set was added again must make it due again.
         seen.dropped_all();
-        assert_eq!(seen.dropped.len(), 1);
         assert_eq!(seen.due_in(1, 3, &index), vec![0, 1, 2]);
         assert_eq!(seen.due_in(1, 3, &index), Vec::<usize>::new());
     }
