@@ -96,6 +96,49 @@ pub(crate) struct Staging {
     /// (`title_memory_reading`) instead of taking `no_wait()` /
     /// `refresh_unlocked()` or the 30-frame partial-read throttle.
     exact: std::sync::atomic::AtomicBool,
+    /// With `VICTORY_STAGING_NO_ZERO=1` ([`crate::pool::no_zero`]): the
+    /// piece was used before and was handed out as it was, and nothing has
+    /// written all of it since. The detiling clears it when it has written
+    /// every subresource; a copy recorded from the buffer while it is still
+    /// set zero-fills the buffer first ([`Staging::zero_if_unwritten`]).
+    unzeroed: std::sync::atomic::AtomicBool,
+}
+
+/// Since the last pass line, with [`crate::pool::no_zero`]: staging pieces
+/// handed out without their zero-fill, those zero-filled where a copy from
+/// them was recorded (nothing had detiled them whole), and those
+/// zero-filled when made because the detiling would not write all a copy
+/// reads ([`detile_covers`]).
+pub(crate) static STAGING_ZEROS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The line of [`STAGING_ZEROS`], with the pass's 5-second lines.
+pub(crate) fn staging_zeros_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::pool::no_zero() {
+        return;
+    }
+    let [left, at_record, at_making] = [0, 1, 2].map(|i| STAGING_ZEROS[i].swap(0, Relaxed));
+    if left + at_making > 0 {
+        tracing::info!(
+            "staging pieces used before, in the last 5 seconds (VICTORY_STAGING_NO_ZERO=1): {left} handed out without \
+             their zero-fill, {at_record} of them zero-filled where a copy was recorded (nothing had detiled them whole), \
+             {at_making} zero-filled when made (the detiling would not write all a copy reads)"
+        );
+    }
+}
+
+/// Whether detiling writes every byte the copies of a staging buffer read:
+/// for each subresource, the title's level (its elements: `Some((row
+/// bytes, rows, depth))` of `Mip::width * element_bytes`, `Mip::height`,
+/// `Mip::depth`; `None`: the layout has no such level) against the host's
+/// footprint (the unpadded bytes of a row, its rows and its depth, as
+/// `GetCopyableFootprints` gives them). The detiling writes the title's
+/// size of a level; a host copy whose level is larger (a top level rounded
+/// up to whole blocks) reads past it.
+fn detile_covers(parts: impl IntoIterator<Item = (Option<(u64, u32, u32)>, (u64, u32, u32))>) -> bool {
+    parts.into_iter().all(|(level, (row_bytes, rows, depth))| {
+        level.is_some_and(|(written, high, deep)| written >= row_bytes && high >= rows && deep >= depth)
+    })
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -139,7 +182,9 @@ fn hot_textures() -> bool {
 }
 
 // SAFETY: the staging mapping is written only at submission, under
-// `last`'s lock; the title memory is only read.
+// `last`'s lock, and by the zero-fill where a copy from it is recorded
+// (`Staging::zero_if_unwritten`), also under `last`'s lock; the title
+// memory is only read.
 unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
@@ -962,6 +1007,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
+    // (Recorded before the check that detiles it: its zeros now, if it was
+    // handed out without them.)
+    staging.zero_if_unwritten();
     record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -1100,6 +1148,7 @@ impl PreludeUpload {
     /// Records the copy of the staging buffer into the host texture on
     /// `list` (the prelude), the host texture in the copy destination state.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        self.staging.zero_if_unwritten();
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the
         // list's steps hold until it is reset.
@@ -1828,6 +1877,9 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        // (Never set without `VICTORY_STAGING_NO_ZERO`.)
+        let unzeroed = self.unzeroed.load(std::sync::atomic::Ordering::Relaxed);
+        let mut failed = false;
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
@@ -1846,13 +1898,48 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
+            // A piece handed out as it was (`unzeroed`): after a failure
+            // this subresource and every later one are zeros, as a piece
+            // zero-filled when made would hold them.
+            if failed {
+                linear.fill(0);
+                continue;
+            }
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                if !unzeroed {
+                    return;
+                }
+                linear.fill(0);
+                failed = true;
             }
+        }
+        // Every byte a copy reads is written now ([`detile_covers`]).
+        if unzeroed {
+            self.unzeroed.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Where a copy from the staging buffer is recorded: a piece handed out
+    /// without its zero-fill that nothing has detiled whole (the texture's
+    /// memory was never mapped, or its read failed) is zero-filled now, as
+    /// it would have been when made, so the copy uploads zeros and not the
+    /// texels of the texture that used the piece before. Under `last`'s
+    /// lock, where the detiling writes the buffer.
+    fn zero_if_unwritten(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.unzeroed.load(Relaxed) {
+            return;
+        }
+        let _last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if self.unzeroed.swap(false, Relaxed) {
+            // SAFETY: the staging buffer's own bytes of its mapping, written
+            // only under `last`'s lock, which is held.
+            unsafe { std::ptr::write_bytes(self.data, 0, self.bytes as usize) };
+            STAGING_ZEROS[1].fetch_add(1, Relaxed);
         }
     }
 }
@@ -2251,6 +2338,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
     let mut total = 0;
+    // With `VICTORY_STAGING_NO_ZERO`, the bytes of each row a copy reads too.
+    let no_zero = crate::pool::no_zero();
+    let mut row_bytes = if no_zero { vec![0u64; count as usize] } else { Vec::new() };
     // SAFETY: outputs for `count` subresources.
     unsafe {
         host.device.GetCopyableFootprints(
@@ -2260,12 +2350,31 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             0,
             Some(footprints.as_mut_ptr()),
             Some(rows.as_mut_ptr()),
-            None,
+            if no_zero { Some(row_bytes.as_mut_ptr()) } else { None },
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
-        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+    // A piece may be handed out without its zero-fill only where the
+    // detiling writes all that the copies read; as `Staging::part` counts
+    // subresources.
+    let leave = no_zero && {
+        let levels = mips - first;
+        detile_covers((0..count as usize).map(|i| {
+            let mip = first + i as u32 % levels;
+            let level = layout
+                .mips
+                .get(mip as usize)
+                .map(|m| (u64::from(m.width) * u64::from(layout.desc.element_bytes), m.height, m.depth));
+            (level, (row_bytes[i], rows[i], footprints[i].Footprint.Depth))
+        }))
+    };
+    let (piece, buffer, base, data, unzeroed) = match crate::pool::staging(host, total, leave) {
+        Some((piece, buffer, base, data, again)) => {
+            if no_zero && again {
+                STAGING_ZEROS[if leave { 0 } else { 2 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            (Some(piece), buffer, base, data, leave && again)
+        }
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
             if crate::residency::upload_refused()
@@ -2281,7 +2390,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
                     d.Width, d.Height, d.DepthOrArraySize, d.Format.0
                 )
             });
-            (None, buffer, 0, data)
+            // (A buffer of its own is zeros as made.)
+            (None, buffer, 0, data, false)
         }
     };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
@@ -2316,6 +2426,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
+        unzeroed: std::sync::atomic::AtomicBool::new(unzeroed),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -2455,6 +2566,30 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+/// [`detile_covers`]: when a staging piece may keep what it held.
+#[cfg(test)]
+mod detile_covers_tests {
+    use super::detile_covers;
+
+    /// Levels the detiling writes as large as the copies read, or larger,
+    /// cover; a level wider, higher or deeper on the host, or one the
+    /// layout does not have, does not; nothing to copy covers.
+    #[test]
+    fn the_detiling_must_write_all_a_copy_reads() {
+        // A 64x64 block-compressed level (16 blocks of 16 bytes a row) and
+        // its next.
+        let same = [(Some((256, 16, 1)), (256, 16, 1)), (Some((128, 8, 1)), (128, 8, 1))];
+        assert!(detile_covers(same));
+        assert!(detile_covers([(Some((272, 17, 1)), (256, 16, 1))]));
+        // The host's top level rounded up to whole blocks: a row more.
+        assert!(!detile_covers([(Some((256, 16, 1)), (256, 17, 1))]));
+        assert!(!detile_covers([(Some((240, 16, 1)), (256, 16, 1))]));
+        assert!(!detile_covers([(Some((256, 16, 4)), (256, 16, 8))]));
+        assert!(!detile_covers([(Some((256, 16, 1)), (256, 16, 1)), (None, (16, 1, 1))]));
+        assert!(detile_covers([]));
     }
 }
 

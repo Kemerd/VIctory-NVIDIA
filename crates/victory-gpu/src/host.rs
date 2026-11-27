@@ -9464,6 +9464,7 @@ impl Meter {
                         crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20
                     );
                 }
+                crate::texture::staging_zeros_line();
                 let served = crate::descriptor::host::SERVED.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
                 if served[0] + served[3] > 0 {
                     tracing::info!(
