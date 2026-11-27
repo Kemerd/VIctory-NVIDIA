@@ -9341,6 +9341,11 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         METER_FPS_TENTHS.store((fps * 10.0).round() as u32, Ordering::Relaxed);
+        // the lines under the frame rate (directstorage rate and queue,
+        // textures due, uploads in flight) are taken in this same window, so
+        // the overlay's text changes at most once a second and its box is not
+        // repainted every frame (`crate::loading`).
+        crate::loading::sample(elapsed.as_secs_f64());
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.

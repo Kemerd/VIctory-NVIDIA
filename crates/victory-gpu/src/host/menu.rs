@@ -112,6 +112,7 @@ fn fps_line_on() -> &'static AtomicBool {
 }
 
 /// That line: the frames rendered a second and, while frame generation shows more, those shown.
+/// It also carries the loading lines (`crate::loading`).
 fn fps_line() -> Option<String> {
     if !fps_line_on().load(Ordering::Relaxed) {
         return None;
@@ -137,6 +138,12 @@ fn fps_line() -> Option<String> {
     if making > 0 {
         line.push_str(&format!("\nSHADERS: {making}"));
     }
+    // then what the title is loading or streaming, one line each and only
+    // while its number is not zero (taken once a second by the meter, so this
+    // is four atomic loads): directstorage rate and queue, textures waiting
+    // for upload, uploads in flight. they are part of this line, so
+    // VICTORY_FPS_LINE=0 and the stats panel hide them with it.
+    line.push_str(&crate::loading::lines());
     Some(line)
 }
 
@@ -578,6 +585,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn loading_lines_have_a_picture_for_every_character() {
+        // constructed numbers, all four lines shown
+        let text = crate::loading::render([1234, 5, 6, 7]);
+        for c in text.bytes().filter(|&c| c != b'\n') {
+            assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{}", c as char);
+        }
+        let longest = text.split('\n').map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(longest <= COLUMNS as usize, "{text}");
     }
 
     #[test]

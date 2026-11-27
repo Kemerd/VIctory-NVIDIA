@@ -901,6 +901,21 @@ impl Window {
 }
 
 impl Lanes {
+    /// Reads submitted and not yet started, over all queues.
+    fn waiting(&self) -> usize {
+        self.lanes.values().map(|l| l.reads.len()).sum()
+    }
+
+    /// Tells the lines under the frame rate (`victory_gpu::loading`) how
+    /// many reads wait; called under the scheduler's lock wherever that
+    /// number changes, so the overlay needs no lock of its own.
+    fn publish_waiting(&self) {
+        victory_gpu::loading::DSTORAGE_WAITING.store(
+            u32::try_from(self.waiting()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Counts a finished request; about every 5 s the window's sums, for
     /// the caller to write once the lock is let go ([`Window::log`]).
     fn count(&mut self, job: &Job, started: std::time::Instant) -> Option<Window> {
@@ -929,7 +944,7 @@ impl Lanes {
             bcpack: self.bcpack.1.as_secs_f64(),
             bcpack_bytes: self.bcpack.0,
             refused,
-            waiting: self.lanes.values().map(|l| l.reads.len()).sum(),
+            waiting: self.waiting(),
             longest_status_us: STATUS_LONGEST.swap(0, Ordering::Relaxed),
         };
         self.done = Default::default();
@@ -964,13 +979,16 @@ impl Lanes {
         self.clock[class] += size * COST[class];
         self.lane_now[class] = lane.clock;
         lane.clock += size;
-        Some(Job {
+        let job = Job {
             lane: id,
             seq,
             request,
             note,
             staging,
-        })
+        };
+        // the pop above is what changed the count
+        self.publish_waiting();
+        Some(job)
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
@@ -1023,6 +1041,7 @@ impl Lanes {
             }
         }
         lane.flush();
+        self.publish_waiting();
     }
 }
 
@@ -1101,6 +1120,7 @@ fn close_lane(id: u64) {
     lane.unsubmitted.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
+    lanes.publish_waiting();
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -1698,6 +1718,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     FILE_BYTES.fetch_add(done as u64, Ordering::Relaxed);
+    // the 5 s summary swaps FILE_BYTES to 0, so the overlay's MB/s keeps a
+    // counter of its own, which the meter takes once a second
+    victory_gpu::loading::DSTORAGE_READ_BYTES.fetch_add(done as u64, Ordering::Relaxed);
     result
 }
 

@@ -57,6 +57,8 @@ mod port;
 #[cfg(windows)]
 mod land;
 pub mod list;
+#[cfg(windows)]
+pub mod loading;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
