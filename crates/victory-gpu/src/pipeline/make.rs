@@ -360,11 +360,35 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PIPELINE_WAIT_BACKLOG=n` (read once, unset by default): past
+/// `n` pipelines queued, a draw's pipeline is not waited for at all and the
+/// draw is dropped at once, as it is when the budget runs out. Unset, every
+/// draw waits as before.
+fn backlog() -> Option<u64> {
+    static MOST: OnceLock<Option<u64>> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let most = std::env::var("VICTORY_PIPELINE_WAIT_BACKLOG").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(most) = most {
+            tracing::info!(most, "host pipelines are not waited for while more than this many are queued");
+        }
+        most
+    })
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
+        return;
+    }
+    // with more queued than the workers can make within the budget, the
+    // pipeline asked for here will not arrive in time, and waiting only
+    // costs the frame: run 5 spent the whole 500 ms in every frame for two
+    // minutes while 470 were queued (about 290 ms a frame, two frames in
+    // the line), run 10 sat at 3 fps with 600 queued. passes over the
+    // screen keep their own budget and workers.
+    if !screen && backlog().is_some_and(|most| WAITING.load(Ordering::Relaxed) > most) {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
