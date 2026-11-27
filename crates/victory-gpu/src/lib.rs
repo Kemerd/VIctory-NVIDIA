@@ -49,6 +49,8 @@ mod host;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The keys of the keyboard's stand-in gamepad, which the F1 menu changes.
+pub mod keybinds;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]

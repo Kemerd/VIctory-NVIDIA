@@ -13,6 +13,11 @@
 //! (DLSS mode, frame generation, frame rate, console, picture size), which it
 //! turns into the layer's switches; the others are the switches themselves.
 //!
+//! After the settings come the keys of the keyboard's stand-in pad
+//! (`crate::keybinds`): Enter on one waits for the next key pressed and
+//! makes it that control's key at once (Esc gives up), Left/Right put the
+//! default back. Those are saved as `VICTORY_KEY_...` with the rest.
+//!
 //! In every build, as the stats panel is. Drawn as
 //! that panel is: white text on a black box, copied onto the swap chain's
 //! buffer, in the middle of the picture.
@@ -29,6 +34,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::font::{colours, glyph};
+use crate::keybinds::{self, BINDS};
 use super::{Host, HostList, transition};
 
 const GLYPH: (u32, u32) = (5, 7);
@@ -163,6 +169,12 @@ fn index_of(item: &Item, value: &str) -> Option<usize> {
     item.values.iter().position(|(v, _)| *v == value)
 }
 
+/// The menu waits for a key to give a control of the stand-in pad: the key
+/// thread then also reports every key pressed, as `CAPTURED | vk`.
+static CAPTURE: AtomicBool = AtomicBool::new(false);
+/// Marks a key in the pressed list as one seen while [`CAPTURE`] was set.
+const CAPTURED: u16 = 0x100;
+
 /// Keys pressed, gathered on a thread of their own every 10 ms: a frame
 /// lasts 50 ms and more, and a short press would fall between two frames.
 fn keys() -> &'static Mutex<Vec<u16>> {
@@ -171,6 +183,11 @@ fn keys() -> &'static Mutex<Vec<u16>> {
         let _ = std::thread::Builder::new().name("settings menu keys".into()).spawn(|| {
             const WATCHED: [u16; 7] = [VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_ESCAPE];
             let mut was = [false; WATCHED.len()];
+            // while capturing, every key the input module reports; the
+            // first scan only takes the keys' state, so that the Enter that
+            // started the capture is not taken as the new key
+            let mut all_was = [false; 256];
+            let mut scanning = false;
             loop {
                 std::thread::sleep(Duration::from_millis(10));
                 let mut process = 0;
@@ -184,6 +201,20 @@ fn keys() -> &'static Mutex<Vec<u16>> {
                         keys().lock().unwrap_or_else(|e| e.into_inner()).push(vk);
                     }
                     was[i] = down;
+                }
+                // about 240 queries every 10 ms, only while the menu waits for a key
+                if ours && CAPTURE.load(Ordering::Relaxed) {
+                    for vk in (0x08..=0xFE_u8).filter(|&vk| keybinds::usable(vk) || vk == 0x1B) {
+                        // SAFETY: a plain query.
+                        let down = unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+                        if scanning && down && !all_was[usize::from(vk)] {
+                            keys().lock().unwrap_or_else(|e| e.into_inner()).push(CAPTURED | u16::from(vk));
+                        }
+                        all_was[usize::from(vk)] = down;
+                    }
+                    scanning = true;
+                } else {
+                    scanning = false;
                 }
             }
         });
@@ -296,6 +327,21 @@ pub(super) struct Menu {
     painted: Option<String>,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The control (a place in `BINDS`) waiting for its new key.
+    capturing: Option<usize>,
+}
+
+/// Lines of the menu: the settings, the keys, then the actions.
+const TOTAL: usize = ITEMS.len() + BINDS.len() + ACTIONS.len();
+
+/// The control of a line, if it is one of the keys' lines.
+fn bind_at(row: usize) -> Option<usize> {
+    row.checked_sub(ITEMS.len()).filter(|&j| j < BINDS.len())
+}
+
+/// The key a saved value stands for: the default when it is empty or not a usable key.
+fn bound_key(j: usize, value: &str) -> u8 {
+    keybinds::parse(value).unwrap_or(BINDS[j].default)
 }
 
 impl Menu {
@@ -306,8 +352,8 @@ impl Menu {
         if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
-        let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+        let values: Vec<String> = ITEMS.iter().map(|i| i.var).chain(BINDS.iter().map(|b| b.var)).map(get).collect();
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, capturing: None }
     }
 
     fn open() -> bool {
@@ -315,7 +361,7 @@ impl Menu {
     }
 
     fn lines(&self) -> Vec<String> {
-        let total = ITEMS.len() + ACTIONS.len();
+        let total = TOTAL;
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
             "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
@@ -329,8 +375,13 @@ impl Menu {
                 let shown = index_of(item, value).map_or(value.to_ascii_uppercase(), |i| item.values[i].1.to_owned());
                 let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
                 format!("{cursor} {:<27} < {shown} >{mark}", item.label)
+            } else if let Some(j) = bind_at(row) {
+                // the keys apply at once, so they are always live
+                let shown = if self.capturing == Some(j) { "PRESS A KEY".to_owned() } else { keybinds::name(bound_key(j, &self.values[row])) };
+                let mark = if self.values[row] != self.started[row] { " *LIVE" } else { " LIVE" };
+                format!("{cursor} {:<27} < {shown} >{mark}", BINDS[j].label)
             } else {
-                format!("{cursor} {}", ACTIONS[row - ITEMS.len()])
+                format!("{cursor} {}", ACTIONS[row - ITEMS.len() - BINDS.len()])
             };
             out.push(line.chars().take(COLUMNS as usize).collect());
         }
@@ -338,7 +389,7 @@ impl Menu {
             out.push(String::new());
         }
         out.push(String::new());
-        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.chars().take(COLUMNS as usize).collect() });
         out
     }
 
@@ -353,6 +404,39 @@ impl Menu {
             self.apply_live(i);
         }
         self.note.clear();
+    }
+
+    /// Gives control `j` the key `vk` (or its default, for `None`), at once,
+    /// and says which other control has the same key if one does.
+    fn bind(&mut self, j: usize, vk: Option<u8>) {
+        let row = ITEMS.len() + j;
+        self.values[row] = vk.filter(|&vk| vk != BINDS[j].default).map(keybinds::value).unwrap_or_default();
+        let vk = bound_key(j, &self.values[row]);
+        keybinds::set(j, vk);
+        // the same key on two controls presses both; allowed, but said
+        let other = (0..BINDS.len()).find(|&k| k != j && keybinds::key(k) == vk);
+        self.note = match other {
+            Some(k) => format!("{} IS ALSO {}", keybinds::name(vk), BINDS[k].label.trim_start_matches("KEY: ")),
+            None => format!("{} IS NOW {}", BINDS[j].label.trim_start_matches("KEY: "), keybinds::name(vk)),
+        };
+    }
+
+    /// A key pressed while the menu waited for one for control `j`.
+    fn captured(&mut self, j: usize, vk: u8) {
+        self.stop_capture();
+        if vk == 0x1B {
+            self.note = "KEY NOT CHANGED".to_owned();
+        } else if keybinds::usable(vk) {
+            self.bind(j, Some(vk));
+        } else {
+            self.note = "THAT KEY CANNOT BE USED".to_owned();
+        }
+    }
+
+    /// Stops waiting for a key.
+    fn stop_capture(&mut self) {
+        self.capturing = None;
+        CAPTURE.store(false, Ordering::Relaxed);
     }
 
     /// A setting the build reads at each use: changed in this run's environment at once.
@@ -389,12 +473,14 @@ impl Menu {
             .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())))
             .filter(|(k, _)| k.starts_with("VICTORY_"))
             .collect();
-        for (i, item) in ITEMS.iter().enumerate() {
+        // the settings, then the keys, by the same places as `values`
+        let vars = ITEMS.iter().map(|i| i.var).chain(BINDS.iter().map(|b| b.var));
+        for (i, var) in vars.enumerate() {
             if self.values[i] == self.started[i] {
                 continue;
             }
-            kept.retain(|(k, _)| k != item.var);
-            kept.push((item.var.to_owned(), self.values[i].clone()));
+            kept.retain(|(k, _)| k != var);
+            kept.push((var.to_owned(), self.values[i].clone()));
         }
         let mut text = String::from("# Saved by the F1 menu; applied over the play settings at every start (an empty value: unset).\r\n");
         for (k, v) in &kept {
@@ -463,9 +549,25 @@ impl Menu {
         if pressed.is_empty() {
             return;
         }
-        let total = ITEMS.len() + ACTIONS.len();
+        let total = TOTAL;
         for vk in pressed {
             let open = Self::open();
+            // waiting for a key: only the keys the capture saw count, and F1
+            if let Some(j) = self.capturing {
+                if vk & CAPTURED != 0 {
+                    self.captured(j, (vk & 0xFF) as u8);
+                    self.changed = true;
+                    continue;
+                }
+                if vk != VK_F1 {
+                    continue;
+                }
+                self.stop_capture();
+            }
+            // (one seen by a capture that has just ended)
+            if vk & CAPTURED != 0 {
+                continue;
+            }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
                 self.note.clear();
@@ -481,7 +583,13 @@ impl Menu {
                 VK_LEFT if self.at < ITEMS.len() => self.change(self.at, -1),
                 VK_RIGHT if self.at < ITEMS.len() => self.change(self.at, 1),
                 VK_RETURN if self.at < ITEMS.len() => self.change(self.at, 1),
-                VK_RETURN => match self.at - ITEMS.len() {
+                VK_LEFT | VK_RIGHT if bind_at(self.at).is_some() => self.bind(self.at - ITEMS.len(), None),
+                VK_RETURN if bind_at(self.at).is_some() => {
+                    self.capturing = bind_at(self.at);
+                    CAPTURE.store(true, Ordering::Relaxed);
+                    self.note = "PRESS THE NEW KEY. ESC KEEPS THE OLD ONE".to_owned();
+                }
+                VK_RETURN => match self.at - ITEMS.len() - BINDS.len() {
                     0 => {
                         if self.save() {
                             self.restart();
@@ -581,13 +689,16 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keybinds::control as bind;
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: vec![String::new(); ITEMS.len() + BINDS.len()], started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None };
         menu.started = menu.values.clone();
-        for at in 0..ITEMS.len() + ACTIONS.len() {
+        for at in 0..TOTAL {
             menu.at = at;
+            // a key's line both as it is and while it waits for a key
+            menu.capturing = bind_at(at);
             for line in menu.lines() {
                 assert!(line.len() <= COLUMNS as usize, "{line}");
                 for c in line.bytes() {
@@ -610,7 +721,7 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).chain(BINDS.iter().map(|_| String::new())).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -619,5 +730,30 @@ mod tests {
         assert_eq!(menu.values[0], ITEMS[0].values[0].0);
         menu.change(0, -1);
         assert_eq!(menu.values[0], ITEMS[0].values[n - 1].0);
+    }
+
+    #[test]
+    fn every_key_name_and_note_has_a_picture() {
+        let mut menu = Menu { values: vec![String::new(); ITEMS.len() + BINDS.len()], started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, capturing: None };
+        menu.started = menu.values.clone();
+        // each usable key on the longest label, and the note it leaves
+        for vk in (0..=0xFF_u8).filter(|&vk| keybinds::usable(vk)) {
+            menu.values[ITEMS.len() + bind::RIGHT_STICK_RIGHT] = keybinds::value(vk);
+            menu.at = ITEMS.len() + bind::RIGHT_STICK_RIGHT;
+            menu.note = format!("{} IS ALSO {}", keybinds::name(vk), "RIGHT STICK RIGHT");
+            for line in menu.lines() {
+                assert!(line.len() <= COLUMNS as usize, "{line}");
+                for c in line.bytes() {
+                    assert_ne!(glyph(c.to_ascii_uppercase()), glyph(b'#'), "{line}: {}", c as char);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_saved_key_reads_back_and_the_default_saves_as_unset() {
+        assert_eq!(bound_key(bind::A, ""), BINDS[bind::A].default);
+        assert_eq!(bound_key(bind::A, &keybinds::value(b'P')), b'P');
+        assert_eq!(bound_key(bind::A, "nonsense"), BINDS[bind::A].default);
     }
 }

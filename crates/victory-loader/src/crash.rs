@@ -116,8 +116,11 @@ fn append_to_log(text: &str) {
         // A handle of our own in append mode: the log's writer keeps its
         // file open too, and appends from both land whole, one after the other.
         let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+        // One write for the whole report: several small writes let lines
+        // of the log's own writer land between them.
+        let whole = format!("unix time {now}, process {}\n{text}\n", std::process::id());
         if let Ok(mut f) = opened {
-            let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+            let _ = f.write_all(whole.as_bytes());
         }
     }
 }
@@ -128,6 +131,30 @@ fn append_to_log(text: &str) {
 /// a failure that is not one.
 fn leave_crash_files(text: &str, info: *const EXCEPTION_POINTERS) {
     use std::sync::atomic::Ordering;
+    // Held for the whole call: a second failure on another thread (the
+    // host's own report after a device loss, say) waits here instead of
+    // ending the process while the first one is still writing the dump,
+    // which left a dump of 0 bytes.
+    // A fault inside this very call on the same thread comes back here: it
+    // only appends, since waiting for the lock it holds would hang.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WRITER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // SAFETY: no arguments; returns the calling thread's id.
+    let me = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    if WRITER.load(Ordering::Acquire) == me {
+        append_to_log(text);
+        return;
+    }
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    WRITER.store(me, Ordering::Release);
+    // Cleared when the call ends, whichever way it returns.
+    struct Clear<'a>(&'a std::sync::atomic::AtomicU32);
+    impl Drop for Clear<'_> {
+        fn drop(&mut self) {
+            self.0.store(0, Ordering::Release);
+        }
+    }
+    let _clear = Clear(&WRITER);
     if LEFT_FILES.swap(true, Ordering::AcqRel) {
         append_to_log(text);
         return;

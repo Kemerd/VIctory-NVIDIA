@@ -10561,6 +10561,14 @@ impl Host {
                     hdr_blend,
                 },
             );
+            // The copy into the back buffer went to the send thread
+            // (`VICTORY_SEND_THREAD=1`): Present puts work on the same queue,
+            // so it waits until that copy is on the queue. Otherwise the
+            // present goes first and the copy then writes a buffer the
+            // compositor already holds, and the device is removed
+            // (0x887A002B). Streamline's frame generation proxy hid this by
+            // presenting on its own queue; DLSS alone or no DLSS did not.
+            send_thread::wait_idle();
             let called = crate::streamline::present_called(&presenting);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             crate::streamline::present_returned(called);
