@@ -361,20 +361,23 @@ const S_BLOCK: usize = 0x4c;
 
 /// DXGI formats of the input elements whose fetch is known, as (bytes,
 /// channels): the 32-bit float formats, which the code loads as dwords, and
-/// `R8G8B8A8_UNORM`, which it loads through a typed format.
+/// the 8 and 16-bit ones, which it loads through a typed format.
 pub(crate) fn element_shape(format: u32) -> Option<(u32, u8)> {
     match format {
         2 => Some((16, 4)),
         6 => Some((12, 3)),
         16 => Some((8, 2)),
         41 => Some((4, 1)),
-        R8G8B8A8_UNORM => Some((4, 4)),
+        R8G8B8A8_UNORM | R8G8B8A8_UINT => Some((4, 4)),
+        R16G16B16A16_FLOAT => Some((8, 4)),
         _ => None,
     }
 }
 
-/// The one byte-wise element format among [`element_shape`]'s.
+/// The element formats of [`element_shape`] that are not 32-bit floats.
 pub(crate) const R8G8B8A8_UNORM: u32 = 28;
+pub(crate) const R8G8B8A8_UINT: u32 = 30;
+pub(crate) const R16G16B16A16_FLOAT: u32 = 10;
 
 /// A container for one stage, whole but for the two pieces the caller
 /// reads into it from title memory: `bytes[code]` and `bytes[metadata]`.
@@ -1116,7 +1119,8 @@ impl Graphics {
                     name: &e.name,
                     index: e.index,
                     system: 0,
-                    component: 3,
+                    // (the host's input assembler gives a UINT format as integers)
+                    component: if e.format == R8G8B8A8_UINT { 1 } else { 3 },
                     register: i as u32,
                     mask: (1 << channels) - 1,
                 })
@@ -2146,6 +2150,27 @@ mod tests {
             rows(&vs_bytes, FourCC::ISG1),
             [(0, 0, 3, 0), (0, 0, 3, 1), (0, 0, 3, 2)]
         );
+    }
+
+    #[test]
+    fn the_8_and_16_bit_elements_are_vertex_inputs() {
+        let packet = graphics_packet(false, 0, &[]);
+        let elements = [("COLOR", 30, 0), ("POSITION", 10, 4), ("TEXCOORD", 28, 12)];
+        let g = Graphics::parse(&packet, &state_piece(&elements), false).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let bytes = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        let part = c.part(FourCC::ISG1).unwrap().data;
+        // (type, register, mask) of each row: integers for UINT, else floats
+        let rows: Vec<_> = (0..u32_at(part, 0).unwrap() as usize)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let word = |k: usize| u32_at(part, at + 4 * k).unwrap();
+                (word(4), word(5), word(6))
+            })
+            .collect();
+        assert_eq!(rows, [(1, 0, 0xf), (3, 1, 0xf), (3, 2, 0xf)]);
     }
 
     #[test]

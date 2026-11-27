@@ -252,6 +252,81 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// The channels a vertex program's load returns, as (row, channel) of the
+/// input signature: `name` at byte `byte` of buffer `slot` (`format` the
+/// typed load's), over the elements of the input layout `fetch`. Only what
+/// the host's input assembler gives exactly: whole dwords of 32-bit floats
+/// (which may run on into the next element, the compiler fetches
+/// neighbours together), and a typed format whose channels are those of
+/// the element (same width and numeric format), taken from the channel
+/// the byte is.
+fn vertex_fetch_channels(
+    fetch: &[crate::native::VsFetch],
+    slot: u32,
+    byte: u32,
+    name: &str,
+    format: Option<u8>,
+) -> Result<Vec<(u8, u8)>, Why> {
+    let holding = |byte: u32| {
+        fetch
+            .iter()
+            .find(|e| e.slot == slot && byte >= e.offset && byte - e.offset < e.bytes)
+            .ok_or("a vertex fetch outside the elements whose format is handled")
+    };
+    let e = holding(byte)?;
+    let within = byte - e.offset;
+    let dwords = match name {
+        "buffer_load_dword" => Some(1),
+        "buffer_load_dwordx2" => Some(2),
+        "buffer_load_dwordx3" => Some(3),
+        "buffer_load_dwordx4" => Some(4),
+        _ => None,
+    };
+    let typed = match name.strip_prefix("tbuffer_load_format_") {
+        Some("x") => Some(1),
+        Some("xy") => Some(2),
+        Some("xyz") => Some(3),
+        Some("xyzw") => Some(4),
+        _ => None,
+    };
+    // What an element's channels are in memory: the width in bits of each
+    // and their numeric format, which the host's input assembler turns
+    // into 32-bit floats or integers.
+    let shape = |e: &crate::native::VsFetch| match e.format {
+        crate::pieces::R8G8B8A8_UNORM => (8, Numeric::Unorm),
+        crate::pieces::R8G8B8A8_UINT => (8, Numeric::Uint),
+        crate::pieces::R16G16B16A16_FLOAT => (16, Numeric::Float),
+        _ => (32, Numeric::Float),
+    };
+    match (dwords, typed, format.and_then(buffer_format)) {
+        (Some(n), None, None) => (0..n)
+            .map(|k| {
+                let at = byte + 4 * k;
+                let e = holding(at).map_err(|_| "a vertex fetch past its element")?;
+                let within = at - e.offset;
+                if shape(e) != (32, Numeric::Float) || !within.is_multiple_of(4) {
+                    return Err("a vertex fetch of a form or format that is not handled");
+                }
+                Ok((e.row, (within / 4) as u8))
+            })
+            .collect(),
+        (None, Some(n), Some((bits, numeric)))
+            if bits.iter().all(|&b| b == shape(e).0)
+                && numeric == shape(e).1
+                && n <= bits.len() as u32
+                && within.is_multiple_of(shape(e).0 / 8) =>
+        {
+            let first = within / (shape(e).0 / 8);
+            let channels = crate::pieces::element_shape(e.format).map_or(0, |s| u32::from(s.1));
+            if first + n > channels {
+                return Err("a vertex fetch past its element");
+            }
+            Ok((first..first + n).map(|c| (e.row, c as u8)).collect())
+        }
+        _ => Err("a vertex fetch of a form or format that is not handled"),
+    }
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -13173,10 +13248,9 @@ impl<'a> Lower<'a> {
     /// becomes a read of the input signature, so the host's input assembler
     /// fetches (and adds the base vertex, as the code does with s2).
     ///
-    /// Only the forms seen are taken: whole dwords of a 32-bit float
-    /// element, and an `R8G8B8A8_UNORM` element through a typed load of
-    /// that format or of one of its bytes. Anything else is refused: a
-    /// fetch that reads what the element does not hold would draw wrong.
+    /// Only the forms of [`vertex_fetch_channels`] are taken. Anything else
+    /// is refused: a fetch that reads what the element does not hold would
+    /// draw wrong.
     fn vertex_fetch(&mut self, inst: &Inst, entry: u32, guard: Option<V>) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -13224,47 +13298,13 @@ impl<'a> Lower<'a> {
         let StageIo::Vs { fetch, .. } = &self.x.native.io else {
             return Err("a vertex fetch outside a vertex program");
         };
-        let (slot, byte) = (entry / 16, u32::from(*offset));
-        let e = fetch
-            .iter()
-            .find(|e| e.slot == slot && byte >= e.offset && byte - e.offset < e.bytes)
-            .ok_or("a vertex fetch outside the elements whose format is handled")?;
-        let within = byte - e.offset;
-        let channels = crate::pieces::element_shape(e.format).map_or(0, |s| u32::from(s.1));
-        // The first channel read and how many, by the load and the format.
-        let dwords = match name {
-            "buffer_load_dword" => Some(1),
-            "buffer_load_dwordx2" => Some(2),
-            "buffer_load_dwordx3" => Some(3),
-            "buffer_load_dwordx4" => Some(4),
-            _ => None,
-        };
-        let typed = match name.strip_prefix("tbuffer_load_format_") {
-            Some("x") => Some(1),
-            Some("xy") => Some(2),
-            Some("xyz") => Some(3),
-            Some("xyzw") => Some(4),
-            _ => None,
-        };
-        let bytes = e.format == crate::pieces::R8G8B8A8_UNORM;
-        let (first, count) = match (dwords, typed, format.and_then(|f| buffer_format(f))) {
-            // Whole dwords of a float element.
-            (Some(n), None, None) if !bytes && within.is_multiple_of(4) => (within / 4, n),
-            // All four bytes as normalized values, or some of the first.
-            (None, Some(n), Some((&[8, 8, 8, 8], Numeric::Unorm))) if bytes && within == 0 => (0, n),
-            // One byte as a normalized value.
-            (None, Some(1), Some((&[8], Numeric::Unorm))) if bytes => (within, 1),
-            _ => return Err("a vertex fetch of a form or format that is not handled"),
-        };
-        if first + count > channels {
-            return Err("a vertex fetch past its element");
-        }
+        let picked = vertex_fetch_channels(fetch, entry / 16, u32::from(*offset), name, *format)?;
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
-        for k in 0..count {
+        for (k, &(row, channel)) in picked.iter().enumerate() {
             let (id, col) = self
-                .find_input(e.row, (first + k) as u8)
+                .find_input(row, channel)
                 .ok_or("a vertex input the signature lacks")?;
             // (float elements arrive as their bits, normalized ones as the
             // float the typed load gives)
@@ -13989,7 +14029,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, vertex_fetch_channels};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -14556,6 +14596,48 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn vertex_fetches_by_their_elements() {
+        use crate::native::VsFetch;
+        let el = |row, offset, bytes, format| VsFetch { row, slot: 0, offset, bytes, format };
+        // R8G8B8A8_UNORM, two R32G32_FLOAT, R8G8B8A8_UINT, R16G16B16A16_FLOAT
+        let fetch = [
+            el(0, 0, 4, 28),
+            el(1, 4, 8, 16),
+            el(2, 12, 8, 16),
+            el(3, 20, 4, 30),
+            el(4, 24, 8, 10),
+        ];
+        let by = |byte, name, format| vertex_fetch_channels(&fetch, 0, byte, name, format);
+        // two neighbouring float pairs in one load
+        assert_eq!(
+            by(4, "buffer_load_dwordx4", None),
+            Ok(vec![(1, 0), (1, 1), (2, 0), (2, 1)])
+        );
+        // the last dword of the pair and the first of the next
+        assert_eq!(by(8, "buffer_load_dwordx2", None), Ok(vec![(1, 1), (2, 0)]));
+        // dwords that leave the elements, or read 8 or 16-bit ones
+        assert!(by(12, "buffer_load_dwordx4", None).is_err());
+        assert!(by(0, "buffer_load_dword", None).is_err());
+        assert!(by(24, "buffer_load_dword", None).is_err());
+        // 8_8_8_8_UNORM, all four, or 8_8_UNORM of the last two (z, w)
+        assert_eq!(by(0, "tbuffer_load_format_xyzw", Some(56)).unwrap().len(), 4);
+        assert_eq!(by(2, "tbuffer_load_format_xy", Some(14)), Ok(vec![(0, 2), (0, 3)]));
+        // 8_UINT of the uint element, not of the unorm one
+        assert_eq!(by(20, "tbuffer_load_format_x", Some(5)), Ok(vec![(3, 0)]));
+        assert!(by(0, "tbuffer_load_format_x", Some(5)).is_err());
+        // 16_16_16_16_FLOAT: xyz, or the second pair as 16_16_FLOAT
+        assert_eq!(
+            by(24, "tbuffer_load_format_xyz", Some(71)),
+            Ok(vec![(4, 0), (4, 1), (4, 2)])
+        );
+        assert_eq!(by(28, "tbuffer_load_format_xy", Some(29)), Ok(vec![(4, 2), (4, 3)]));
+        // a format of other channel widths or more channels than it has
+        assert!(by(24, "tbuffer_load_format_xy", Some(63)).is_err());
+        assert!(by(0, "tbuffer_load_format_xyzw", Some(14)).is_err());
+        assert!(by(2, "tbuffer_load_format_xyzw", Some(56)).is_err());
     }
 
     #[test]
