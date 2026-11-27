@@ -255,6 +255,23 @@ fn refuse_untranslated<'a>(stages: impl Iterator<Item = &'a [u8]>) -> Result<(),
     Ok(())
 }
 
+/// Translates `shaders` now, on the title's thread, and refuses the pipeline
+/// when one of them does not translate. A pipeline that is handed out and
+/// only fails later on a worker can never draw, and the title, told it
+/// exists, never falls back to the pipeline it makes when this call fails;
+/// refused here it answers as with the switch off, from the first run on.
+/// The shader cache makes a stage seen before cost a lookup; a new one is
+/// translated here instead of on a worker, once.
+fn refuse_failed(shaders: &[Arc<Shader>]) -> Result<(), Refusal> {
+    if !refusing() {
+        return Ok(());
+    }
+    if shaders.iter().any(|s| s.translated().is_none()) {
+        return Err("a stage that does not translate");
+    }
+    Ok(())
+}
+
 /// Device method 0x218: a compute pipeline from the pieces `desc` names,
 /// or why it is not made.
 pub(crate) fn compute(
@@ -268,6 +285,7 @@ pub(crate) fn compute(
     let container = compute_container(&d)?;
     refuse_untranslated(std::iter::once(container.as_slice()))?;
     let shader = shader_of("compute", Cow::Owned(container));
+    refuse_failed(std::slice::from_ref(&shader))?;
     Ok(hand_out(vec![shader], None, iid, out))
 }
 
@@ -370,6 +388,7 @@ pub(crate) fn graphics(
         .into_iter()
         .map(|(stage, bytes)| shader_of(stage, Cow::Owned(bytes)))
         .collect();
+    refuse_failed(&shaders)?;
     Ok(hand_out(shaders, Some(Box::new(state)), iid, out))
 }
 
