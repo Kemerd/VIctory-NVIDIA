@@ -1907,6 +1907,90 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res).map(|_| ())
     }
 
+    /// A wave32 pixel program: `body`, then an export of v3 to the first target.
+    fn exports_v3(body: &[u32]) -> Result<(), ShaderError> {
+        exports_v3_on(body, false)
+    }
+
+    /// [`exports_v3`] for a console wave of 64 lanes when `wave64` is set.
+    fn exports_v3_on(body: &[u32], wave64: bool) -> Result<(), ShaderError> {
+        let mut words = body.to_vec();
+        words.extend_from_slice(&[
+            0xF800_180F,
+            0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+            0xBF81_0000,
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            }],
+            false,
+        );
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+    }
+
+    /// "Some lane is left" of a mask operation (SCC of `s_and_b32 m, vcc_lo, exec_lo`), spread
+    /// by `s_cselect_b32 s, -1, 0` into a mask a select reads: the select stays
+    /// refused on a console wave of 32 lanes and of 64: the mask is not tracked.
+    #[test]
+    fn a_pixel_select_by_some_lane_of_a_mask_stays_refused() {
+        let body = [
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x7E04_0282, // v_mov_b32 v2, 2
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0x8704_7E6A, // s_and_b32 s4, vcc_lo, exec_lo
+            0x8506_80C1, // s_cselect_b32 s6, -1, 0
+            0xBEEA_0306, // s_mov_b32 vcc_lo, s6
+            0x0206_0501, // v_cndmask_b32 v3, v1, v2, vcc
+        ];
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let wave32 = exports_v3_on(&body, false);
+        let body64 = [
+            body[0],
+            body[1],
+            body[2],
+            0x8784_7E6A, // s_and_b64 s[4:5], vcc, exec
+            0x8586_80C1, // s_cselect_b64 s[6:7], -1, 0
+            0xBEEA_0406, // s_mov_b64 vcc, s[6:7]
+            body[6],
+        ];
+        let wave64 = exports_v3_on(&body64, true);
+        lower::TEST_HOST_WAVE.set(was);
+        for e in [wave32, wave64] {
+            let e = e.unwrap_err().to_string();
+            assert!(e.contains("a select on an untracked mask"), "{e}");
+        }
+    }
+
     /// The high dword of a wave64 mask rewritten alone (`s_mov_b32 vcc_hi`
     /// or `exec_hi`): lanes 32-63 took the mask the low dword was first
     /// written with (the compare's, EXEC's on entry). Now the store refuses;

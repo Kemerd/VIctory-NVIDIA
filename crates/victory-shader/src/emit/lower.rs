@@ -4557,7 +4557,7 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
+            Atom::Uniform(v) => match self.scc_value(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
                     let z = self.s.m.i32(0);
@@ -4974,7 +4974,13 @@ impl<'a> Lower<'a> {
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
         // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        // (and with host lanes, "some lane" is the host wave's: the console's where both have
+        // 32 lanes, which is what a count above zero asks too)
+        let host = self.mask_data == MaskData::Host
+            && !self.console_lanes
+            && !self.x.native.wave64
+            && host_max_wave() == 32;
+        if !(self.console_lanes || host) || self.local || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -7019,19 +7025,26 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        match self.scc_value(v)? {
+            Val::Bit(x) => Ok(x),
+            _ => Err("SCC without a value"),
+        }
+    }
+
+    /// An SCC value as data: of a mask operation, whether some lane is left.
+    fn scc_value(&mut self, v: Value) -> Result<Val, Why> {
         if self.x.st.scc_some.contains_key(&v)
             && matches!(self.vals.get(&v), None | Some(Val::Missing(_)))
         {
             let x = self.scc_some(v)?;
             self.vals.insert(v, Val::Bit(x));
-            return Ok(x);
+            return Ok(Val::Bit(x));
         }
         match self.get(v) {
-            Ok(Val::Bit(x)) => Ok(x),
-            Ok(_) => Err("SCC without a value"),
+            Ok(val) => Ok(val),
             // Of a mask operation whose result lies within EXEC: whether
             // some lane is left.
-            Err(LANE_MASK) if self.within_exec(v) => self.scc_some(v),
+            Err(LANE_MASK) if self.within_exec(v) => self.scc_some(v).map(Val::Bit),
             Err(why) => Err(why),
         }
     }
