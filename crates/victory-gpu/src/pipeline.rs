@@ -329,8 +329,8 @@ pub(crate) fn builder_rests(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    // (`VICTORY_BVH_BUILDER=1`, or `VICTORY_RT_NATIVE=1`, which asks for it.)
+    if !make::builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -339,6 +339,12 @@ pub(crate) fn builder_runs() -> bool {
     }
     if b.whole {
         return true;
+    }
+    // Those not made yet (a title that builds right after creating them)
+    // all go to the workers first, so that they are made side by side and
+    // this thread waits for the slowest instead of making each in turn.
+    for p in &b.pipelines {
+        make::ahead(p);
     }
     let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
     if !missing.is_empty() {
@@ -587,6 +593,13 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        drop(b);
+        // With the builder asked for, its programs go to the workers now:
+        // the title creates them minutes before its first build, and that
+        // first build needs every one of them in the same frame.
+        if make::builder_asked() {
+            make::ahead(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

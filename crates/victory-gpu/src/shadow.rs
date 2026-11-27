@@ -765,6 +765,17 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    // 32:9 patch (`crate::aspect`): the title's fresh projections are
+    // rewritten in its own memory before the copy takes them, so title, held
+    // copy and card all agree on the wide matrix and nothing re-syncs the
+    // narrow one back. Only runs when VICTORY_ASPECT is set.
+    if crate::aspect::target().is_some() {
+        for &(src, _, len) in &copies {
+            // SAFETY: the caller's ranges, the same assumption the copies
+            // below make of these very bytes.
+            crate::aspect::tune(unsafe { std::slice::from_raw_parts_mut(src as *mut u8, len) });
+        }
+    }
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
         wide(copy_jobs(copies));

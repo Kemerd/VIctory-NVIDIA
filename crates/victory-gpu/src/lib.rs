@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod aspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -127,6 +129,8 @@ pub fn frames_begun() -> u64 {
 }
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
+pub use memory::{structure_copied, structure_extent, structure_extent_from};
 #[cfg(windows)]
 pub use shadow::title_memory_write_combined;
 #[cfg(windows)]

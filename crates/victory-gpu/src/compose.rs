@@ -11,7 +11,11 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+#define RS "StaticConstants(b0, num32BitConstants=1), DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
+// The share of the screen width the interface may use (its aspect over the
+// output's): 0 leaves both planes full-frame exactly as before; below 1 the
+// interface is kept at its console aspect and the world keeps the bars.
+cbuffer Fit : register(b0) { float ui_fit; };
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
@@ -26,7 +30,15 @@ V vs(uint id : SV_VertexID) {
 [RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
-    float4 o = over.SampleLevel(smooth_, v.uv, 0);
+    float2 ouv = v.uv;
+    float inside = 1.0;
+    if (ui_fit > 0.0 && ui_fit < 1.0) {
+        // Map the centered ui_fit-wide band onto the interface's whole width;
+        // outside the band the plane reads as absent and the scene stands.
+        ouv.x = (v.uv.x - 0.5) / ui_fit + 0.5;
+        inside = (ouv.x >= 0.0 && ouv.x <= 1.0) ? 1.0 : 0.0;
+    }
+    float4 o = over.SampleLevel(smooth_, ouv, 0) * inside;
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
 "#;
@@ -36,6 +48,10 @@ pub(crate) struct Composer {
     pso: ID3D12PipelineState,
     views: Vec<ID3D12DescriptorHeap>,
     step: u32,
+    /// The aspect to keep the interface at (`VICTORY_UI_LETTERBOX=16x9`), or
+    /// `None` with everything as it was: unset, the fit constant is 0 and the
+    /// shader takes its original path untouched.
+    ui_aspect: Option<f32>,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Composer {}
@@ -103,12 +119,22 @@ impl Composer {
             desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
                 D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
             let pso = device.CreateGraphicsPipelineState(&desc)?;
+            // The interface's aspect to preserve, when asked for: "16x9" or
+            // a bare ratio. Anything unparseable leaves the patch off.
+            let ui_aspect = std::env::var("VICTORY_UI_LETTERBOX").ok().and_then(|v| {
+                let v = v.trim().to_owned();
+                match v.split_once(['x', 'X']) {
+                    Some((w, h)) => Some(w.trim().parse::<f32>().ok()? / h.trim().parse::<f32>().ok()?),
+                    None => v.parse::<f32>().ok(),
+                }
+            });
             Ok(Composer {
                 root,
                 pso,
                 views: Vec::new(),
                 step: device
                     .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+                ui_aspect,
             })
         }
     }
@@ -168,7 +194,22 @@ impl Composer {
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
-            list.SetGraphicsRootDescriptorTable(0, gpu);
+            // The band the interface keeps at its console aspect on this
+            // output: its share of the width (< 1 only on a wider screen),
+            // 0 to leave the shader on its original path.
+            let fit = match self.ui_aspect {
+                Some(a) if width != 0 => {
+                    let share = a * height as f32 / width as f32; // ui_aspect / screen_aspect
+                    if share < 1.0 && share > 0.0 {
+                        share
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            list.SetGraphicsRoot32BitConstant(0, fit.to_bits(), 0);
+            list.SetGraphicsRootDescriptorTable(1, gpu);
             list.IASetPrimitiveTopology(
                 windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             );

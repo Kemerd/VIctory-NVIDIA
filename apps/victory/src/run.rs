@@ -95,30 +95,41 @@ pub fn run(
         if upscaler.is_some() && render_1080p {
             println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
         }
-        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())?;
+        // `VICTORY_DISPLAY_WIDE=5120x1440`: the output patched to that size
+        // in place of 2560x1440 (`native_1440p::wide_asked`); a patched image
+        // of another size goes to a folder of its own (`wide`, empty at 16:9).
+        let (out_w, out_h) = native_1440p::wide_asked()?.unwrap_or((native_1440p::WIDTH, native_1440p::HEIGHT));
+        let is_wide = (out_w, out_h) != (native_1440p::WIDTH, native_1440p::HEIGHT);
+        let wide = if is_wide { format!("-{out_w}x{out_h}") } else { String::new() };
+        if is_wide && render_1080p {
+            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DISPLAY_WIDE's scene is the output's size");
+        }
+        let (w, h) = native_1440p::prepare_sized(&mut prepared, (out_w, out_h), render_1080p && upscaler.is_none() && !is_wide)?;
         // SAFETY: nothing else runs yet; the title and the display mode list
         // read these later.
         unsafe {
-            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{out_w}x{out_h}"));
             std::env::set_var("VICTORY_NATIVE_1440P", "1");
         }
         match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
             Some((mode, Ok(()))) => {
-                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                let [rw, rh] = mode.render_size([out_w, out_h]);
                 println!(
-                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
-                    native_1440p::WIDTH,
-                    native_1440p::HEIGHT,
+                    "display        {out_w}x{out_h} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
                     mode.name()
                 );
-                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+                cfg.cache_subdir(&format!("images/native-1440p{wide}-upscaler-{}-sdr", mode.name()))?
             }
             other => {
                 if let Some((_, Err(e))) = other {
                     println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 }
-                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+                println!("display        {out_w}x{out_h} SDR, scene {w}x{h}");
+                cfg.cache_subdir(&if render_1080p && !is_wide {
+                    "images/1080p-to-1440p-sdr".to_owned()
+                } else {
+                    format!("images/native-1440p{wide}-sdr")
+                })?
             }
         }
     } else if let Some(mode) = upscaler {
@@ -238,16 +249,21 @@ pub fn run(
     // The title's FidelityFX calls go through ours when DLSS or frame
     // generation is on (bound as before otherwise).
     let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    // The title's calls of its ray-tracing structure builder go through ours
+    // with `VICTORY_RT_NATIVE=1` (bound as before otherwise).
+    let interposed = victory_hle::modules::bvh_builder::Interpose { inner: &interposed };
     show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
-    // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
-    // clock ticks at that interval (victory-gpu), and the title is given
-    // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
-    // overrides it; `off` leaves the title alone).
+    // The frame rate (VICTORY_FRAME_INTERVAL_MS, or the launcher's
+    // VICTORY_FRAME_INTERVAL_US; off without either): our frame clock ticks
+    // at that interval (victory-gpu), and the title is given the matching
+    // rate in place of its setting's 30, so its timers step by the time a
+    // frame took and not by 1/30 s (VICTORY_TITLE_FPS overrides it; `off`
+    // leaves the title alone).
     #[cfg(windows)]
     if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
         use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};

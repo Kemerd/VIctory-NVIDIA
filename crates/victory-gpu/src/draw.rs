@@ -3691,6 +3691,10 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // (A builder dispatch's recording is timed in three parts for the
+        // by-address memory's line: the all-or-none check, the binding with
+        // its memory made ready, and the dispatch with what it writes.)
+        let timed = crate::pipeline::is_builder(self.pipeline as This).then(std::time::Instant::now);
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3718,6 +3722,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let timed = timed.map(|began| crate::memory::builder_time(0, began));
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3727,6 +3732,7 @@ impl State {
             }
             return;
         }
+        let timed = timed.map(|began| crate::memory::builder_time(1, began));
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
@@ -3754,6 +3760,9 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
+        if let Some(began) = timed {
+            crate::memory::builder_time(2, began);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()

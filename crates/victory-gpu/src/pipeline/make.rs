@@ -92,6 +92,19 @@ fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
 
+/// Whether the title's own ray tracing is asked for: its structure builder
+/// runs (`VICTORY_BVH_BUILDER=1`), which `VICTORY_RT_NATIVE=1` asks for as
+/// well (the title's calls of the builder then also go through
+/// `victory_hle::modules::bvh_builder`). With neither, nothing changes.
+pub(super) fn builder_asked() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| {
+        ["VICTORY_BVH_BUILDER", "VICTORY_RT_NATIVE"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|v| v == "1"))
+    })
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
         return Some("named in VICTORY_LEAVE_OUT, left out");
@@ -101,8 +114,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if builder_asked() {
             return false;
         }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
@@ -114,8 +126,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if builder_asked() {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
@@ -315,6 +326,25 @@ pub(crate) fn early(p: &Arc<Pending>) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, if p.scene_input { REQUESTED } else { EARLY });
     }
+}
+
+/// Queues `p` for the workers at once, ahead of any draw or dispatch: for
+/// pipelines that are all needed in the same instant (the structure
+/// builder's, which run all or none). Nothing waits here; [`now`] waits
+/// for one a worker has begun and makes one no worker has taken yet.
+///
+/// The builder's were made by [`now`] alone at first: one after the other
+/// on the title's recording thread at the first builder dispatch, some
+/// fifty programs at two to four a second on a cache that had none of
+/// them. The frame stood for 32 s and the title's own watchdog (30 s)
+/// ended the run.
+pub(super) fn ahead(p: &Arc<Pending>) {
+    // (One left out on purpose is never made; one without shaders has
+    // nothing to make.)
+    if p.left_out.is_some() || p.shaders.is_empty() {
+        return;
+    }
+    start(p, REQUESTED);
 }
 
 /// Whether the frame's budget is one for all threads together: a thread

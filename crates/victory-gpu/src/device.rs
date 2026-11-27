@@ -369,6 +369,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    #[cfg(windows)]
+    dump_unknown_pipeline(SLOT, calls, desc);
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.
@@ -397,6 +399,88 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         );
     }
     E_NOTIMPL
+}
+
+/// `VICTORY_PIPELINE_DUMP=<folder>` (a folder outside the repository: what
+/// goes there is the title's): what the two creation methods above were
+/// given, for the first [`DUMPED`] calls of each, so that they can be
+/// written. Per call `<slot>-<call>-desc.bin`, up to 512 bytes of the
+/// description, and one file for each thing it names:
+///
+/// - the description's first word is an object of ours (the root
+///   signature), then come pairs of a title address and a length (small
+///   records in one stretch of memory, and blocks a multiple of 64 bytes
+///   long in another): `-blob<n>-<length>.bin`, each whole;
+/// - after the pairs, title addresses without a length:
+///   `-word<n>.bin`, 256 bytes of each.
+///
+/// Everything is read through [`crate::host::read_there`]: none of these
+/// addresses is known to be mapped.
+#[cfg(windows)]
+fn dump_unknown_pipeline(slot: usize, calls: u32, desc: *const u8) {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+    /// Calls of each method written out.
+    const DUMPED: u32 = 48;
+    /// Title memory lies between these (above our own low memory, below the
+    /// host's own heaps).
+    const TITLE: std::ops::Range<u64> = 1 << 32..1 << 40;
+    /// The longest block taken for one.
+    const MOST: u64 = 4 << 20;
+    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let folder = FOLDER.get_or_init(|| {
+        let folder = std::env::var_os("VICTORY_PIPELINE_DUMP").map(PathBuf::from)?;
+        match std::fs::create_dir_all(&folder) {
+            Ok(()) => {
+                tracing::info!(folder = %folder.display(), "the unknown pipeline creation methods' descriptions are written out (VICTORY_PIPELINE_DUMP)");
+                Some(folder)
+            }
+            Err(e) => {
+                tracing::warn!(folder = %folder.display(), %e, "VICTORY_PIPELINE_DUMP: the folder cannot be made; nothing is written");
+                None
+            }
+        }
+    });
+    let Some(folder) = folder else { return };
+    if calls > DUMPED || desc.is_null() {
+        return;
+    }
+    let write = |name: String, bytes: &[u8]| {
+        if let Err(e) = std::fs::write(folder.join(&name), bytes) {
+            tracing::warn!(name, %e, "VICTORY_PIPELINE_DUMP: not written");
+        }
+    };
+    // The description itself: as much of 512 bytes as is there.
+    let mut head = [0u8; 512];
+    let there = crate::host::read_there(desc, &mut head);
+    if there < 16 {
+        return;
+    }
+    write(format!("{slot:03x}-{calls:03}-desc.bin"), &head[..there]);
+    let words: Vec<u64> = head[..there]
+        .chunks_exact(8)
+        .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+        .collect();
+    // Word 0 is the root signature; pairs of (address, length) follow for as
+    // long as they read as that.
+    let mut at = 1;
+    while let (Some(&address), Some(&len)) = (words.get(at), words.get(at + 1)) {
+        if !TITLE.contains(&address) || len == 0 || len > MOST {
+            break;
+        }
+        let mut block = vec![0u8; len as usize];
+        let got = crate::host::read_there(address as *const u8, &mut block);
+        write(format!("{slot:03x}-{calls:03}-blob{:02}-{len:x}.bin", (at - 1) / 2), &block[..got]);
+        at += 2;
+    }
+    // What follows: title addresses with no length beside them.
+    for (n, &word) in words.iter().enumerate().skip(at).take(16) {
+        if TITLE.contains(&word) {
+            let mut some = [0u8; 256];
+            let got = crate::host::read_there(word as *const u8, &mut some);
+            write(format!("{slot:03x}-{calls:03}-word{n:02}.bin"), &some[..got]);
+        }
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is

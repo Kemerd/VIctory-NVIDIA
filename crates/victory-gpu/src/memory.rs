@@ -203,6 +203,21 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Where the recording threads' time goes around the one mutex, in
+    /// microseconds over all threads: waiting for it at a dispatch; holding
+    /// it for the frame's first look (faults, the sweep), for new arenas,
+    /// for what the constants and the root views name, for the views and
+    /// the bringing up; and at a submission, waiting for it and landing.
+    /// (Run rt-2: 36 s of the recording threads a frame once 19 arenas were
+    /// held, against 95 ms without the builder, and no number said where.)
+    waited: u64,
+    held: [u64; 5],
+    landing: [u64; 2],
+    /// Times every copy was asked to be brought up to date by a list.
+    brought_up: u64,
+    /// Root views outside buffers made ready with a length the builder's
+    /// call gave ([`structure_extent`]), and with a guessed one.
+    sized: [u64; 2],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -789,8 +804,138 @@ impl Memory {
             s.came[3],
             self.faulted
         );
+        // Where the threads' time went (all threads' together, a frame).
+        let ms = |micros: u64| micros as f64 / 1000.0 / frames;
+        tracing::info!(
+            "title memory by address, time per frame over all threads: {:.1} ms waiting for the mutex at dispatches; under it {:.1} ms the frame's first look, \
+             {:.1} ms new arenas, {:.1} ms constants, {:.1} ms root views, {:.1} ms views and bringing up ({:.1} times every copy was brought up); \
+             at submissions {:.1} ms waiting for it and {:.1} ms landing; a builder dispatch's recording in all: {:.1} ms the all-or-none check, \
+             {:.1} ms binding, {:.1} ms the dispatch and what it writes; root views outside buffers sized by the builder's calls {:.1}, by a guess {:.1}",
+            ms(s.waited),
+            ms(s.held[0]),
+            ms(s.held[1]),
+            ms(s.held[2]),
+            ms(s.held[3]),
+            ms(s.held[4]),
+            s.brought_up as f64 / frames,
+            ms(s.landing[0]),
+            ms(s.landing[1]),
+            ms(BUILDER_TIME[0].swap(0, std::sync::atomic::Ordering::Relaxed)),
+            ms(BUILDER_TIME[1].swap(0, std::sync::atomic::Ordering::Relaxed)),
+            ms(BUILDER_TIME[2].swap(0, std::sync::atomic::Ordering::Relaxed)),
+            s.sized[0] as f64 / frames,
+            s.sized[1] as f64 / frames,
+        );
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// What the recording threads spend in the structure builder's dispatches
+/// since the last report, in microseconds over all threads: the
+/// all-or-none check, the binding (which makes the memory ready, above),
+/// and the dispatch itself with the noting of what it writes.
+static BUILDER_TIME: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Adds the time since `began` to part `part` of [`BUILDER_TIME`]; the
+/// moment the next part begins.
+pub(crate) fn builder_time(part: usize, began: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    if let Some(sum) = BUILDER_TIME.get(part) {
+        sum.fetch_add(now.duration_since(began).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    now
+}
+
+/// What the title's calls of its structure builder say lies where
+/// (`victory_hle::modules::bvh_builder`, with `VICTORY_RT_NATIVE=1`): the
+/// start of a structure being built or copied to, or of scratch memory, and
+/// its length in bytes as the builder's own size calculation gives it.
+/// Without that switch nothing is ever put in, and every dispatch is sized
+/// by the guesses ([`VIEW`], [`BUILT`]) as before.
+///
+/// A dispatch names its memory by root views, which have a start and no
+/// length. The guesses hold copies of 4 MiB of title memory for a structure
+/// of a few KiB, and stop short of one that is longer: a top level of
+/// 32,768 instances is 12 MB, and in run rt-3 some 800 pages a frame were
+/// still found without a copy, in one stretch of addresses, long after the
+/// faults' budget for the run was spent.
+static EXTENTS: std::sync::RwLock<std::collections::BTreeMap<u64, u64>> = std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Extents kept at most; past it all are let go (the builder's calls name
+/// the live ones again as they come) and it is said once.
+const EXTENTS_MOST: usize = 1 << 16;
+/// The longest extent taken at its word (a size past it is a misread call).
+const EXTENT_MOST: u64 = 4 * ARENA;
+
+/// The builder was told to use `len` bytes of title memory from `start`
+/// (see [`EXTENTS`]). An extent that begins inside it is replaced, and one
+/// that reaches into it from below is cut short: memory is reused for
+/// structures of other sizes.
+pub fn structure_extent(start: u64, len: u64) {
+    // Title memory the directory covers, and a length worth believing.
+    if start < 1 << 32 || len == 0 || len > EXTENT_MOST || start + len > u64::from(MEMORY_PAGES) * PAGE {
+        return;
+    }
+    let end = start + len;
+    let mut extents = EXTENTS.write().unwrap_or_else(|e| e.into_inner());
+    // (The same structure named again, frame after frame: nothing to do.)
+    if extents.get(&start) == Some(&len) {
+        return;
+    }
+    let inside: Vec<u64> = extents.range(start..end).map(|(&at, _)| at).collect();
+    for at in inside {
+        extents.remove(&at);
+    }
+    if let Some((&before, held)) = extents.range_mut(..start).next_back()
+        && before + *held > start
+    {
+        *held = start - before;
+    }
+    if extents.len() >= EXTENTS_MOST {
+        extents.clear();
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(EXTENTS_MOST, "title memory by address: more extents named by the builder's calls than are kept; all were let go"));
+    }
+    extents.insert(start, len);
+}
+
+/// The bytes from `at` to the end of the extent that holds it
+/// ([`structure_extent`]), if one does.
+pub fn structure_extent_from(at: u64) -> Option<u64> {
+    let extents = EXTENTS.read().unwrap_or_else(|e| e.into_inner());
+    let (&start, &len) = extents.range(..=at).next_back()?;
+    (at < start + len).then(|| start + len - at)
+}
+
+/// The builder was told to copy the structure at `source` to `dest`
+/// (compacting it). The title took the memory at `dest` by the compacted
+/// size it read at `size_at`, the title address the build was told to
+/// store that size at (0: not known): the copy's extent is that size, if
+/// what is there now reads as one (a multiple of 64 bytes, no longer than
+/// the structure it is a copy of). Otherwise nothing is noted, and the
+/// copy's dispatches are sized by the guess as before; the source's own
+/// length would reach over whatever lies behind the shorter copy.
+///
+/// Whether the size was plausible: said for the first calls
+/// (`VICTORY_RT_TRACE` logs them), since a size that is not is the title
+/// having read its slot before our submission landed there
+/// ([`sizes_wait`]).
+pub fn structure_copied(dest: u64, source: u64, size_at: u64) -> Option<u64> {
+    let whole = structure_extent_from(source)?;
+    if size_at < 1 << 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    // (Through the kernel: the slot is the title's, and may be gone.)
+    if !crate::host::read_into(size_at as *const u8, &mut bytes) {
+        return None;
+    }
+    let size = u64::from_le_bytes(bytes);
+    if size == 0 || size > whole || size % 64 != 0 {
+        return None;
+    }
+    structure_extent(dest, size);
+    Some(size)
 }
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
@@ -903,11 +1048,21 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
+    // (Timed in sections for the report's line: see `Stats::held`.)
+    let asked = std::time::Instant::now();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    let mut mark = std::time::Instant::now();
+    m.stats.waited += mark.duration_since(asked).as_micros() as u64;
+    // The time since the last mark goes to section `i`.
+    let mut section = |m: &mut Memory, i: usize| {
+        let now = std::time::Instant::now();
+        m.stats.held[i] += now.duration_since(mark).as_micros() as u64;
+        mark = now;
+    };
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
@@ -918,6 +1073,7 @@ pub(crate) fn ready(
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
     }
+    section(m, 0);
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
@@ -927,6 +1083,7 @@ pub(crate) fn ready(
         list.first_use(SIZES);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    section(m, 1);
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -956,6 +1113,7 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    section(m, 2);
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
@@ -980,11 +1138,16 @@ pub(crate) fn ready(
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
             list.defer_host(move || {
+                let asked = std::time::Instant::now();
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    let got = std::time::Instant::now();
                     m.land(at);
+                    m.stats.landing[0] += got.duration_since(asked).as_micros() as u64;
+                    m.stats.landing[1] += got.elapsed().as_micros() as u64;
                 }
             });
             m.bring_up(list);
+            m.stats.brought_up += 1;
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1002,7 +1165,10 @@ pub(crate) fn ready(
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
                 let before = held(m);
-                m.ready(at, BUILT);
+                // As long as the builder's call said it is, where it did.
+                let known = structure_extent_from(at);
+                m.stats.sized[usize::from(known.is_none())] += 1;
+                m.ready(at, known.unwrap_or(BUILT));
                 came[1] += held(m).saturating_sub(before);
             }
         }
@@ -1017,7 +1183,11 @@ pub(crate) fn ready(
                 came[3] += held(m).saturating_sub(before);
             }
             None => {
-                m.ready(at, if builds { VIEW } else { PAGE });
+                // A structure a program walks, or memory a stage reads: all
+                // of it where the builder's call gave its length.
+                let known = structure_extent_from(at);
+                m.stats.sized[usize::from(known.is_none())] += 1;
+                m.ready(at, known.unwrap_or(if builds { VIEW } else { PAGE }));
                 came[2] += held(m).saturating_sub(before);
             }
         }
@@ -1025,6 +1195,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    section(m, 3);
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
@@ -1062,6 +1233,7 @@ pub(crate) fn ready(
     if use_ == Use::Reads {
         m.dump.walked(addresses);
     }
+    section(m, 4);
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
