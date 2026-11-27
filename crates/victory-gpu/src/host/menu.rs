@@ -124,10 +124,20 @@ fn fps_line() -> Option<String> {
     if fps <= 0.0 {
         return None;
     }
-    Some(match crate::streamline::shown_per_frame() {
+    let mut line = match crate::streamline::shown_per_frame() {
         1 => format!("FPS: {fps:.1}"),
         per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
-    })
+    };
+    // a second line under it while host pipelines are still being made:
+    // draws that need one are dropped until it is, so a dark or patchy
+    // picture with this count up is the cache warming, not a fault (run 10:
+    // 600 queued at world entry after a translator change, a black screen
+    // for about a minute).
+    let making = crate::pipeline::making();
+    if making > 0 {
+        line.push_str(&format!("\nSHADERS: {making}"));
+    }
+    Some(line)
 }
 
 /// The index of `value` among the item's values (an unknown value: shown as
@@ -497,7 +507,12 @@ impl Menu {
             self.painted = line.clone();
             self.changed = true;
         }
-        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
+        // (the corner line may hold a second line, split at its newline)
+        let lines = if self.changed {
+            Some(line.as_ref().map_or_else(|| self.lines(), |l| l.split('\n').map(String::from).collect()))
+        } else {
+            None
+        };
         let Some(buffers) = &mut self.buffers else { return };
         if let Some(lines) = lines {
             self.changed = false;
@@ -505,7 +520,12 @@ impl Menu {
         }
         // The whole box in the middle, or of it the first line's part in the corner.
         let (w, h) = match &line {
-            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
+            Some(l) => {
+                // as wide as its longest line, as tall as its lines
+                let widest = l.split('\n').map(str::len).max().unwrap_or(0) as u32;
+                let rows = l.split('\n').count() as u32;
+                ((widest * CELL.0 + 2 * RIM) * scale, (rows * CELL.1 + 2 * RIM) * scale)
+            }
             None => size(scale),
         };
         let (w, h) = (w.min(width), h.min(height));
