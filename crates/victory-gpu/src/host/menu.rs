@@ -76,6 +76,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
     // The same builder, with the title's calls of it through `victory_hle::modules::bvh_builder`.
     Item { var: "VICTORY_RT_NATIVE", label: "RAY TRACING NATIVE (UNTESTED)", values: UNSET_ON, live: false },
+    // Reflex by itself (`streamline::reflex`): its sleep and the frame's own markers. Needs DLSS or frame
+    // generation on, which load Streamline.
+    Item { var: "VICTORY_REFLEX", label: "REFLEX (UNTESTED)", values: &[("", "OFF"), ("on", "ON"), ("boost", "ON + BOOST")], live: false },
     Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
     Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
     Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
