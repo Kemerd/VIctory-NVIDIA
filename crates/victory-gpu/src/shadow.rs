@@ -2251,6 +2251,90 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Whether `VICTORY_REFRESH_SPLIT=1`: it answers which of the ~60 MB a frame
+/// copied into CPU sides truly changed and where the no-op checks' time goes.
+/// Stats only; with it unset nothing below takes a clock, reads title or
+/// CPU-side memory, or touches a counter.
+pub(crate) fn refresh_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_REFRESH_SPLIT").is_ok_and(|v| v == "1"))
+}
+
+/// Since the last line: [0] calls of `Shadow::nothing_new`, [1] nanoseconds in
+/// them (all threads together), [2] bytes copied of pages never taken before,
+/// [3] bytes copied of pages taken before and written since, [4] runs taken,
+/// [5] rewritten pages sampled, [6] sampled pages equal to title memory in
+/// all three probes.
+pub(crate) static REFRESH_SPLIT: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Where in a sampled page the three probes lie, and how long each is.
+const PROBES: [usize; 3] = [0, 2048, PAGE - 16];
+
+/// Whether the three 16-byte probes of title memory and of the copy's CPU
+/// side are equal: a difference proves the page changed, equality only says
+/// it may not have.
+fn probes_equal(title: &[[u8; 16]; 3], held: &[[u8; 16]; 3]) -> bool {
+    title == held
+}
+
+/// Which of each 64 pages [`sample_rewrites`] takes; moves on at every call so
+/// the samples do not lie on the same addresses every frame.
+static SAMPLE_PHASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Samples one page in 64 of a rewritten run `[from, to)` against title
+/// memory, before the copy overwrites the CPU side. Sparse on purpose: the
+/// CPU side may be write-combined memory, which is slow to read. Only the
+/// runs `take` copies (not the ones `take_landed` does) are sampled.
+fn sample_rewrites(data: *const u8, start: usize, from: usize, to: usize) {
+    if data.is_null() {
+        return;
+    }
+    let first = from.div_ceil(PAGE).max(start.div_ceil(PAGE));
+    // the first page at or after `first` that is the phase's one in 64
+    let phase = SAMPLE_PHASE.fetch_add(7, Ordering::Relaxed) % 64;
+    let mut page = first + (phase + 64 - first % 64) % 64;
+    while (page + 1) * PAGE <= to {
+        let p = page * PAGE;
+        let (mut title, mut held) = ([[0u8; 16]; 3], [[0u8; 16]; 3]);
+        let mut read = true;
+        for (i, off) in PROBES.iter().enumerate() {
+            read &= crate::host::read_into((p + off) as *const u8, &mut title[i]);
+            // SAFETY: inside the mapping, and this range is one `update` hands to take only after leaving pending ranges alone, so no shader range holds it.
+            held[i] = unsafe { std::ptr::read_unaligned(data.add(p + off - start) as *const [u8; 16]) };
+        }
+        // A page that could not be read tells nothing.
+        if read {
+            REFRESH_SPLIT[5].fetch_add(1, Ordering::Relaxed);
+            if probes_equal(&title, &held) {
+                REFRESH_SPLIT[6].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        page += 64;
+    }
+}
+
+/// Logs and clears [`REFRESH_SPLIT`], per frame; nothing if the switch is off
+/// or nothing was counted.
+pub(crate) fn refresh_split_line(frames: f64) {
+    if !refresh_split() {
+        return;
+    }
+    let c: [f64; 7] = std::array::from_fn(|i| REFRESH_SPLIT[i].swap(0, Ordering::Relaxed) as f64);
+    if c.iter().all(|&v| v == 0.0) {
+        return;
+    }
+    let frames = frames.max(1.0);
+    let (checks, ms) = (c[0] / frames, c[1] / 1e6 / frames);
+    let (a, b) = (c[2] / 1e6 / frames, c[3] / 1e6 / frames);
+    let runs = c[4] / frames;
+    let avg_kb = if c[4] > 0.0 { (c[2] + c[3]) / 1e3 / c[4] } else { 0.0 };
+    let (s, e) = (c[5] / frames, c[6] / frames);
+    let pct = if c[5] > 0.0 { 100.0 * (c[5] - c[6]) / c[5] } else { 0.0 };
+    tracing::info!(
+        "host copies' refreshes, per frame (VICTORY_REFRESH_SPLIT=1): {checks:.0} checks of 'nothing new' taking {ms:.2} ms on all threads together; {a:.1} MB copied of pages never taken before, {b:.1} MB of pages taken before and written since, in {runs:.0} runs ({avg_kb:.1} KB a run); of {s:.0} sampled rewritten pages {e:.0} matched title memory in all three probes, so at least {pct:.0} % of them truly changed"
+    );
+}
+
 /// Title memory the title asked for write-combined (the console's 0x400
 /// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
 static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
@@ -3047,7 +3131,16 @@ mod landing_tests {
 
 #[cfg(test)]
 mod parts_tests {
-    use super::{PAGE, by_parts};
+    use super::{PAGE, by_parts, probes_equal};
+
+    #[test]
+    fn one_differing_probe_proves_a_change() {
+        let title = [[1u8; 16], [2u8; 16], [3u8; 16]];
+        let mut held = title;
+        assert!(probes_equal(&title, &held));
+        held[2][15] ^= 1;
+        assert!(!probes_equal(&title, &held));
+    }
 
     #[test]
     fn runs_are_cut_to_the_parts_written() {
@@ -4120,6 +4213,18 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        if !refresh_split() {
+            return self.nothing_new_untimed(address, len);
+        }
+        let began = std::time::Instant::now();
+        let same = self.nothing_new_untimed(address, len);
+        REFRESH_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+        REFRESH_SPLIT[1].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        same
+    }
+
+    /// [`Shadow::nothing_new`] without the clock.
+    fn nothing_new_untimed(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -4295,6 +4400,11 @@ impl Shadow {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
         let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
+        if refresh_split() {
+            for &(a, b, known) in &runs {
+                REFRESH_SPLIT[if known { 3 } else { 2 }].fetch_add((b - a) as u64, Ordering::Relaxed);
+            }
+        }
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
@@ -4421,6 +4531,9 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
+        if refresh_split() {
+            REFRESH_SPLIT[4].fetch_add(1, Ordering::Relaxed);
+        }
         thread_local! {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -4428,6 +4541,9 @@ impl Shadow {
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
+            }
+            if known && refresh_split() {
+                sample_rewrites(self.data as *const u8, self.start as usize, from, to);
             }
             return self.copy(from, to);
         };
