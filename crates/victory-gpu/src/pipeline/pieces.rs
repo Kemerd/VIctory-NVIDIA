@@ -272,6 +272,19 @@ fn refuse_failed(shaders: &[Arc<Shader>]) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// `VICTORY_PIPELINE_PIECES_ONLY=compute` or `=graphics`, read once: only
+/// that kind of pipeline is made from pieces and the other kind is refused
+/// as with the switch off, so a wrong picture can be put down to one kind
+/// in a run. Unset, both kinds are made.
+fn kind_refused(kind: &str) -> Result<(), Refusal> {
+    static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| std::env::var("VICTORY_PIPELINE_PIECES_ONLY").ok().filter(|v| !v.is_empty()));
+    match only {
+        Some(only) if only != kind => Err("a kind of pipeline left to the title (VICTORY_PIPELINE_PIECES_ONLY)"),
+        _ => Ok(()),
+    }
+}
+
 /// Device method 0x218: a compute pipeline from the pieces `desc` names,
 /// or why it is not made.
 pub(crate) fn compute(
@@ -279,6 +292,7 @@ pub(crate) fn compute(
     iid: *const Iid,
     out: *mut This,
 ) -> Result<HRESULT, Refusal> {
+    kind_refused("compute")?;
     let d: ComputeDesc = described(desc, size_of::<ComputeDesc>())
         .ok_or("a description that is not there to read")?;
     rooted(d.root)?;
@@ -380,6 +394,7 @@ pub(crate) fn graphics(
     out: *mut This,
 ) -> Result<HRESULT, Refusal> {
     // (what is not there of the words after the stages reads as zero)
+    kind_refused("graphics")?;
     let d: GraphicsDesc = described(desc, 0x68).ok_or("a description that is not there to read")?;
     rooted(d.root)?;
     let (stages, state) = graphics_parts(&d)?;
