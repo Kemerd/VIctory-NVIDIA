@@ -577,11 +577,26 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
     // CB_BLENDn_CONTROL: colour source (bits 0-4), function (5-7) and
     // destination (8-12), the same for alpha from bit 16, separate alpha
     // (29), enable (30). CB_TARGET_MASK: four write bits a target.
+    //
+    // The numbering is Mesa's `BlendOp` of gfx6-gfx10.3
+    // (src/amd/registers/gfx103.json; gfx11 renumbers 11 and up). 11 and 12
+    // (BOTH_SRC_ALPHA, BOTH_INV_SRC_ALPHA) are Direct3D 9's, which Mesa never
+    // sets, and 19 and 20 (the constant's alpha) need D3D12's ALPHA_FACTOR,
+    // which only some devices have (D3D12_OPTIONS13 AlphaBlendFactorSupported):
+    // all four stay refused. The constant is the title's OMSetBlendFactor.
     let factor = |v: u32| match v {
         // zero, one, source colour and its inverse, source alpha and its
         // inverse, destination alpha and its inverse, destination colour
         // and its inverse, source alpha saturated
         0..=10 => Some(D3D12_BLEND(v as i32 + 1)),
+        // constant colour and its inverse
+        13 => Some(D3D12_BLEND_BLEND_FACTOR),
+        14 => Some(D3D12_BLEND_INV_BLEND_FACTOR),
+        // the second colour export: colour and alpha, and their inverses
+        15 => Some(D3D12_BLEND_SRC1_COLOR),
+        16 => Some(D3D12_BLEND_INV_SRC1_COLOR),
+        17 => Some(D3D12_BLEND_SRC1_ALPHA),
+        18 => Some(D3D12_BLEND_INV_SRC1_ALPHA),
         _ => None,
     };
     // The alpha channel has no colour to blend with: the hardware reads a
@@ -595,6 +610,8 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
             D3D12_BLEND_INV_SRC_COLOR => D3D12_BLEND_INV_SRC_ALPHA,
             D3D12_BLEND_DEST_COLOR => D3D12_BLEND_DEST_ALPHA,
             D3D12_BLEND_INV_DEST_COLOR => D3D12_BLEND_INV_DEST_ALPHA,
+            D3D12_BLEND_SRC1_COLOR => D3D12_BLEND_SRC1_ALPHA,
+            D3D12_BLEND_INV_SRC1_COLOR => D3D12_BLEND_INV_SRC1_ALPHA,
             other => other,
         })
     };
@@ -637,6 +654,30 @@ fn state_of(g: &Graphics) -> Result<GraphicsState, Refusal> {
                 v,
             ));
         };
+        // Dual-source blending: D3D12 wants the program to write
+        // SV_Target0 and SV_Target1 and one render target bound. The pixel
+        // stage declares SV_Target<n> for every export of
+        // SPI_SHADER_COL_FORMAT, so the second export is SV_Target1; only
+        // that form is taken, on target 0.
+        let dual = |b: D3D12_BLEND| {
+            matches!(
+                b,
+                D3D12_BLEND_SRC1_COLOR
+                    | D3D12_BLEND_INV_SRC1_COLOR
+                    | D3D12_BLEND_SRC1_ALPHA
+                    | D3D12_BLEND_INV_SRC1_ALPHA
+            )
+        };
+        if [src, dst, src_alpha, dst_alpha].into_iter().any(dual) {
+            let exports = g.colour_exports();
+            if n != 0 || g.targets != 1 || exports & 0xf == 0 || exports & 0xf0 == 0 || exports >> 8 != 0 {
+                return Err(unknown(
+                    "dual-source blending other than on the only render target, fed by exactly two colour exports",
+                    "CB_BLEND_CONTROL",
+                    v,
+                ));
+            }
+        }
         // (bits 13-15 and 31, the latter the raster operation's switch,
         // were set or clear without any other change)
         to.BlendEnable = true.into();
@@ -1141,6 +1182,31 @@ mod tests {
             (t.SrcBlendAlpha, t.DestBlendAlpha),
             (D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA)
         );
+    }
+
+    #[test]
+    fn constant_factors_map_and_the_unsettled_ones_are_refused() {
+        // constant colour and its inverse, in colour and (read as alpha) in alpha
+        let s = blended(1 << 30 | 14 << 8 | 13);
+        let t = &s.blend.RenderTarget[0];
+        assert_eq!((t.SrcBlend, t.DestBlend), (D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR));
+        assert_eq!(
+            (t.SrcBlendAlpha, t.DestBlendAlpha),
+            (D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR)
+        );
+        // BOTH_SRC_ALPHA (11), BOTH_INV_SRC_ALPHA (12), CONSTANT_ALPHA (19, 20)
+        for bad in [11, 12, 19, 20] {
+            let mut packet = graphics_packet();
+            put(&mut packet, 0x7c, 0x00cc_0010);
+            put(&mut packet, 0xd0, 1 << 30 | bad);
+            assert!(state_of(&Graphics::parse(&packet, &state_piece(), false).unwrap()).is_err());
+        }
+        // dual-source needs the second colour export, which a packet without
+        // a pixel stage does not have
+        let mut packet = graphics_packet();
+        put(&mut packet, 0x7c, 0x00cc_0010);
+        put(&mut packet, 0xd0, 1 << 30 | 15 << 8 | 1);
+        assert!(state_of(&Graphics::parse(&packet, &state_piece(), false).unwrap()).is_err());
     }
 
     #[test]

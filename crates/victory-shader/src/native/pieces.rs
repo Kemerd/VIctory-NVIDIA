@@ -612,6 +612,12 @@ pub struct Graphics {
 }
 
 impl Graphics {
+    /// `SPI_SHADER_COL_FORMAT` of the pixel stage: a nibble per colour
+    /// export, 0 for none (all zero without a pixel stage).
+    pub fn colour_exports(&self) -> u32 {
+        self.pixel.as_ref().map_or(0, |p| p.col_format)
+    }
+
     /// Reads a graphics packet and its state piece; `pixel` says whether
     /// the description has a pixel stage. Refuses what the layouts in the
     /// module notes do not cover, and every value whose meaning for a
@@ -2414,6 +2420,17 @@ mod tests {
             why(&p, &state_piece(&ELEMENTS)),
             "SPI_PS_INPUT_CNTL OFFSET (bits 0-5) of 0x21 or more"
         );
+    }
+
+    #[test]
+    fn colour_exports_are_the_pixel_stages_col_format() {
+        let mut p = graphics_packet(true, 1, &[(0, false)]);
+        put(&mut p, G_COL_FORMAT, 0x44);
+        let g = Graphics::parse(&p, &state_piece(&ELEMENTS), true).unwrap();
+        assert_eq!(g.colour_exports(), 0x44);
+        let none = graphics_packet(false, 0, &[]);
+        let g = Graphics::parse(&none, &state_piece(&ELEMENTS), false).unwrap();
+        assert_eq!(g.colour_exports(), 0);
     }
 
     #[test]
