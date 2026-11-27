@@ -83,6 +83,13 @@ static ON_THEIR_WAY: Mutex<Vec<(u64, Arc<Job>)>> = Mutex::new(Vec::new());
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static LANDED: Condvar = Condvar::new();
 static BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Uploads on their way on the copy queue now (zero unless `VICTORY_UPLOAD_AHEAD`
+/// is on), for the lines under the frame rate (`crate::loading`).
+pub(crate) fn in_flight() -> usize {
+    // a display number only, so a relaxed load is enough
+    IN_FLIGHT.load(Relaxed)
+}
 /// Since the start: uploads, bytes, microseconds from the asking until the
 /// copy had run, the longest; askings turned down; waits of lists.
 static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
