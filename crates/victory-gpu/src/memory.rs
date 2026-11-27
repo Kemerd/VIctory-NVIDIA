@@ -108,6 +108,8 @@ const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// Frames after an arena could not be had before another is asked for.
+const ARENA_AGAIN: u64 = 30;
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -178,6 +180,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// No arena is asked for before this frame ([`Memory::another`]).
+    no_arena_before: u64,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -218,6 +222,8 @@ struct Stats {
     /// Root views outside buffers made ready with a length the builder's
     /// call gave ([`structure_extent`]), and with a guessed one.
     sized: [u64; 2],
+    /// Times an arena could not be had.
+    no_arena: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -268,6 +274,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            no_arena_before: 0,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -405,11 +412,38 @@ impl Memory {
 
     /// Another arena's pages.
     fn another(&mut self) -> bool {
-        let Some(at) = crate::upload::reserve(ARENA as usize) else {
+        // One that could not be had is not asked for again at once: every
+        // builder dispatch comes through here, a thousand and more a frame,
+        // and a search of the title's whole address space that finds no
+        // room takes milliseconds (runs rt-2 and rt-4: 5 to 18 s of every
+        // frame went here, under the mutex, and the title's watchdog ended
+        // both runs).
+        if self.frame < self.no_arena_before {
             return false;
+        }
+        let failed = |m: &mut Memory, what: &'static str, error: u32| {
+            m.no_arena_before = m.frame + ARENA_AGAIN;
+            m.stats.no_arena += 1;
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    what,
+                    error,
+                    arenas = m.arenas.len(),
+                    pages = m.pages.len(),
+                    "title memory by address: another arena could not be had; pages without a place read zeros until one can"
+                );
+            }
+            false
+        };
+        // (Where shaders do not look for it: they get its copy's number.)
+        let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize) else {
+            return failed(self, "no address space for it", crate::upload::last_error());
         };
         let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
-            return false;
+            // (Its memory is of no use without its copy.)
+            crate::upload::release(at);
+            return failed(self, "no copy of it on the host", 0);
         };
         self.arenas.push((n, at));
         // The lowest first.
@@ -810,7 +844,8 @@ impl Memory {
             "title memory by address, time per frame over all threads: {:.1} ms waiting for the mutex at dispatches; under it {:.1} ms the frame's first look, \
              {:.1} ms new arenas, {:.1} ms constants, {:.1} ms root views, {:.1} ms views and bringing up ({:.1} times every copy was brought up); \
              at submissions {:.1} ms waiting for it and {:.1} ms landing; a builder dispatch's recording in all: {:.1} ms the all-or-none check, \
-             {:.1} ms binding, {:.1} ms the dispatch and what it writes; root views outside buffers sized by the builder's calls {:.1}, by a guess {:.1}",
+             {:.1} ms binding, {:.1} ms the dispatch and what it writes; root views outside buffers sized by the builder's calls {:.1}, by a guess {:.1}; \
+             arenas that could not be had since the last line: {}",
             ms(s.waited),
             ms(s.held[0]),
             ms(s.held[1]),
@@ -825,6 +860,7 @@ impl Memory {
             ms(BUILDER_TIME[2].swap(0, std::sync::atomic::Ordering::Relaxed)),
             s.sized[0] as f64 / frames,
             s.sized[1] as f64 / frames,
+            s.no_arena,
         );
         self.stats.from = Some((now, self.frame));
     }

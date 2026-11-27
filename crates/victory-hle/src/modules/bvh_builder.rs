@@ -394,6 +394,20 @@ extern "system" fn build_batched(this: *mut c_void, list: *mut c_void, count: u3
             "ray tracing trace: build batched{}",
             dwords(peek(descs.cast(), PEEK))
         );
+        // What the first build is made of: its geometry descriptions (a
+        // bottom level's; the console's layout of them is not known to be
+        // the PC's) or the start of its instances (a top level's), as
+        // dwords. The title's memory, which its builder reads on the CPU
+        // for the sizes.
+        if let Some(first) = some.first() {
+            tracing::info!(
+                kind = first.build.inputs.kind,
+                count = first.build.inputs.count,
+                layout = first.build.inputs.layout,
+                "ray tracing trace: the first build's inputs{}",
+                dwords(peek(first.build.inputs.descs as *const u8, PEEK))
+            );
+        }
     }
     extents(this, descs.cast(), count);
     let started = Instant::now();
