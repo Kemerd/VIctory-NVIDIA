@@ -9355,6 +9355,7 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            crate::texture::look_once_line(frames);
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {
@@ -9463,6 +9464,7 @@ impl Meter {
                         crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20
                     );
                 }
+                crate::texture::staging_zeros_line();
                 let served = crate::descriptor::host::SERVED.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
                 if served[0] + served[3] > 0 {
                     tracing::info!(
@@ -9627,7 +9629,8 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); title buffer copies done on the CPU \
+                     looked for among them {:.1} times ({:.2} ms), {:.1} copies found (VICTORY_SEND_COPIED_FIND)",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -9637,7 +9640,10 @@ impl Meter {
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    per_frame(10),
+                    per_frame(11) / 1e6,
+                    per_frame(12)
                 );
             }
             tracing::info!(
@@ -11242,6 +11248,58 @@ mod refresh_tests {
         }
         // SAFETY: as above.
         assert_eq!(unsafe { data.add(2 * PAGE + 129).read() }, 9);
+    }
+
+    /// A copy by address of fresh memory of ours (`VICTORY_MEMORY_FRESH`):
+    /// its first refresh takes the page written before it and nothing else,
+    /// a range nothing wrote is known as it was, and a page written later is
+    /// taken by the next refresh. Made without the switch, the first refresh
+    /// sends all of it up.
+    #[test]
+    fn fresh_memory_goes_up_where_it_was_written() {
+        const LEN: usize = 4 * PAGE;
+        // An asking before the memory is made, as the title's memory has
+        // been asked about long before an arena is: the copy's pages are
+        // noted as taken at asking 1, and every write to the memory is noted
+        // later than that.
+        let before = title(PAGE, false);
+        let _ = crate::watch::writes(before, before + PAGE, true);
+        let region = title(LEN, false);
+        // SAFETY (all blocks): the test's own memory.
+        unsafe { ((region + PAGE + 8) as *mut u32).write_volatile(5) };
+        let data = memory(LEN);
+        let copy = Shadow::unbacked_by_address(region as u64, data, LEN as u64, true);
+        copy.update(region, LEN);
+        let first = copy.take_dirty();
+        assert!(!first.is_empty(), "the page written before is taken");
+        assert!(first.iter().all(|&(a, b)| a >= PAGE && b <= 2 * PAGE && a < b), "nothing beside it: {first:?}");
+        assert!(first.iter().any(|&(a, b)| a <= PAGE + 8 && b >= PAGE + 12));
+        assert_eq!(unsafe { (data.add(PAGE + 8) as *const u32).read() }, 5);
+        // Nothing written since: known as it was, and nothing goes up.
+        let mut known = false;
+        for _ in 0..100 {
+            crate::watch::ask_once(&[(region, region + LEN)]);
+            known = copy.nothing_new(region, LEN);
+            copy.update(region, LEN);
+            crate::watch::ask_once_end();
+            if known {
+                break;
+            }
+        }
+        assert!(known, "a range nothing wrote is known");
+        assert_eq!(copy.take_dirty(), []);
+        // Written later: taken by the next refresh.
+        unsafe { ((region + 3 * PAGE + 64) as *mut u32).write_volatile(7) };
+        copy.update(region, LEN);
+        let later = copy.take_dirty();
+        assert!(!later.is_empty() && later.iter().all(|&(a, b)| a >= 3 * PAGE && b <= LEN), "{later:?}");
+        assert_eq!(unsafe { (data.add(3 * PAGE + 64) as *const u32).read() }, 7);
+        // Without the switch: the first refresh sends all of it.
+        let other = title(LEN, false);
+        let side = memory(LEN);
+        let plain = Shadow::unbacked_by_address(other as u64, side, LEN as u64, false);
+        plain.update(other, LEN);
+        assert_eq!(plain.take_dirty(), [(0, LEN)]);
     }
 
     /// The refreshes of a frame as run record-1 had them: 30 submissions, the

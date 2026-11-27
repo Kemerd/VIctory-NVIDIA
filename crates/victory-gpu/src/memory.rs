@@ -126,6 +126,115 @@ const SWEEP: usize = 128;
 /// Frames after an arena could not be had before another is asked for.
 const ARENA_AGAIN: u64 = 30;
 
+/// Whether the next arena is made ahead, by a thread of its own
+/// (`VICTORY_MEMORY_ARENAS_AHEAD=1`, off by default; with it unset no
+/// thread is started and [`Memory::another`] makes every arena as before).
+///
+/// An arena is a search of the address space for 64 MiB and two 64 MiB
+/// D3D12 buffers made resident and mapped, and it is made on a recording
+/// thread under the one mutex: 13 arenas at about 19.4 ms each, 252 ms
+/// once in the first ten seconds of run rt-b, about 40 ms in each later 10
+/// s window, and single arenas of up to about 0.6 s in the newest run;
+/// nothing without the title's ray tracing (`VICTORY_RT_NATIVE`), where a
+/// run holds one arena. The thread only makes the memory and the copy, with
+/// no lock held, and parks the pair in [`Memory::ahead`]; `another` alone
+/// numbers an arena and hands out its pages, so lists learn of it when
+/// they do today, and no arena more than today is numbered (each numbered
+/// copy is refreshed and asked of the write watch at every submission that
+/// reads by address). It is asked for only from a builder's dispatch, while
+/// fewer than twice [`SPARE`] pages are free. It removes a hitch; it is not
+/// the cause of the 300-450 ms streaming frames.
+fn arenas_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_ARENAS_AHEAD").is_some_and(|v| v == "1"))
+}
+
+/// The arenas thread's call: set and told when an arena is wanted.
+static AHEAD: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+/// An arena is asked of the thread or being made (or the thread could not
+/// be started: then it stays set and nothing is asked again).
+static AHEAD_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// After a failure the thread is not asked before this frame; the
+/// recording threads keep their own pause ([`Memory::no_arena_before`]).
+static AHEAD_PAUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Since the last report: arenas the thread made, its microseconds, and the
+/// times it could not make one.
+static AHEAD_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether another arena is wanted ahead with `free` pages free, `held`
+/// held and `copies` numbered: fewer than twice [`SPARE`] free, and room
+/// for all of its pages and for its number.
+fn want_ahead(free: usize, held: usize, copies: usize) -> bool {
+    free < 2 * SPARE && held + free + (ARENA / PAGE) as usize <= MOST && copies < COPIES as usize
+}
+
+/// Asks the arenas thread for an arena, starting it the first time. Called
+/// with the mutex held: it only sets a flag and wakes the thread.
+fn wake_ahead() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if crate::frame::current() < AHEAD_PAUSED.load(Relaxed) || AHEAD_BUSY.swap(true, Relaxed) {
+        return;
+    }
+    static STARTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let started = *STARTED.get_or_init(|| {
+        let spawned = std::thread::Builder::new().name("victory-arenas".into()).spawn(make_ahead).is_ok();
+        if !spawned {
+            tracing::warn!("title memory by address: the arenas thread could not be started; arenas are made as before");
+        }
+        spawned
+    });
+    if !started {
+        return;
+    }
+    *AHEAD.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    AHEAD.1.notify_one();
+}
+
+/// The arenas thread: makes an arena's memory and copy with no lock held,
+/// then takes the mutex alone to park them for [`Memory::another`].
+fn make_ahead() {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        {
+            let mut asked = AHEAD.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*asked {
+                asked = AHEAD.1.wait(asked).unwrap_or_else(|e| e.into_inner());
+            }
+            *asked = false;
+        }
+        let started = std::time::Instant::now();
+        // (Fresh: nothing wrote it, and it starts as zeros on both sides.)
+        let made = crate::upload::reserve_out_of_reach(ARENA as usize).and_then(|at| {
+            let copy = crate::shadow::by_address(at as u64, ARENA, true);
+            if copy.is_none() {
+                crate::upload::release(at);
+            }
+            copy.map(|copy| (at, copy))
+        });
+        match made {
+            None => {
+                AHEAD_STATS[2].fetch_add(1, Relaxed);
+                AHEAD_PAUSED.store(crate::frame::current() + ARENA_AGAIN, Relaxed);
+            }
+            Some((at, copy)) => {
+                AHEAD_STATS[0].fetch_add(1, Relaxed);
+                AHEAD_STATS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+                let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_mut() {
+                    Some(m) if m.ahead.is_none() => m.ahead = Some((at, copy)),
+                    // (Not wanted after all: its copy goes before its memory.)
+                    _ => {
+                        drop(guard);
+                        drop(copy);
+                        crate::upload::release(at);
+                    }
+                }
+            }
+        }
+        AHEAD_BUSY.store(false, Relaxed);
+    }
+}
+
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
@@ -197,6 +306,9 @@ struct Memory {
     refused: std::collections::HashSet<u64>,
     /// No arena is asked for before this frame ([`Memory::another`]).
     no_arena_before: u64,
+    /// With [`arenas_ahead`]: an arena the thread made, its memory and its
+    /// copy, not numbered yet; [`Memory::another`] takes it.
+    ahead: Option<(usize, Arc<Shadow>)>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -239,6 +351,9 @@ struct Stats {
     sized: [u64; 2],
     /// Times an arena could not be had.
     no_arena: u64,
+    /// With [`arenas_ahead`]: arenas taken from the thread's slot, and
+    /// arenas made on a recording thread under the mutex.
+    arenas_made: [u64; 2],
     /// Of the pages shaders found empty: those below 4 GiB (not memory of
     /// the title's the directory covers: an offset on a base that read 0),
     /// those inside a structure the builder's calls named, and those of the
@@ -268,7 +383,8 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        let directory = crate::shadow::by_address(entries as u64, bytes)?;
+        // (Fresh: nothing wrote it, and it starts as zeros on both sides.)
+        let directory = crate::shadow::by_address(entries as u64, bytes, true)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
         let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
@@ -297,6 +413,7 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             no_arena_before: 0,
+            ahead: None,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -404,7 +521,8 @@ impl Memory {
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
         if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
-            if let Some(shadow) = crate::shadow::by_address(start, PAGE)
+            // (Title memory: its bytes are the title's, never fresh.)
+            if let Some(shadow) = crate::shadow::by_address(start, PAGE, false)
                 && let Some(n) = self.number(shadow)
             {
                 self.windows += 1;
@@ -458,11 +576,26 @@ impl Memory {
             }
             false
         };
-        // (Where shaders do not look for it: they get its copy's number.)
-        let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize) else {
-            return failed(self, "no address space for it", crate::upload::last_error());
+        // One the thread made ahead ([`arenas_ahead`]) is numbered here, as
+        // one made now would be: every list learns of it at the same moment.
+        let (at, copy) = match self.ahead.take() {
+            Some((at, copy)) => {
+                self.stats.arenas_made[0] += 1;
+                (at, Some(copy))
+            }
+            None => {
+                // (Where shaders do not look for it: they get its copy's number.)
+                let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize) else {
+                    return failed(self, "no address space for it", crate::upload::last_error());
+                };
+                if arenas_ahead() {
+                    self.stats.arenas_made[1] += 1;
+                }
+                // (Fresh: nothing wrote it, and it starts as zeros on both sides.)
+                (at, crate::shadow::by_address(at as u64, ARENA, true))
+            }
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        let Some(n) = copy.and_then(|s| self.number(s)) else {
             // (Its memory is of no use without its copy.)
             crate::upload::release(at);
             return failed(self, "no copy of it on the host", 0);
@@ -944,6 +1077,19 @@ impl Memory {
             s.sized[1] as f64 / frames,
             s.no_arena,
         );
+        if arenas_ahead() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let [made, micros, failed] = [0, 1, 2].map(|i| AHEAD_STATS[i].swap(0, Relaxed));
+            tracing::info!(
+                "title memory by address, arenas since the last line (VICTORY_MEMORY_ARENAS_AHEAD=1): {made} made ahead in \
+                 {:.1} ms on their thread ({failed} could not be had there), {} taken from its slot, {} made on a recording \
+                 thread under the mutex; one {} parked",
+                micros as f64 / 1000.0,
+                s.arenas_made[0],
+                s.arenas_made[1],
+                if self.ahead.is_some() { "is" } else { "is not" }
+            );
+        }
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -1211,6 +1357,10 @@ pub(crate) fn ready(
         list.first_use(SIZES);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    // The next arena made ahead while there is still room ([`arenas_ahead`]).
+    if builds && arenas_ahead() && m.ahead.is_none() && want_ahead(m.free.len(), m.pages.len(), m.copies.len()) {
+        wake_ahead();
+    }
     section(m, 1);
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
@@ -1576,6 +1726,18 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An arena is wanted ahead while fewer than twice the spare pages are
+    /// free, and only with room for all of its pages and for its number.
+    #[test]
+    fn an_arena_is_wanted_ahead_only_with_room_for_it() {
+        let arena = (ARENA / PAGE) as usize;
+        assert!(want_ahead(SPARE, 0, 1));
+        assert!(!want_ahead(2 * SPARE, 0, 1));
+        assert!(want_ahead(0, MOST - arena, 1));
+        assert!(!want_ahead(0, MOST - arena + 1, 1));
+        assert!(!want_ahead(0, 0, COPIES as usize));
+    }
 
     #[test]
     fn a_piece_takes_what_changed() {

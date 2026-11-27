@@ -263,6 +263,9 @@ impl Worker {
     fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
         for job in jobs {
             job.staging.refresh();
+            // (A piece handed out without its zeros that the refresh did
+            // not detile whole: zeros before the copy reads it.)
+            job.staging.zero_if_unwritten();
         }
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
