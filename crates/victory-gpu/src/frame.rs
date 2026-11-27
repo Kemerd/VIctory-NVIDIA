@@ -224,6 +224,25 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        // `VICTORY_REFLEX`: this is where Reflex sleeps and the frame's
+        // simulation is marked as started (nothing without the switch).
+        // Here, because:
+        // - this wait is the title's own start of a frame. The token it
+        //   makes is the frame's name (the title hands it back with the
+        //   frame's present), and everything the title does for the frame,
+        //   reading the pad first of all, follows its return;
+        // - it is once per frame: only a wait that makes a token gets here,
+        //   not a poll that timed out without one, nor a wait for the
+        //   vertical blank or the flip;
+        // - our own clock's wait is over (above), so whatever Reflex adds
+        //   is the last delay before the title reads input, which is what
+        //   makes the input fresher;
+        // - it is the title's thread, with no lock of ours held: the
+        //   presenting thread goes on with the frame before while this one
+        //   sleeps. The sleep on the presenting thread, or before the
+        //   present, would hold back a finished frame instead.
+        #[cfg(windows)]
+        crate::streamline::frame_begins(frame);
         pace::begun();
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.

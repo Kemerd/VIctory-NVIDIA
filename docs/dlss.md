@@ -66,6 +66,7 @@ later), hardware-accelerated GPU scheduling on (frame generation needs it).
 | `VICTORY_FSR_PATH` | `1` | off | the title's FidelityFX path at `VICTORY_DLSS_MODE`'s scale with its own FidelityFX (no Streamline): the comparison for DLSS |
 | `VICTORY_FRAMEGEN_HUDLESS` | `0` | on (with `VICTORY_FRAMEGEN=1`) | `0`: no colour without the interface is copied or tagged on Series X (generated frames then warp the interface) |
 | `VICTORY_STREAMLINE_PRESENT` | `1` | off | DLSS without frame generation: our swap chain is Streamline's proxy of it, so Streamline sees the presents (no "presentCommon() was not observed") |
+| `VICTORY_REFLEX` | `on` (or `1`), `boost` | off | Reflex by itself, with or without frame generation, whenever Streamline is loaded (`VICTORY_DLSS=1` or `VICTORY_FRAMEGEN=1`): `slReflexSleep` where the title's frame begins, the latency markers at their own times, a line of Reflex's state every ten seconds. `on`: low latency; `boost`: low latency with boost. Unset: every call made of Streamline is as before the switch existed |
 
 ## How it works
 
@@ -128,10 +129,60 @@ frame number, the latency markers (simulation, render submit, present), the
 constants and the depth and motion-vector tags in the states the submissions
 left them in (viewport 0), and frame generation is switched on; a present
 without a new upscaling (menus, loads) switches it off and clears the tags.
-Reflex low latency is on (frame generation needs it); `slReflexSleep` is not
-called. On Series S, whose interface is a second plane, the scene plane is the
-colour without the interface and the interface plane its colour and alpha
+Reflex low latency is on (frame generation needs it); without `VICTORY_REFLEX`
+`slReflexSleep` is not called and the markers are all sent at the present. On
+Series S, whose interface is a second plane, the scene plane is the colour
+without the interface and the interface plane its colour and alpha
 (premultiplied, as our composer blends them).
+
+**Reflex by itself** (`VICTORY_REFLEX=on` or `boost`; code:
+`streamline.rs` and `streamline/reflex.rs`). Reflex and the latency markers
+(PCL) are asked for whenever Streamline is loaded, and `slReflexSetOptions` is
+called once with the mode the switch names. A frame is what the title begins
+with its wait for the frame origin (`frame.rs`): there it gets an index of its
+own, and every frame token of the frame is made from that index
+(`slGetNewFrameToken` with the index, where the token is used), on whichever
+thread:
+
+| When | Thread | Call |
+|---|---|---|
+| the origin wait made the frame's token, after our own clock's wait | the title's | `slReflexSleep`, then simulation start |
+| the title asks GameInput for its current reading (first of the frame, before its first submission) | the title's | controller input sample |
+| the title's first `ExecuteCommandLists` of the frame on a queue of the direct list type (a copy or compute queue's submission is not the frame's render submission) | the title's | simulation end, render submit start |
+| our present of the frame begins | the presenting one | render submit end (and before it what the frame still owes), then present start |
+| our present returned | the presenting one | present end |
+
+Each marker goes once a frame and in that order. The title's present is bound
+to its frame when the title calls it (by the frame token in its first plane,
+else by order), so the host's present finds the frame's index when its turn
+comes on the line's thread, where the title may already be in its next frame.
+A frame that never submits gets its simulation end and render submit start at
+its present; a present the title began no frame for (the check's, a second
+present of one frame) gets a frame of its own with every marker there. With
+frame generation the present's constants and tags use the same index.
+`sl_pcl.h` 2.14.16 has no general input-sample marker any more (6 is struck
+out as deprecated): the controller's (13) is the one sent, for a pad or a
+keyboard reading. The latency ping (`ePCLatencyPing`, a window message) and
+the flash indicator are not sent.
+
+A token is Streamline's object and the headers do not say how many it keeps
+(`sl_core_api.h`: no more than three frames in flight are expected; the guide
+makes one a frame). With the switch about nine are made a frame on three or
+more threads, so while one is in use no other is made: a lock is held from
+`slGetNewFrameToken` until the call that reads the token has returned (a
+frame's markers; `slSetConstants` and `slEvaluateFeature` of the upscaling;
+`slSetConstants` and `slSetTagForFrame` of frame generation, whose token is
+made after the lock of the calls is taken). A marker may therefore wait for
+as long as an upscaling takes to record; the ten-second line has the wait.
+The one token read without the lock is the sleep's: held across the sleep the
+lock would stop the markers of the frame before. Without the switch there is
+no lock.
+
+The sleep has no bound in the header and runs on the title's thread, so its
+length is watched: the longest is in the ten-second line, one over 250 ms is
+warned of once, and after one over 2 s no further sleep is asked for in the
+run (one warning; the markers go on). A sleep that never returns cannot be
+ended from our side.
 
 **The colour without the interface on Series X.** There the title keeps the
 interface in a target of its own (3840x2160, RGBA8, with its own depth) and
@@ -202,6 +253,76 @@ lines: … copies in front of the title's interface composite, … presents tagg
 with one, … presents with frame generation on had none; … interface composite
 draws into a presented texture (… after a copy in their list), … draws of other
 pipelines into one`.
+
+Reflex by itself (`VICTORY_REFLEX`): at start `Streamline: Reflex by itself is
+asked for (VICTORY_REFLEX) and supported`; at the device `Streamline: Reflex
+options set … code=0 mode=…` and `Reflex by itself is on`; then about every
+ten seconds `Reflex state: low latency available, …; latency report over N
+frames: … from simulation start to the end of GPU rendering on average …;
+since the last line: N frames begun, N sleeps of … ms on average (the longest
+… ms), N frames with an input sample (N read too late for one), N simulations
+ended by a submission with the title's token and N by one found by order, N
+presented without a submission before, N presents with no frame begun, N
+presents bound by the title's token and N by order, N frames never presented,
+… ms waited for a frame token in use (the longest wait … ms)`. The total is
+the difference of two time stamps of the report (`gpuRenderEndTime` less
+`simStartTime`); the header names no unit for them. `Reflex stays off` or
+`Reflex by itself stays off` with the reason, if it does not run. Once each,
+if it happens: `Reflex: one slReflexSleep took … ms, more than the 250 ms …`
+and `Reflex: one slReflexSleep took … ms, more than 2000 ms: no further sleep
+is asked for in this run …` (the line then says `NO sleep is asked for any
+more`).
+
+## The first run with Reflex by itself in the title
+
+Not run in the title yet. Through the launcher: `-More @{ VICTORY_REFLEX =
+'on' }` with DLSS or frame generation on. Before it, without the title:
+`victory upscaler-check --present` with `VICTORY_REFLEX=on` goes through the
+sleep, every marker and the state on stand-in frames and ends with a `Reflex
+state:` line. In the title, the ten-second line should show:
+
+1. `low latency available` on a GeForce card, and after the first line a
+   `latency report over N frames` with a total that is not 0.
+2. As many sleeps as frames begun, and about as many frames begun as the
+   frame-rate line counts frames. Many more begun than presented (`frames
+   never presented` large): the title waits for the frame origin more than
+   once a frame, and the sleep is then in the wrong place.
+3. `presents bound by the title's token` for nearly all presents. `by order`
+   instead: the plane's token is not the origin wait's, and in a title that
+   begins its next frame before it presents the last one the present's
+   markers would name the wrong frame.
+4. `frames with an input sample` near the frames begun while a pad is read.
+   Mostly `read too late for one`: the title reads input after its first
+   submission (another thread than the one that begins frames), and the
+   input sample then has no place in that frame.
+5. `presented without a submission before` and `presents with no frame
+   begun` near 0 in gameplay.
+6. The frame rate with and without the switch: Reflex should cost a few
+   percent at most when it is on (more with boost), and the frame-pacing
+   line (`VICTORY_TIMER_LOG=1`) should stay even. Our own clock still paces
+   the title's flip wait; if the two fight, the pacing line shows it.
+7. With frame generation: no `DLSS Frame Generation status changed` (2 is
+   "Reflex not seen") and no `common constants cannot be found for frame N`
+   in Streamline's log (the present's markers and the constants name one
+   frame index).
+8. With DLSS, frame generation and Reflex on together (the most tokens a
+   frame): still no `common constants cannot be found`, no `DLSS: the
+   upscaling was not recorded: slEvaluateFeature …` and no `frame
+   generation: slSetConstants` or `slSetTagForFrame` warning. One of them
+   with the switch and none without: a token named another frame by the
+   time it was read.
+9. `simulations ended by a submission with the title's token` for nearly all
+   frames. `by one found by order` instead: the title does not tag its
+   submissions (or tags them with something else than the origin wait's
+   token), the newest running frame is taken, and a frame still submitting
+   after the title began the next one ends the next one's simulation early.
+10. `the longest … ms` of the sleeps under a frame's time, and neither of the
+    two `one slReflexSleep took` warnings, also with the window minimised or
+    without focus for a while (whether the sleep stands then is not in the
+    headers).
+11. `ms waited for a frame token in use` small against ten seconds of frames
+    (it is a sum), and its longest wait about what an upscaling takes to
+    record (the frame generation time line has that number).
 
 ## The first run with frame generation in the title
 
@@ -294,6 +415,11 @@ Before it, once: `victory upscaler-check --present` (below, line 1).
   frame generation needs about 0.5 GB more at 1440p.
 - Latency: frame generation holds a frame back; it is meant for a base frame
   rate of 60 and up.
+- Reflex by itself (`VICTORY_REFLEX`) is set at the start only: no line in the
+  F1 menu, no change while the title runs. It does not load Streamline alone
+  (it needs `VICTORY_DLSS=1` or `VICTORY_FRAMEGEN=1`). No latency ping and no
+  flash indicator are sent, so NVIDIA's tools measure no input sampling
+  latency from them.
 - `slShutdown` is not called in the title; the process ends with the title.
   Where the title leaves through the C runtime's exit with frame generation
   on, the process may fail fast at its very end as the check did without its

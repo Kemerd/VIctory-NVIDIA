@@ -674,7 +674,20 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let taken = found.is_some() && !out.is_null();
+    let hr = hand(out, found);
+    // Our lock goes first: what follows takes one of the renderer's.
+    drop(state);
+    // `VICTORY_REFLEX`: the title has taken a pad or keyboard reading, which
+    // is the frame's input sample for Reflex. Here, where the title asks,
+    // not where our poll thread read the host. Nothing without the switch.
+    #[cfg(windows)]
+    if taken {
+        victory_gpu::streamline::input_sampled();
+    }
+    #[cfg(not(windows))]
+    let _ = taken;
+    hr
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
