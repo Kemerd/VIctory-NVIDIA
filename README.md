@@ -18,7 +18,7 @@ Put both next to your own `game_scarlett_master.exe` and double-click `PLAY.cmd`
 Enter starts with the recommended settings, or with your last ones. **C** walks through eight choices:
 
 1. **Resolution:** 2560x1440, 1920x1080 upscaled to 1440, 3840x2160, **5120x1440 (32:9)**, **3440x1440 (21:9)**, 2560x1080, or any width x height.
-2. **Console profile:** Series X (sharper) or Series S (faster).
+2. **Console profile:** Series X, the default and the one to use. Series S (1280x720 inside, much softer) is only for weaker cards.
 3. **DLSS:** Quality, Balanced, Performance, DLAA or off.
 4. **Frame generation:** ready to switch on in F1, **2x to 6x** from the start (3x and up need an RTX 50), or not loaded.
 5. **HDR10** on or off (turn Windows HDR on first).

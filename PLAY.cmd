@@ -73,8 +73,8 @@ if "%A%"=="7" (
 rem ---- 2. console profile ----
 cls
 echo 2/8  Console profile
-echo   1. Series X   (sharper, recommended)
-echo   2. Series S   (1280x720 inside: faster, softer)
+echo   1. Series X   (default: the full-detail profile)
+echo   2. Series S   (only for weaker cards: 1280x720 inside, much softer)
 set "A="
 set /p A=Choice [1]:
 set "C_CONSOLE=x"
