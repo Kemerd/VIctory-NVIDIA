@@ -864,18 +864,23 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
         let found: Vec<Arc<Shadow>> =
             overlapping(&carded.by_start, carded.longest, dst, len).filter_map(|(_, weak)| weak.upgrade()).collect();
         // Both ways under one holding of the lock: a copy made between two
-        // looks would be a false alarm.
+        // looks would be a false alarm. The list's copies are upgraded here
+        // and compared after the lock is let go, so one whose last owner went
+        // meanwhile is not destroyed under it.
+        #[cfg(feature = "diagnostics")]
+        let end = dst.saturating_add(len);
+        #[cfg(feature = "diagnostics")]
+        let listed: Vec<Arc<Shadow>> = carded
+            .list
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|s| (s.start as usize) < end && ((s.start + s.len) as usize) > dst)
+            .collect();
+        drop(carded);
         #[cfg(feature = "diagnostics")]
         {
             let fast: std::collections::BTreeSet<u64> = found.iter().map(|s| s.id).collect();
-            let end = dst.saturating_add(len);
-            let slow: std::collections::BTreeSet<u64> = carded
-                .list
-                .iter()
-                .filter_map(std::sync::Weak::upgrade)
-                .filter(|s| (s.start as usize) < end && ((s.start + s.len) as usize) > dst)
-                .map(|s| s.id)
-                .collect();
+            let slow: std::collections::BTreeSet<u64> = listed.iter().map(|s| s.id).collect();
             static SAID: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
             if slow.difference(&fast).next().is_some() {
                 SAID[0].call_once(|| tracing::warn!(dst, len, "send_copied: the copies by start missed one the list holds"));
@@ -883,11 +888,14 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
             if fast.difference(&slow).next().is_some() {
                 SAID[1].call_once(|| tracing::warn!(dst, len, "send_copied: the copies by start found one the list does not hold"));
             }
+            drop(listed);
         }
         found
     } else {
         carded_copies()
     };
+    // the look alone: the bytes of the copies found below are not its cost.
+    let looked = started.elapsed();
     let mut hits = 0;
     for shadow in found {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
@@ -903,7 +911,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
         }
     }
     SEND_COPIED[0].fetch_add(1, Ordering::Relaxed);
-    SEND_COPIED[1].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    SEND_COPIED[1].fetch_add(looked.as_nanos() as u64, Ordering::Relaxed);
     SEND_COPIED[2].fetch_add(hits, Ordering::Relaxed);
 }
 

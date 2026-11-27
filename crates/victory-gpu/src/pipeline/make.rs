@@ -871,8 +871,9 @@ fn workers() -> bool {
                 running = true;
             }
         }
-        // Read once, here ([`slow_extras`]); none with it unset.
-        let extras = if running { slow_extras(workers, std::thread::available_parallelism().map_or(2, |n| n.get())) } else { 0 };
+        // Read once, here ([`slow_extras`]); none with it unset. the screen
+        // workers count among the threads already making pipelines.
+        let extras = if running { slow_extras(workers + screens, std::thread::available_parallelism().map_or(2, |n| n.get())) } else { 0 };
         for i in 0..extras {
             let spawned = std::thread::Builder::new().name(format!("victory-pipelines-slow-{i}")).spawn(|| {
                 let lowest = std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");

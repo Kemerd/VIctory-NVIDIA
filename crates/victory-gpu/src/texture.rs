@@ -118,7 +118,7 @@ pub(crate) fn staging_zeros_line() {
         return;
     }
     let [left, at_record, at_making] = [0, 1, 2].map(|i| STAGING_ZEROS[i].swap(0, Relaxed));
-    if left + at_making > 0 {
+    if left + at_record + at_making > 0 {
         tracing::info!(
             "staging pieces used before, in the last 5 seconds (VICTORY_STAGING_NO_ZERO=1): {left} handed out without \
              their zero-fill, {at_record} of them zero-filled where a copy was recorded (nothing had detiled them whole), \
@@ -158,6 +158,10 @@ struct Last {
     /// only where all of it was read: not for a partly mapped texture, a
     /// first filling from the pages there, or a kernel read that failed.
     looked: Option<u64>,
+    /// A refresh has run for this buffer, read or not. The read-ahead
+    /// threads ([`Staging::refresh_soon`]) leave a buffer that was tried:
+    /// the submission came first, and its copy may be in flight.
+    tried: bool,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -1089,6 +1093,24 @@ fn claim_upload(uploaded: &std::sync::atomic::AtomicBool, dirty: &std::sync::ato
     (!was_uploaded || was_dirty).then_some(!was_uploaded)
 }
 
+/// Notes a whole read of a guarded texture: the frame it was read in
+/// ([`look_once`]) and, for a look the guard told no write of (`blind`:
+/// whether it was a second look in its frame), the counts of [`LOOK_ONCE`].
+/// Called only where all of the texture was read, so the line counts reads
+/// and not looks that went on to a throttle or a failed read.
+fn note_looked(last: &mut Last, looked: Option<u64>, blind: Option<bool>, size: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    last.looked = looked;
+    if let Some(again) = blind {
+        LOOK_ONCE[0].fetch_add(1, Relaxed);
+        LOOK_ONCE[1].fetch_add(size as u64, Relaxed);
+        if again {
+            LOOK_ONCE[2].fetch_add(1, Relaxed);
+            LOOK_ONCE[3].fetch_add(size as u64, Relaxed);
+        }
+    }
+}
+
 /// A title texture a list samples, its upload decided at the list's
 /// submission ([`prelude_uploads`]): its staging buffer, its host copy (both
 /// held by the list until it is reset), and its levels on demand. (Ported
@@ -1121,6 +1143,12 @@ impl PreludeUpload {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        // A piece handed out without its zeros that nothing detiled whole is
+        // zero-filled here, before the prelude is recorded under the list's
+        // states lock: `record` would make the submit thread wait for `last`
+        // there, with that lock held. A load and nothing more once the flag
+        // is clear.
+        self.staging.zero_if_unwritten();
         // A host copy that took the place of one with fewer levels: the slots
         // that show that one are made again once this upload has run.
         if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
@@ -1148,6 +1176,7 @@ impl PreludeUpload {
     /// Records the copy of the staging buffer into the host texture on
     /// `list` (the prelude), the host texture in the copy destination state.
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList) {
+        // (Done in `finish_refresh` already; kept for any other caller.)
         self.staging.zero_if_unwritten();
         let texture = &self.copy.texture;
         // The staging buffer lives as long as `self.staging`, which the
@@ -1540,19 +1569,32 @@ impl Staging {
     /// once (no draw samples it through a table, which would ask the write
     /// watch and guard its pages), not marked exact by a bake (that read
     /// belongs to the submission) and not uploaded. None: held back by
-    /// those; Some(false): it was filled already, the submission (or another
-    /// list's) came first; Some(true): read here.
+    /// those, or by a refresh that was tried and read nothing (a submission's:
+    /// its copy may be in flight, nothing is written to the buffer after it);
+    /// Some(false): it was filled already, the submission (or another list's)
+    /// came first; Some(true): read here. Decided and read under one hold of
+    /// `last`, so a submission cannot come between the look and the read.
     pub(crate) fn refresh_soon(&self) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.once.load(Relaxed) || self.exact.load(Relaxed) || self.uploaded.load(Relaxed) {
             return None;
         }
-        // (A refresh between this look and the next one returns at once.)
-        if self.last.lock().unwrap_or_else(|e| e.into_inner()).hash.is_some() {
+        let started = std::time::Instant::now();
+        let _texture = crate::timeline::span("a texture's refresh");
+        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        if last.hash.is_some() {
             return Some(false);
         }
-        self.refresh();
-        Some(true)
+        if last.tried {
+            return None;
+        }
+        let read = self.refresh_locked(&mut last);
+        let elapsed = started.elapsed().as_micros() as u64;
+        REFRESH_WAITS[3].fetch_add(elapsed, Relaxed);
+        let preparing = &crate::host::PREPARING;
+        preparing[2].fetch_add(elapsed, Relaxed);
+        preparing[3].fetch_add(read as u64, Relaxed);
+        Some(read > 0)
     }
 
     fn movie_plane(&self) -> bool {
@@ -1578,10 +1620,15 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
+        self.refresh_locked(&mut last)
+    }
+
+    /// The refresh, `last` (this buffer's) held by the caller.
+    fn refresh_locked(&self, last: &mut Last) -> usize {
         let size = self.read;
         let start = self.memory as usize;
-        let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
-        let last = &mut *last;
+        last.tried = true;
         let exact = self.exact.swap(false, std::sync::atomic::Ordering::Relaxed);
         let alone = self.once.load(std::sync::atomic::Ordering::Relaxed);
         if alone && !exact && last.hash.is_some() {
@@ -1618,6 +1665,10 @@ impl Staging {
         // The frame the guard's check below read, noted in `last.looked`
         // where the texture is then read whole ([`look_once`]).
         let mut looked = None;
+        // With no write told: whether this look is a second one in its frame,
+        // counted on [`LOOK_ONCE`] only where the texture is then read whole
+        // ([`note_looked`]).
+        let mut blind_look = None;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -1649,12 +1700,7 @@ impl Staging {
                     LOOK_ONCE[5].fetch_add(size as u64, Relaxed);
                     return 0;
                 }
-                LOOK_ONCE[0].fetch_add(1, Relaxed);
-                LOOK_ONCE[1].fetch_add(size as u64, Relaxed);
-                if again {
-                    LOOK_ONCE[2].fetch_add(1, Relaxed);
-                    LOOK_ONCE[3].fetch_add(size as u64, Relaxed);
-                }
+                blind_look = Some(again);
             }
             blind = unwritten;
         }
@@ -1677,13 +1723,13 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size, looked);
+                return self.refresh_unlocked(last, size, looked, blind_look);
             };
             mapped
         } else if exact && exact_unlocked() {
             match crate::watch::title_memory_reading_now() {
                 Some(mapped) => mapped,
-                None => match self.refresh_exact_unlocked(last, size, looked) {
+                None => match self.refresh_exact_unlocked(last, size, looked, blind_look) {
                     Some(read) => {
                         if read {
                             found_blind(last);
@@ -1740,7 +1786,7 @@ impl Staging {
         if through_copy() || !crate::watch::soft_runs(start, size).is_empty() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
-                last.looked = looked;
+                note_looked(last, looked, blind_look, size);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
@@ -1758,7 +1804,7 @@ impl Staging {
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = digest(tiled);
-        last.looked = looked;
+        note_looked(last, looked, blind_look, size);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -1779,13 +1825,13 @@ impl Staging {
     /// next refresh (what was learnt about writes to it is forgotten, so
     /// that it is not passed over as unwritten); one never filled takes the
     /// pages that are there ([`Staging::fill`]). Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize, looked: Option<u64>) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, looked: Option<u64>, blind_look: Option<bool>) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.looked = looked;
+            note_looked(last, looked, blind_look, size);
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
@@ -1812,14 +1858,20 @@ impl Staging {
     /// lock would be. `Some(changed)` if read (and detiled if it changed),
     /// `None` if a page was missing: then the refresh waits for the lock
     /// as before.
-    fn refresh_exact_unlocked(&self, last: &mut Last, size: usize, looked: Option<u64>) -> Option<bool> {
+    fn refresh_exact_unlocked(
+        &self,
+        last: &mut Last,
+        size: usize,
+        looked: Option<u64>,
+        blind_look: Option<bool>,
+    ) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         let mut changed = false;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.looked = looked;
+            note_looked(last, looked, blind_look, size);
             let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);

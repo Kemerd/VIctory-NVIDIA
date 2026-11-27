@@ -425,6 +425,14 @@ fn keys_used(used: impl Fn(usize) -> bool, addresses: &[u64], written: &[u64], c
     })
 }
 
+/// Whether the arenas thread is making one now while pages are still free:
+/// the pages left are used first. An arena made on a recording thread
+/// meanwhile would wait for the same mapping lock with the mutex held, and
+/// one of the two would be left over.
+fn arena_coming(m: &Memory) -> bool {
+    arenas_ahead() && AHEAD_BUSY.load(std::sync::atomic::Ordering::Relaxed) && !m.free.is_empty()
+}
+
 /// Whether a builder dispatch would make an arena (or ask for one ahead)
 /// with memory as it is: [`TOP_UP`] from here.
 fn note_top_up(m: &Memory) {
@@ -432,7 +440,7 @@ fn note_top_up(m: &Memory) {
         return;
     }
     let frame = crate::frame::current();
-    let make = m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && frame >= m.no_arena_before;
+    let make = !arena_coming(m) && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && frame >= m.no_arena_before;
     let ahead = arenas_ahead()
         && m.ahead.is_none()
         && want_ahead(m.free.len(), m.pages.len(), m.copies.len())
@@ -1335,7 +1343,20 @@ impl Memory {
             // thread's `bring` may have stored them after the refresh in
             // front of the steps, and then nothing above tells of them while
             // the CPU side still holds the old ones ([`land_sent`]).
-            if land_sent() && from < to {
+            // Only where the CPU side lacks what the arena holds: that is
+            // the bring-after-refresh case. Bytes the refresh in front took
+            // already are not read a second time.
+            if land_sent() && from < to && {
+                let side = shadow.card_data();
+                // SAFETY: the arena page holds `[from, to)` of the page and the
+                // CPU side holds the same offsets of the copy; nothing
+                // refreshes this copy while the submission is landing.
+                side.is_null()
+                    || unsafe {
+                        std::slice::from_raw_parts((held.at + from) as *const u8, to - from)
+                            != std::slice::from_raw_parts(side.add(base + from), to - from)
+                    }
+            } {
                 crate::watch::wrote(held.at + from, to - from);
                 note_landed(shadow, held.at + from, held.at + to);
             }
@@ -1520,16 +1541,18 @@ impl Memory {
         }
     }
 
-    /// Every ten seconds or so, what was used.
-    fn report(&mut self) {
+    /// Every ten seconds or so, what was used: the lines to write, which the
+    /// caller does once it has let go of the mutex (none until it is time).
+    fn report(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
         let now = std::time::Instant::now();
         let (since, frame) = *self.stats.from.get_or_insert((now, self.frame));
         if now.duration_since(since).as_secs_f64() < 10.0 {
-            return;
+            return lines;
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
-        tracing::info!(
+        lines.push(format!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
@@ -1565,10 +1588,10 @@ impl Memory {
             s.fault_kinds[3] as f64 / frames,
             s.fault_kinds[4] as f64 / frames,
             s.fault_kinds[5] as f64 / frames,
-        );
+        ));
         // Where the threads' time went (all threads' together, a frame).
         let ms = |micros: u64| micros as f64 / 1000.0 / frames;
-        tracing::info!(
+        lines.push(format!(
             "title memory by address, time per frame over all threads: {:.1} ms waiting for the mutex at dispatches; under it {:.1} ms the frame's first look, \
              {:.1} ms new arenas, {:.1} ms constants, {:.1} ms root views, {:.1} ms views and bringing up ({:.1} times every copy was brought up); \
              at submissions {:.1} ms waiting for it and {:.1} ms landing; a builder dispatch's recording in all: {:.1} ms the all-or-none check, \
@@ -1589,10 +1612,10 @@ impl Memory {
             s.sized[0] as f64 / frames,
             s.sized[1] as f64 / frames,
             s.no_arena,
-        );
+        ));
         if ask_runs() {
             let [all, calls, views, upload, up, held] = s.asks;
-            tracing::info!(
+            lines.push(format!(
                 "title memory by address, root views split per frame (VICTORY_MEMORY_ASK_RUNS=1): {:.2} ms asking whether pages are \
                  the title's ({:.1} askings), {:.2} ms of it in the root views; there {:.2} ms naming memory in upload buffers, \
                  {:.2} ms bringing up, {:.2} ms the rest; {:.1} held pages of the builder's views not asked about",
@@ -1603,12 +1626,12 @@ impl Memory {
                 ms(up),
                 ms(s.held[3].saturating_sub(views + upload + up)),
                 held as f64 / frames
-            );
+            ));
         }
         if quiet() != Quiet::Off {
             use std::sync::atomic::Ordering::Relaxed;
             let [reads, builds, judged, did, waited] = [0, 1, 2, 3, 4].map(|i| QUIET_STATS[i].swap(0, Relaxed));
-            tracing::info!(
+            lines.push(format!(
                 "title memory by address, quiet calls (VICTORY_MEMORY_QUIET): per frame {:.1} reading and {:.1} building returned \
                  without the mutex (not in the counts above); checked: {:.1} a frame judged quiet, {:.1} ms a frame of the waiting \
                  for the mutex at dispatches theirs ({:.0}%), and {} judged quiet that did something since the last line",
@@ -1618,20 +1641,20 @@ impl Memory {
                 ms(waited),
                 100.0 * waited as f64 / s.waited.max(1) as f64,
                 did
-            );
+            ));
         }
         if land_sent() {
             use std::sync::atomic::Ordering::Relaxed;
             let [stored, read] = [0, 1].map(|i| LANDED_BYTES[i].swap(0, Relaxed) as f64 / 1e6 / frames);
-            tracing::info!(
+            lines.push(format!(
                 "title memory by address, per frame (VICTORY_MEMORY_LAND_SENT=1): {stored:.2} MB stored at submissions by \
                  landing, {read:.2} MB of stale pages read into the CPU side behind it for the same submission's sends"
-            );
+            ));
         }
         if arenas_ahead() {
             use std::sync::atomic::Ordering::Relaxed;
             let [made, micros, failed] = [0, 1, 2].map(|i| AHEAD_STATS[i].swap(0, Relaxed));
-            tracing::info!(
+            lines.push(format!(
                 "title memory by address, arenas since the last line (VICTORY_MEMORY_ARENAS_AHEAD=1): {made} made ahead in \
                  {:.1} ms on their thread ({failed} could not be had there), {} taken from its slot, {} made on a recording \
                  thread under the mutex; one {} parked",
@@ -1639,7 +1662,7 @@ impl Memory {
                 s.arenas_made[0],
                 s.arenas_made[1],
                 if self.ahead.is_some() { "is" } else { "is not" }
-            );
+            ));
         }
         // Why `map` refused the pages shaders found empty, and what the
         // three switches did (all counts over the frames since the last
@@ -1648,7 +1671,7 @@ impl Memory {
         let per = |n: u64| n as f64 / frames;
         let lean = [0, 1, 2, 3].map(|i| LEAN[i].swap(0, Relaxed));
         let settled = [0, 1, 2, 3, 4, 5, 6].map(|i| SETTLED[i].swap(0, Relaxed));
-        tracing::info!(
+        lines.push(format!(
             "title memory by address, per frame: pages that shaders found empty and `map` refused: {:.1} outside the directory, {:.1} turned down earlier              in the frame, {:.1} not committed, {:.1} not write-watched, {:.1} in a title buffer with no copy, {:.1} whose copy has no number,              {:.1} windows of title memory not made, {:.1} with no page left, {:.1} with no arena;              VICTORY_MEMORY_BUFFER_FAULTS ({}): {:.1} pages whole in title buffers given a place outside the budgets, {:.1} refused;              VICTORY_MEMORY_LEAN ({}): {:.1} pages asked about before the mutex, {:.1} answers used under it, {:.1} root views held and not asked about,              {:.1} named pages already placed; VICTORY_MEMORY_DIRTY ({}): {:.1} settling steps, {:.1} of them with nothing written, {:.1} arenas brought up,              {:.1} runs of pages, {:.1} KB copied, {:.2} ms on the submitting thread, {:.1} arena askings spared",
             per(s.refusals[WHY_RANGE]),
             per(s.refusals[WHY_AGAIN]),
@@ -1675,8 +1698,9 @@ impl Memory {
             settled[4] as f64 / 1024.0 / frames,
             settled[5] as f64 / 1000.0 / frames,
             per(settled[6]),
-        );
+        ));
         self.stats.from = Some((now, self.frame));
+        lines
     }
 }
 
@@ -2092,6 +2116,17 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
     changed
 }
 
+/// The lines of [`Memory::report`], written when this goes out of scope.
+struct Said(Vec<String>);
+
+impl Drop for Said {
+    fn drop(&mut self) {
+        for line in &self.0 {
+            tracing::info!("{line}");
+        }
+    }
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name is made ready (`addresses`: its root views, of them
 /// `written` those it writes; `constants`: its root constants, see the
@@ -2146,6 +2181,9 @@ pub(crate) fn ready(
     let _answers = lean.then(|| ask_ahead_of_the_mutex(addresses, constants, builds));
     // (Timed in sections for the report's line: see `Stats::held`.)
     let asked = std::time::Instant::now();
+    // (Declared before the guard, so it is dropped after it: the report's
+    // lines are written with the mutex let go, whichever way this returns.)
+    let mut said = Said(Vec::new());
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
@@ -2173,7 +2211,7 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
         m.look_again();
-        m.report();
+        said.0 = m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
         // (After the look: a quiet call finds it done.)
@@ -2185,11 +2223,13 @@ pub(crate) fn ready(
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
-    // (Given before the lock with a quiet switch.)
-    if quiet() == Quiet::Off && builds && sizes_wait() && asks_size(written, constants, threads) {
+    // (Given before the lock with a quiet switch, unless the trace or the
+    // dump sent every call the long way.)
+    if (quiet() == Quiet::Off || looked_at) && builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {
+    let coming = arena_coming(m);
+    while builds && !coming && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {
         did.set(true);
     }
     // The next arena made ahead while there is still room ([`arenas_ahead`]).
@@ -2302,9 +2342,12 @@ pub(crate) fn ready(
             Some(_) => {
                 m.ready(at, 1);
                 let started = ask_runs().then(std::time::Instant::now);
+                let asked_in = m.stats.asks[0];
                 m.named_in_upload(at);
                 if let Some(started) = started {
-                    m.stats.asks[3] += started.elapsed().as_micros() as u64;
+                    // (Less its own askings, which the views' share counts.)
+                    let own = m.stats.asks[0] - asked_in;
+                    m.stats.asks[3] += (started.elapsed().as_micros() as u64).saturating_sub(own);
                 }
                 came[3] += held(m).saturating_sub(before);
             }
@@ -2347,7 +2390,11 @@ pub(crate) fn ready(
         did.set(true);
     }
     // (After the views are in the heap: a quiet call may use them.)
-    HEAPS.write().unwrap_or_else(|e| e.into_inner()).insert(key, (base, m.copies.len() as u32));
+    // (Written only when it changes: quiet calls read it without the mutex.)
+    let now = (base, m.copies.len() as u32);
+    if run != Some(now) {
+        HEAPS.write().unwrap_or_else(|e| e.into_inner()).insert(key, now);
+    }
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which

@@ -461,6 +461,10 @@ pub(crate) fn read_ahead_line(frames: f64) {
         return;
     }
     let [queued, read, bytes, first, held, full] = [0, 1, 2, 3, 4, 5].map(|i| READ_STATS[i].swap(0, Relaxed) as f64 / frames);
+    // like the lines next to it, say nothing in menus and quiet frames
+    if queued + read + first + held + full == 0.0 {
+        return;
+    }
     tracing::info!(
         "texture uploads of the lists read ahead of their submission (VICTORY_TEXTURE_READ_AHEAD=1), per frame: {queued:.1} queued, \
          {read:.1} read ahead ({:.1} MB), {first:.1} the submission filled first, {held:.1} held back (read once no more, exact \
