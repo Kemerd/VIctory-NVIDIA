@@ -5828,6 +5828,26 @@ impl Host {
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
+        // What by-address memory stored into its arenas and directory at
+        // this submission's steps, after the refresh in front of them, goes
+        // into the CPU side now, before the sends take it from there
+        // (`VICTORY_MEMORY_LAND_SENT=1`; empty without it). Bytes go title
+        // memory -> arena -> CPU side -> send memory -> card: no hop is
+        // added, the next submission's refresh of these pages moves here.
+        // Without refreshes in front the flush above did it already.
+        let landed = crate::memory::landed();
+        if refresh_front() {
+            for (shadow, from, to) in landed {
+                if crate::watch::light() && shadow.nothing_new(from, to - from) {
+                    continue;
+                }
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                crate::memory::landed_read(copied);
+            }
+        }
         crate::watch::ask_once_end();
         split.part(2);
         stage.next("submit: snapshots");
@@ -9356,6 +9376,7 @@ impl Meter {
                 );
             }
             crate::texture::look_once_line(frames);
+            crate::texture::ahead::read_ahead_line(frames);
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {

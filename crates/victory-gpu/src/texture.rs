@@ -1535,6 +1535,26 @@ impl Staging {
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
+    /// For the read-ahead threads ([`ahead::read_soon`]), on a thread of
+    /// theirs: the refresh the submission would do, only for a buffer read
+    /// once (no draw samples it through a table, which would ask the write
+    /// watch and guard its pages), not marked exact by a bake (that read
+    /// belongs to the submission) and not uploaded. None: held back by
+    /// those; Some(false): it was filled already, the submission (or another
+    /// list's) came first; Some(true): read here.
+    pub(crate) fn refresh_soon(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.once.load(Relaxed) || self.exact.load(Relaxed) || self.uploaded.load(Relaxed) {
+            return None;
+        }
+        // (A refresh between this look and the next one returns at once.)
+        if self.last.lock().unwrap_or_else(|e| e.into_inner()).hash.is_some() {
+            return Some(false);
+        }
+        self.refresh();
+        Some(true)
+    }
+
     fn movie_plane(&self) -> bool {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
         let desc = &self.layout.desc;
@@ -1947,11 +1967,11 @@ impl Staging {
 /// Lets go of a title texture's staging buffer (lists that recorded an
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
-pub(crate) fn unstage(resource: This) {
+/// Returns the buffer let go of: no later upload finds it, so its flags
+/// change no more but by its own refresh ([`ahead::read_soon`]).
+pub(crate) fn unstage(resource: This) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    map.as_mut()?.remove(&(resource as usize))
 }
 
 /// Where a staged title texture's memory is: address and bytes.

@@ -126,6 +126,256 @@ const SWEEP: usize = 128;
 /// Frames after an arena could not be had before another is asked for.
 const ARENA_AGAIN: u64 = 30;
 
+/// Whether what [`Memory::land`] stores at a submission reaches that
+/// submission's sends (`VICTORY_MEMORY_LAND_SENT=1`, off by default).
+///
+/// Where the bytes are: title memory -> the arena (our memory, the copy's
+/// "title memory") -> the copy's CPU side -> the submission's send memory
+/// -> the card. With `VICTORY_JOIN_PARTS` above 1 the submission refreshes
+/// every copy in front of its steps (`refresh_front` in `crate::host`),
+/// and a later refresh of the same span in that submission is dropped.
+/// `land` runs as a step, after that refresh: what it stores into an arena
+/// (a packed structure streamed in between recording and submission, a
+/// directory entry of a page placed then) is in the arena, not in the CPU
+/// side the sends are taken from, so the submission sends the old bytes
+/// and the right ones follow with the next refresh, after the builder's
+/// dispatch read the old ones. With the switch the pages `land` stored are
+/// noted here ([`landed`]) and the submission refreshes them once more
+/// after its steps and before its sends, as it did before refreshes ran in
+/// front. No hop is added: the refresh the next submission would have done
+/// moves into this one. Only with the title's ray tracing; it is a matter
+/// of order, not of frame time. If "stored at submissions" on the line
+/// stays 0 over a streaming run, the case does not happen.
+fn land_sent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_LAND_SENT").is_some_and(|v| v == "1"))
+}
+
+/// With [`land_sent`]: the copies and whole pages of them stored at
+/// submissions, for the submission to refresh after its steps. Apart from
+/// the mutex: the submitting thread drains it without taking that.
+static LANDED: Mutex<Vec<(Arc<Shadow>, usize, usize)>> = Mutex::new(Vec::new());
+static LANDED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Since the last report: bytes stored at submissions by `land`, `place`
+/// and `gone`, and bytes of stale pages the submissions then read into the
+/// CPU side for them (pages read, not bytes that differed).
+static LANDED_BYTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `[from, to)` rounded out to whole pages and cut to the copy's span
+/// `[first, first + len)`: a page refreshed whole is noted as taken, one
+/// refreshed in part is read again by the next refresh.
+fn whole_pages(from: usize, to: usize, first: usize, len: usize) -> Option<(usize, usize)> {
+    let page = PAGE as usize;
+    let (a, b) = ((from / page * page).max(first), to.div_ceil(page).saturating_mul(page).min(first + len));
+    (from < to && a < b).then_some((a, b))
+}
+
+/// Runs by copy (`key`), those of one copy that overlap or touch as one.
+fn joined<T: Clone>(mut runs: Vec<(usize, T, usize, usize)>) -> Vec<(T, usize, usize)> {
+    runs.sort_by_key(|r| (r.0, r.2));
+    let mut out: Vec<(usize, T, usize, usize)> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match out.last_mut() {
+            Some(last) if last.0 == run.0 && run.2 <= last.3 => last.3 = last.3.max(run.3),
+            _ => out.push(run),
+        }
+    }
+    out.into_iter().map(|(_, t, a, b)| (t, a, b)).collect()
+}
+
+/// Notes `[from, to)` of `copy` as stored at a submission ([`land_sent`]).
+fn note_landed(copy: &Arc<Shadow>, from: usize, to: usize) {
+    let (first, len) = copy.span();
+    let Some((a, b)) = whole_pages(from, to, first as usize, len as usize) else { return };
+    LANDED.lock().unwrap_or_else(|e| e.into_inner()).push((copy.clone(), a, b));
+    LANDED_ANY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// On the submitting thread, after a submission's steps: the pages of
+/// copies stored at it ([`land_sent`]), whole pages, joined by copy. Empty
+/// without the switch; takes no lock while nothing was noted.
+pub(crate) fn landed() -> Vec<(Arc<Shadow>, usize, usize)> {
+    if !land_sent() || !LANDED_ANY.swap(false, std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    let noted = std::mem::take(&mut *LANDED.lock().unwrap_or_else(|e| e.into_inner()));
+    joined(noted.into_iter().map(|(copy, a, b)| (Arc::as_ptr(&copy) as usize, copy, a, b)).collect())
+}
+
+/// The bytes a submission read into a CPU side for [`landed`]'s pages.
+pub(crate) fn landed_read(bytes: usize) {
+    LANDED_BYTES[1].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a builder or reading dispatch whose every key its list has used
+/// already does ([`ready`]): `VICTORY_MEMORY_QUIET=1` returns it before the
+/// mutex is taken; `=check` judges every call so before taking the mutex,
+/// takes it all the same, and counts the calls judged quiet that did
+/// something under it (that count must stay 0 over a streaming run before
+/// `=1` is used); unset, every call takes the mutex as before.
+///
+/// Such a call only finds the heap's run under the lock. The saving is
+/// thread time spent waiting, not time under the lock, and only with the
+/// title's ray tracing: in the newest run with this line (224808) the
+/// threads waited 55.5 ms a frame at dispatches in its first window and 2-8
+/// ms after, and the time under the lock is the same either way; the
+/// checking run's share of the waiting is the measure, not frame time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quiet {
+    Off,
+    Check,
+    On,
+}
+
+fn quiet() -> Quiet {
+    static ON: std::sync::OnceLock<Quiet> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MEMORY_QUIET").as_deref() {
+        Ok("1") => Quiet::On,
+        Ok("check") => Quiet::Check,
+        _ => Quiet::Off,
+    })
+}
+
+/// Per host view heap (by address): the first slot of its run, and how many
+/// copies have their view there. Written under the mutex after the views
+/// are in the heap, read there and by a quiet call ([`quiet`]).
+static HEAPS: std::sync::LazyLock<std::sync::RwLock<HashMap<usize, (u32, u32)>>> =
+    std::sync::LazyLock::new(Default::default);
+/// The frame the first look was done in ([`Memory::frame`]), for a quiet
+/// call; set where that is.
+static FRAME_LOOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// How many copies are numbered, set at the push ([`Memory::number`]).
+static COPIES_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// A builder dispatch would make an arena under the mutex (or ask the
+/// arenas thread for one): no builder call is quiet. Set wherever the
+/// mutex is let go by a call that may have used free pages.
+static TOP_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// What a quiet call returns besides the run: fixed once memory by address
+/// is made.
+static READY_AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+/// Since the last report: quiet calls returned, reading and building; with
+/// `=check` the calls judged quiet, of them those that did something, and
+/// their microseconds waiting for the mutex.
+static QUIET_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The keys [`ready`] gives its list's `first_use`; the quiet test asks
+/// the same ones (the two change together).
+const READ: usize = usize::MAX - 0x6d;
+/// A page named by a constant (kind 1) or a root view (kind 2).
+fn page_key(kind: usize, at: u64) -> usize {
+    usize::MAX - (kind << 26) - (at / PAGE) as usize
+}
+/// A root view the builder was given.
+fn view_key(at: u64) -> usize {
+    usize::MAX - (3 << 33) - (at >> 8) as usize
+}
+/// A root view the builder writes.
+fn written_key(at: u64) -> usize {
+    usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize
+}
+/// Every copy brought up, for `n` of them.
+fn copies_key(n: usize) -> usize {
+    usize::MAX - (6 << 33) - n
+}
+
+/// The title addresses `constants` name, in order: in two constants (low
+/// dword, then bits 32 to 39), or in one in 256-byte units (the builder's
+/// alone).
+fn constant_addresses(constants: &[u32], builds: bool, mut each: impl FnMut(u64)) {
+    for (i, &c) in constants.iter().enumerate() {
+        if let Some(&high) = constants.get(i + 1)
+            && (1..=0x1F).contains(&high)
+            && c >= 0x1_0000
+        {
+            each(u64::from(c) | u64::from(high) << 32);
+        }
+        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
+            each(u64::from(c) << 8);
+        }
+    }
+}
+
+/// What a call with these arguments returns if its list has used every key
+/// the long way of [`ready`] would give it, in the long way's order and
+/// short cuts: the view key of every root view above 4 GiB when it builds
+/// (asked before anything else of it), the written key only when it builds
+/// and writes it, the page key of kind 2 for each (a packed structure is
+/// only found inside a view key's first use), both constant forms, the copies
+/// key and READ; and nothing to do besides: the frame's first look done,
+/// no arena to make, the heap's run viewing every copy. None otherwise.
+fn quiet_call(
+    used: impl Fn(usize) -> bool,
+    heap: usize,
+    addresses: &[u64],
+    written: &[u64],
+    constants: &[u32],
+    builds: bool,
+) -> Option<Ready> {
+    use std::sync::atomic::Ordering::Acquire;
+    if FRAME_LOOKED.load(Acquire) != crate::frame::current() || (builds && TOP_UP.load(Acquire)) {
+        return None;
+    }
+    let copies = COPIES_NOW.load(Acquire);
+    let (base, made) = *HEAPS.read().unwrap_or_else(|e| e.into_inner()).get(&heap)?;
+    if made as usize != copies || !keys_used(used, addresses, written, constants, builds, copies) {
+        return None;
+    }
+    let &(directory, faults) = READY_AT.get()?;
+    Some(Ready { directory, faults, base })
+}
+
+/// Whether `used` holds every key [`ready`]'s long way would give a call
+/// with these arguments, `copies` copies numbered ([`quiet_call`]).
+fn keys_used(used: impl Fn(usize) -> bool, addresses: &[u64], written: &[u64], constants: &[u32], builds: bool, copies: usize) -> bool {
+    if !used(READ) || !used(copies_key(copies)) {
+        return false;
+    }
+    let mut all = true;
+    constant_addresses(constants, builds, |at| all = all && used(page_key(1, at)));
+    all && addresses.iter().filter(|&&a| a >= 1 << 32).all(|&at| {
+        (!builds || used(view_key(at)))
+            && (!builds || !written.contains(&at) || used(written_key(at)))
+            && used(page_key(2, at))
+    })
+}
+
+/// Whether a builder dispatch would make an arena (or ask for one ahead)
+/// with memory as it is: [`TOP_UP`] from here.
+fn note_top_up(m: &Memory) {
+    if quiet() == Quiet::Off {
+        return;
+    }
+    let frame = crate::frame::current();
+    let make = m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && frame >= m.no_arena_before;
+    let ahead = arenas_ahead()
+        && m.ahead.is_none()
+        && want_ahead(m.free.len(), m.pages.len(), m.copies.len())
+        && frame >= AHEAD_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+        && !AHEAD_BUSY.load(std::sync::atomic::Ordering::Relaxed);
+    TOP_UP.store(make || ahead, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether the builder's root view on a page held already is taken as the
+/// title's without asking the kernel again (`VICTORY_MEMORY_ASK_RUNS=1`, off
+/// by default), and the root views' time on the time line is split.
+///
+/// Asking is two kernel questions under the mutex (committed, and the write
+/// watch for one page), each list's first naming of the view, though the
+/// page has been held for minutes. Landing asks committed again at the
+/// submission, and the next look at the page asks the write watch with a
+/// later number, so nothing is missed; a held page the title gave back is
+/// no longer counted as turned down. Expected: about 7-10 us per held root
+/// view (QueryWorkingSetEx on 16 pages 5-7 us, a write watch asking about
+/// 2 us, measured apart from the game), 1-2 ms a frame of the list threads'
+/// time in the steady state; no measured share of the streaming frame until
+/// a run with the split says otherwise. The other questions per run of
+/// pages (one for the run, not one a page) are not made: through the
+/// guards they could protect memory that is not the title's.
+fn ask_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_ASK_RUNS").is_some_and(|v| v == "1"))
+}
+
 /// Whether the next arena is made ahead, by a thread of its own
 /// (`VICTORY_MEMORY_ARENAS_AHEAD=1`, off by default; with it unset no
 /// thread is started and [`Memory::another`] makes every arena as before).
@@ -297,9 +547,6 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -354,6 +601,11 @@ struct Stats {
     /// With [`arenas_ahead`]: arenas taken from the thread's slot, and
     /// arenas made on a recording thread under the mutex.
     arenas_made: [u64; 2],
+    /// With [`ask_runs`]: microseconds in `possible` and its calls, of them
+    /// the microseconds in the root views' section; microseconds there in
+    /// `named_in_upload` and in bringing up; root views whose page was held
+    /// and not asked about.
+    asks: [u64; 6],
     /// Of the pages shaders found empty: those below 4 GiB (not memory of
     /// the title's the directory covers: an offset on a base that read 0),
     /// those inside a structure the builder's calls named, and those of the
@@ -409,7 +661,6 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
-            heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
             no_arena_before: 0,
@@ -442,6 +693,17 @@ impl Memory {
     /// this frame, and the title's GPU memory. (A shader's pointer, or a
     /// constant taken for an address, may be anything.)
     fn possible(&mut self, page: u64) -> bool {
+        if !ask_runs() {
+            return self.possible_now(page);
+        }
+        let started = std::time::Instant::now();
+        let ours = self.possible_now(page);
+        self.stats.asks[0] += started.elapsed().as_micros() as u64;
+        self.stats.asks[1] += 1;
+        ours
+    }
+
+    fn possible_now(&mut self, page: u64) -> bool {
         // Not the last entry: addresses past the directory read it, and it
         // stays empty.
         if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
@@ -474,6 +736,8 @@ impl Memory {
             return None;
         }
         self.copies.push(shadow);
+        // (At the push: a quiet call never sees more copies than there are.)
+        COPIES_NOW.store(self.copies.len(), std::sync::atomic::Ordering::Release);
         let n = self.copies.len() - 1;
         self.numbers.insert(key, n);
         Some(n)
@@ -625,6 +889,15 @@ impl Memory {
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
+                // At a submission the place may be given again by `place`
+                // in the same `land`: the card's directory learns of the
+                // zero with this submission ([`land_sent`]). (Gone between
+                // submissions, the note costs the next one a page's look.)
+                if land_sent() {
+                    let entry = self.entry(page) as usize;
+                    crate::watch::wrote(entry, 8);
+                    note_landed(&self.directory.1, entry, entry + 8);
+                }
             }
         }
         self.stats.gone += 1;
@@ -830,6 +1103,13 @@ impl Memory {
         };
         self.hold(page, at, copy);
         crate::watch::wrote(self.entry(page) as usize, 8);
+        // The entry goes up with this submission, with the page's bytes
+        // ([`land_sent`]).
+        if land_sent() {
+            let entry = self.entry(page) as usize;
+            note_landed(&self.directory.1, entry, entry + 8);
+            LANDED_BYTES[0].fetch_add(8, std::sync::atomic::Ordering::Relaxed);
+        }
         self.take(page, 0, PAGE as usize, true);
         true
     }
@@ -851,10 +1131,22 @@ impl Memory {
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
                 crate::watch::wrote(held.at + at, n);
+                if land_sent() {
+                    note_landed(shadow, held.at + at, held.at + at + n);
+                    LANDED_BYTES[0].fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             at += n;
         }
         if whole {
+            // Told and noted whether the bytes differed or not: a list
+            // thread's `bring` may have stored them after the refresh in
+            // front of the steps, and then nothing above tells of them while
+            // the CPU side still holds the old ones ([`land_sent`]).
+            if land_sent() && from < to {
+                crate::watch::wrote(held.at + from, to - from);
+                note_landed(shadow, held.at + from, held.at + to);
+            }
             shadow.resend(base + from, base + to);
         }
     }
@@ -1077,6 +1369,44 @@ impl Memory {
             s.sized[1] as f64 / frames,
             s.no_arena,
         );
+        if ask_runs() {
+            let [all, calls, views, upload, up, held] = s.asks;
+            tracing::info!(
+                "title memory by address, root views split per frame (VICTORY_MEMORY_ASK_RUNS=1): {:.2} ms asking whether pages are \
+                 the title's ({:.1} askings), {:.2} ms of it in the root views; there {:.2} ms naming memory in upload buffers, \
+                 {:.2} ms bringing up, {:.2} ms the rest; {:.1} held pages of the builder's views not asked about",
+                ms(all),
+                calls as f64 / frames,
+                ms(views),
+                ms(upload),
+                ms(up),
+                ms(s.held[3].saturating_sub(views + upload + up)),
+                held as f64 / frames
+            );
+        }
+        if quiet() != Quiet::Off {
+            use std::sync::atomic::Ordering::Relaxed;
+            let [reads, builds, judged, did, waited] = [0, 1, 2, 3, 4].map(|i| QUIET_STATS[i].swap(0, Relaxed));
+            tracing::info!(
+                "title memory by address, quiet calls (VICTORY_MEMORY_QUIET): per frame {:.1} reading and {:.1} building returned \
+                 without the mutex (not in the counts above); checked: {:.1} a frame judged quiet, {:.1} ms a frame of the waiting \
+                 for the mutex at dispatches theirs ({:.0}%), and {} judged quiet that did something since the last line",
+                reads as f64 / frames,
+                builds as f64 / frames,
+                judged as f64 / frames,
+                ms(waited),
+                100.0 * waited as f64 / s.waited.max(1) as f64,
+                did
+            );
+        }
+        if land_sent() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let [stored, read] = [0, 1].map(|i| LANDED_BYTES[i].swap(0, Relaxed) as f64 / 1e6 / frames);
+            tracing::info!(
+                "title memory by address, per frame (VICTORY_MEMORY_LAND_SENT=1): {stored:.2} MB stored at submissions by \
+                 landing, {read:.2} MB of stale pages read into the CPU side behind it for the same submission's sends"
+            );
+        }
         if arenas_ahead() {
             use std::sync::atomic::Ordering::Relaxed;
             let [made, micros, failed] = [0, 1, 2].map(|i| AHEAD_STATS[i].swap(0, Relaxed));
@@ -1322,6 +1652,37 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
+    let builds = use_ != Use::Reads;
+    // A call that names nothing new needs nothing under the lock
+    // ([`quiet`]). The size key is given first: it is the list's alone.
+    // (Not while the diagnostics trace or dump look at every call.)
+    #[cfg(feature = "diagnostics")]
+    let looked_at = trace::on() || dump::folder().is_some();
+    #[cfg(not(feature = "diagnostics"))]
+    let looked_at = false;
+    let mut judged_quiet = false;
+    if quiet() != Quiet::Off && !looked_at {
+        if builds && sizes_wait() && asks_size(written, constants, threads) {
+            list.first_use(SIZES);
+        }
+        let heap_key = std::ptr::from_ref(heap) as usize;
+        if let Some(ready) = quiet_call(|key| list.used(key), heap_key, addresses, written, constants, builds) {
+            if quiet() == Quiet::On {
+                QUIET_STATS[usize::from(builds)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(ready);
+            }
+            judged_quiet = true;
+        }
+    }
+    // With `VICTORY_MEMORY_QUIET=check`: whether this call did anything
+    // under the lock (a key's first use, the frame's first look, an arena,
+    // a heap's run or a view).
+    let did = std::cell::Cell::new(false);
+    let first_use = |key: usize| {
+        let first = list.first_use(key);
+        did.set(did.get() | first);
+        first
+    };
     // (Timed in sections for the report's line: see `Stats::held`.)
     let asked = std::time::Instant::now();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1331,6 +1692,14 @@ pub(crate) fn ready(
     let m = guard.as_mut()?;
     let mut mark = std::time::Instant::now();
     m.stats.waited += mark.duration_since(asked).as_micros() as u64;
+    if quiet() != Quiet::Off {
+        let directory = &m.directory.1;
+        READY_AT.get_or_init(|| (directory.gpu(directory.span().0), m.faults.2));
+        if judged_quiet {
+            QUIET_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QUIET_STATS[4].fetch_add(mark.duration_since(asked).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     // The time since the last mark goes to section `i`.
     let mut section = |m: &mut Memory, i: usize| {
         let now = std::time::Instant::now();
@@ -1346,17 +1715,22 @@ pub(crate) fn ready(
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
+        // (After the look: a quiet call finds it done.)
+        FRAME_LOOKED.store(frame, std::sync::atomic::Ordering::Release);
+        did.set(true);
     }
     section(m, 0);
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
-    let builds = use_ != Use::Reads;
-    if builds && sizes_wait() && asks_size(written, constants, threads) {
+    // (Given before the lock with a quiet switch.)
+    if quiet() == Quiet::Off && builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {
+        did.set(true);
+    }
     // The next arena made ahead while there is still room ([`arenas_ahead`]).
     if builds && arenas_ahead() && m.ahead.is_none() && want_ahead(m.free.len(), m.pages.len(), m.copies.len()) {
         wake_ahead();
@@ -1364,41 +1738,37 @@ pub(crate) fn ready(
     section(m, 1);
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
-    // a frame with the same arguments.
-    const READ: usize = usize::MAX - 0x6d;
-    let named = |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
+    // a frame with the same arguments. (The keys change together with
+    // `quiet_call`'s.)
+    let named = |kind: usize, at: u64| first_use(page_key(kind, at));
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units (the builder's alone). A constant that only
     // looks like one names memory nothing reads; one that is not the title's
     // memory is refused.
     let held = |m: &Memory| m.pages.len() as u64;
     let before = held(m);
-    for (i, &c) in constants.iter().enumerate() {
-        if let Some(&high) = constants.get(i + 1)
-            && (1..=0x1F).contains(&high)
-            && c >= 0x1_0000
-        {
-            let at = u64::from(c) | u64::from(high) << 32;
-            if named(1, at) {
-                m.ready(at, 1);
-            }
+    constant_addresses(constants, builds, |at| {
+        if named(1, at) {
+            m.ready(at, 1);
         }
-        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
-            let at = u64::from(c) << 8;
-            if named(1, at) {
-                m.ready(at, 1);
-            }
-        }
-    }
+    });
     let mut came = [held(m) - before, 0, 0, 0];
     section(m, 2);
+    // (`possible`'s time in this section, for [`ask_runs`]'s line.)
+    let asked_before = m.stats.asks[0];
+    // With [`ask_runs`] a page held already is not asked about again.
+    let held_page = |m: &mut Memory, page: u64| {
+        let held = ask_runs() && m.pages.contains_key(&page);
+        m.stats.asks[5] += u64::from(held);
+        held
+    };
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
         if builds
-            && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize)
+            && first_use(view_key(at))
             && crate::shadow::in_buffer(at, 1).is_none()
-            && m.possible(at / PAGE)
+            && (held_page(m, at / PAGE) || m.possible(at / PAGE))
         {
             // What it needs, as far as it is known now; the rest when the
             // list is submitted ([`Memory::land`]).
@@ -1422,16 +1792,22 @@ pub(crate) fn ready(
                     m.land(at);
                     m.stats.landing[0] += got.duration_since(asked).as_micros() as u64;
                     m.stats.landing[1] += got.elapsed().as_micros() as u64;
+                    // (Landing may have placed pages from the free ones.)
+                    note_top_up(m);
                 }
             });
+            let started = ask_runs().then(std::time::Instant::now);
             m.bring_up(list);
+            if let Some(started) = started {
+                m.stats.asks[4] += started.elapsed().as_micros() as u64;
+            }
             m.stats.brought_up += 1;
         }
-        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
+        if builds && written.contains(&at) && first_use(written_key(at)) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
-                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
+                && first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
             {
                 m.small(list, start, len);
             }
@@ -1457,7 +1833,11 @@ pub(crate) fn ready(
         match crate::shadow::in_buffer(at, 1) {
             Some(_) => {
                 m.ready(at, 1);
+                let started = ask_runs().then(std::time::Instant::now);
                 m.named_in_upload(at);
+                if let Some(started) = started {
+                    m.stats.asks[3] += started.elapsed().as_micros() as u64;
+                }
                 came[3] += held(m).saturating_sub(before);
             }
             None => {
@@ -1473,33 +1853,41 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    m.stats.asks[2] += m.stats.asks[0] - asked_before;
     section(m, 3);
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
+    let run = HEAPS.read().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
+    let (base, made) = match run {
+        Some(run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let Some(base) = heap.dynamic(COPIES + 1) else {
+                note_top_up(m);
+                return None;
+            };
             // Every slot of the run: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
             }
+            did.set(true);
             (base, 0)
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        did.set(true);
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    // (After the views are in the heap: a quiet call may use them.)
+    HEAPS.write().unwrap_or_else(|e| e.into_inner()).insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
     // may run after this one's (structures unpacked from zeros, and then
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
-    let first_read = list.first_use(READ);
-    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
+    let first_read = first_use(READ);
+    if first_use(copies_key(m.copies.len())) {
         m.bring_up(list);
     }
     if first_read {
@@ -1512,6 +1900,10 @@ pub(crate) fn ready(
         m.dump.walked(addresses);
     }
     section(m, 4);
+    note_top_up(m);
+    if judged_quiet && did.get() {
+        QUIET_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
@@ -1536,7 +1928,7 @@ mod trace {
         said: u32,
     }
 
-    fn on() -> bool {
+    pub(super) fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1"))
     }
@@ -1642,7 +2034,7 @@ mod dump {
         }
     }
 
-    fn folder() -> Option<&'static std::path::PathBuf> {
+    pub(super) fn folder() -> Option<&'static std::path::PathBuf> {
         static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
         FOLDER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into)).as_ref()
     }
@@ -1726,6 +2118,60 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call is quiet only when its list used every key the long way gives
+    /// it: both constant forms (the second only when it builds), the view,
+    /// written and page keys of root views above 4 GiB, the copies key for
+    /// the present count and READ.
+    #[test]
+    fn a_call_is_quiet_only_with_every_key_used() {
+        let (low, high, units) = (0x2234_0000u32, 0x3u32, 0x0200_0000u32);
+        let constants = [low, high, units];
+        let (view, other, small) = (0x5_0000_0100u64, 0x6_0000_0000u64, 0x8000u64);
+        let mut seen = Vec::new();
+        constant_addresses(&constants, true, |at| seen.push(at));
+        assert_eq!(seen, vec![0x3_2234_0000, u64::from(units) << 8]);
+        seen.clear();
+        constant_addresses(&constants, false, |at| seen.push(at));
+        assert_eq!(seen, vec![0x3_2234_0000]);
+        let every = |builds: bool| {
+            let mut keys = std::collections::HashSet::from([READ, copies_key(2), page_key(1, 0x3_2234_0000)]);
+            if builds {
+                keys.extend([page_key(1, u64::from(units) << 8), view_key(view), written_key(view), view_key(other)]);
+            }
+            keys.extend([page_key(2, view), page_key(2, other)]);
+            keys
+        };
+        let (addresses, written) = ([view, other, small], [view]);
+        for builds in [false, true] {
+            let keys = every(builds);
+            assert!(keys_used(|k| keys.contains(&k), &addresses, &written, &constants, builds, 2));
+            // A new copy numbered since: the long way brings every copy up.
+            assert!(!keys_used(|k| keys.contains(&k), &addresses, &written, &constants, builds, 3));
+            // Any key missing sends the call the long way.
+            for missing in &keys {
+                assert!(!keys_used(|k| k != *missing && keys.contains(&k), &addresses, &written, &constants, builds, 2));
+            }
+        }
+        // A reading call is not asked the builder's keys.
+        let reads = every(false);
+        assert!(!reads.contains(&view_key(view)));
+    }
+
+    /// What is noted for a submission is whole pages of the copy, cut to its
+    /// span, and runs of one copy that meet are joined.
+    #[test]
+    fn landed_pages_are_whole_and_joined_by_copy() {
+        let page = PAGE as usize;
+        let first = 16 * page;
+        assert_eq!(whole_pages(first + 10, first + 20, first, 4 * page), Some((first, first + page)));
+        assert_eq!(whole_pages(first - 10, first + page + 1, first, 4 * page), Some((first, first + 2 * page)));
+        assert_eq!(whole_pages(first + 3 * page + 1, first + 9 * page, first, 4 * page), Some((first + 3 * page, first + 4 * page)));
+        assert_eq!(whole_pages(first + 8, first + 8, first, 4 * page), None);
+        assert_eq!(whole_pages(first + 5 * page, first + 6 * page, first, 4 * page), None);
+        let runs = vec![(2, 'b', 0, 10), (1, 'a', 20, 30), (1, 'a', 0, 10), (1, 'a', 10, 15), (2, 'b', 5, 40)];
+        assert_eq!(joined(runs), vec![('a', 0, 15), ('a', 20, 30), ('b', 0, 40)]);
+    }
 
     /// An arena is wanted ahead while fewer than twice the spare pages are
     /// free, and only with room for all of its pages and for its number.
