@@ -207,6 +207,154 @@ pub(crate) fn landed_read(bytes: usize) {
     LANDED_BYTES[1].fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// What a builder or reading dispatch whose every key its list has used
+/// already does ([`ready`]): `VICTORY_MEMORY_QUIET=1` returns it before the
+/// mutex is taken; `=check` judges every call so before taking the mutex,
+/// takes it all the same, and counts the calls judged quiet that did
+/// something under it (that count must stay 0 over a streaming run before
+/// `=1` is used); unset, every call takes the mutex as before.
+///
+/// Such a call only finds the heap's run under the lock. The saving is
+/// thread time spent waiting, not time under the lock, and only with the
+/// title's ray tracing: in the newest run with this line (224808) the
+/// threads waited 55.5 ms a frame at dispatches in its first window and 2-8
+/// ms after, and the time under the lock is the same either way; the
+/// checking run's share of the waiting is the measure, not frame time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quiet {
+    Off,
+    Check,
+    On,
+}
+
+fn quiet() -> Quiet {
+    static ON: std::sync::OnceLock<Quiet> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_MEMORY_QUIET").as_deref() {
+        Ok("1") => Quiet::On,
+        Ok("check") => Quiet::Check,
+        _ => Quiet::Off,
+    })
+}
+
+/// Per host view heap (by address): the first slot of its run, and how many
+/// copies have their view there. Written under the mutex after the views
+/// are in the heap, read there and by a quiet call ([`quiet`]).
+static HEAPS: std::sync::LazyLock<std::sync::RwLock<HashMap<usize, (u32, u32)>>> =
+    std::sync::LazyLock::new(Default::default);
+/// The frame the first look was done in ([`Memory::frame`]), for a quiet
+/// call; set where that is.
+static FRAME_LOOKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// How many copies are numbered, set at the push ([`Memory::number`]).
+static COPIES_NOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// A builder dispatch would make an arena under the mutex (or ask the
+/// arenas thread for one): no builder call is quiet. Set wherever the
+/// mutex is let go by a call that may have used free pages.
+static TOP_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// What a quiet call returns besides the run: fixed once memory by address
+/// is made.
+static READY_AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+/// Since the last report: quiet calls returned, reading and building; with
+/// `=check` the calls judged quiet, of them those that did something, and
+/// their microseconds waiting for the mutex.
+static QUIET_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The keys [`ready`] gives its list's `first_use`; the quiet test asks
+/// the same ones (the two change together).
+const READ: usize = usize::MAX - 0x6d;
+/// A page named by a constant (kind 1) or a root view (kind 2).
+fn page_key(kind: usize, at: u64) -> usize {
+    usize::MAX - (kind << 26) - (at / PAGE) as usize
+}
+/// A root view the builder was given.
+fn view_key(at: u64) -> usize {
+    usize::MAX - (3 << 33) - (at >> 8) as usize
+}
+/// A root view the builder writes.
+fn written_key(at: u64) -> usize {
+    usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize
+}
+/// Every copy brought up, for `n` of them.
+fn copies_key(n: usize) -> usize {
+    usize::MAX - (6 << 33) - n
+}
+
+/// The title addresses `constants` name, in order: in two constants (low
+/// dword, then bits 32 to 39), or in one in 256-byte units (the builder's
+/// alone).
+fn constant_addresses(constants: &[u32], builds: bool, mut each: impl FnMut(u64)) {
+    for (i, &c) in constants.iter().enumerate() {
+        if let Some(&high) = constants.get(i + 1)
+            && (1..=0x1F).contains(&high)
+            && c >= 0x1_0000
+        {
+            each(u64::from(c) | u64::from(high) << 32);
+        }
+        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
+            each(u64::from(c) << 8);
+        }
+    }
+}
+
+/// What a call with these arguments returns if its list has used every key
+/// the long way of [`ready`] would give it, in the long way's order and
+/// short cuts: the view key of every root view above 4 GiB when it builds
+/// (asked before anything else of it), the written key only when it builds
+/// and writes it, the page key of kind 2 for each (a packed structure is
+/// only found inside a view key's first use), both constant forms, the copies
+/// key and READ; and nothing to do besides: the frame's first look done,
+/// no arena to make, the heap's run viewing every copy. None otherwise.
+fn quiet_call(
+    used: impl Fn(usize) -> bool,
+    heap: usize,
+    addresses: &[u64],
+    written: &[u64],
+    constants: &[u32],
+    builds: bool,
+) -> Option<Ready> {
+    use std::sync::atomic::Ordering::Acquire;
+    if FRAME_LOOKED.load(Acquire) != crate::frame::current() || (builds && TOP_UP.load(Acquire)) {
+        return None;
+    }
+    let copies = COPIES_NOW.load(Acquire);
+    let (base, made) = *HEAPS.read().unwrap_or_else(|e| e.into_inner()).get(&heap)?;
+    if made as usize != copies || !keys_used(used, addresses, written, constants, builds, copies) {
+        return None;
+    }
+    let &(directory, faults) = READY_AT.get()?;
+    Some(Ready { directory, faults, base })
+}
+
+/// Whether `used` holds every key [`ready`]'s long way would give a call
+/// with these arguments, `copies` copies numbered ([`quiet_call`]).
+fn keys_used(used: impl Fn(usize) -> bool, addresses: &[u64], written: &[u64], constants: &[u32], builds: bool, copies: usize) -> bool {
+    if !used(READ) || !used(copies_key(copies)) {
+        return false;
+    }
+    let mut all = true;
+    constant_addresses(constants, builds, |at| all = all && used(page_key(1, at)));
+    all && addresses.iter().filter(|&&a| a >= 1 << 32).all(|&at| {
+        (!builds || used(view_key(at)))
+            && (!builds || !written.contains(&at) || used(written_key(at)))
+            && used(page_key(2, at))
+    })
+}
+
+/// Whether a builder dispatch would make an arena (or ask for one ahead)
+/// with memory as it is: [`TOP_UP`] from here.
+fn note_top_up(m: &Memory) {
+    if quiet() == Quiet::Off {
+        return;
+    }
+    let frame = crate::frame::current();
+    let make = m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && frame >= m.no_arena_before;
+    let ahead = arenas_ahead()
+        && m.ahead.is_none()
+        && want_ahead(m.free.len(), m.pages.len(), m.copies.len())
+        && frame >= AHEAD_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+        && !AHEAD_BUSY.load(std::sync::atomic::Ordering::Relaxed);
+    TOP_UP.store(make || ahead, std::sync::atomic::Ordering::Release);
+}
+
 /// Whether the next arena is made ahead, by a thread of its own
 /// (`VICTORY_MEMORY_ARENAS_AHEAD=1`, off by default; with it unset no
 /// thread is started and [`Memory::another`] makes every arena as before).
@@ -378,9 +526,6 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -490,7 +635,6 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
-            heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
             no_arena_before: 0,
@@ -555,6 +699,8 @@ impl Memory {
             return None;
         }
         self.copies.push(shadow);
+        // (At the push: a quiet call never sees more copies than there are.)
+        COPIES_NOW.store(self.copies.len(), std::sync::atomic::Ordering::Release);
         let n = self.copies.len() - 1;
         self.numbers.insert(key, n);
         Some(n)
@@ -1186,6 +1332,21 @@ impl Memory {
             s.sized[1] as f64 / frames,
             s.no_arena,
         );
+        if quiet() != Quiet::Off {
+            use std::sync::atomic::Ordering::Relaxed;
+            let [reads, builds, judged, did, waited] = [0, 1, 2, 3, 4].map(|i| QUIET_STATS[i].swap(0, Relaxed));
+            tracing::info!(
+                "title memory by address, quiet calls (VICTORY_MEMORY_QUIET): per frame {:.1} reading and {:.1} building returned \
+                 without the mutex (not in the counts above); checked: {:.1} a frame judged quiet, {:.1} ms a frame of the waiting \
+                 for the mutex at dispatches theirs ({:.0}%), and {} judged quiet that did something since the last line",
+                reads as f64 / frames,
+                builds as f64 / frames,
+                judged as f64 / frames,
+                ms(waited),
+                100.0 * waited as f64 / s.waited.max(1) as f64,
+                did
+            );
+        }
         if land_sent() {
             use std::sync::atomic::Ordering::Relaxed;
             let [stored, read] = [0, 1].map(|i| LANDED_BYTES[i].swap(0, Relaxed) as f64 / 1e6 / frames);
@@ -1439,6 +1600,37 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
+    let builds = use_ != Use::Reads;
+    // A call that names nothing new needs nothing under the lock
+    // ([`quiet`]). The size key is given first: it is the list's alone.
+    // (Not while the diagnostics trace or dump look at every call.)
+    #[cfg(feature = "diagnostics")]
+    let looked_at = trace::on() || dump::folder().is_some();
+    #[cfg(not(feature = "diagnostics"))]
+    let looked_at = false;
+    let mut judged_quiet = false;
+    if quiet() != Quiet::Off && !looked_at {
+        if builds && sizes_wait() && asks_size(written, constants, threads) {
+            list.first_use(SIZES);
+        }
+        let heap_key = std::ptr::from_ref(heap) as usize;
+        if let Some(ready) = quiet_call(|key| list.used(key), heap_key, addresses, written, constants, builds) {
+            if quiet() == Quiet::On {
+                QUIET_STATS[usize::from(builds)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(ready);
+            }
+            judged_quiet = true;
+        }
+    }
+    // With `VICTORY_MEMORY_QUIET=check`: whether this call did anything
+    // under the lock (a key's first use, the frame's first look, an arena,
+    // a heap's run or a view).
+    let did = std::cell::Cell::new(false);
+    let first_use = |key: usize| {
+        let first = list.first_use(key);
+        did.set(did.get() | first);
+        first
+    };
     // (Timed in sections for the report's line: see `Stats::held`.)
     let asked = std::time::Instant::now();
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -1448,6 +1640,14 @@ pub(crate) fn ready(
     let m = guard.as_mut()?;
     let mut mark = std::time::Instant::now();
     m.stats.waited += mark.duration_since(asked).as_micros() as u64;
+    if quiet() != Quiet::Off {
+        let directory = &m.directory.1;
+        READY_AT.get_or_init(|| (directory.gpu(directory.span().0), m.faults.2));
+        if judged_quiet {
+            QUIET_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            QUIET_STATS[4].fetch_add(mark.duration_since(asked).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     // The time since the last mark goes to section `i`.
     let mut section = |m: &mut Memory, i: usize| {
         let now = std::time::Instant::now();
@@ -1463,17 +1663,22 @@ pub(crate) fn ready(
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
+        // (After the look: a quiet call finds it done.)
+        FRAME_LOOKED.store(frame, std::sync::atomic::Ordering::Release);
+        did.set(true);
     }
     section(m, 0);
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
-    let builds = use_ != Use::Reads;
-    if builds && sizes_wait() && asks_size(written, constants, threads) {
+    // (Given before the lock with a quiet switch.)
+    if quiet() == Quiet::Off && builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {
+        did.set(true);
+    }
     // The next arena made ahead while there is still room ([`arenas_ahead`]).
     if builds && arenas_ahead() && m.ahead.is_none() && want_ahead(m.free.len(), m.pages.len(), m.copies.len()) {
         wake_ahead();
@@ -1481,39 +1686,27 @@ pub(crate) fn ready(
     section(m, 1);
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
-    // a frame with the same arguments.
-    const READ: usize = usize::MAX - 0x6d;
-    let named = |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
+    // a frame with the same arguments. (The keys change together with
+    // `quiet_call`'s.)
+    let named = |kind: usize, at: u64| first_use(page_key(kind, at));
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units (the builder's alone). A constant that only
     // looks like one names memory nothing reads; one that is not the title's
     // memory is refused.
     let held = |m: &Memory| m.pages.len() as u64;
     let before = held(m);
-    for (i, &c) in constants.iter().enumerate() {
-        if let Some(&high) = constants.get(i + 1)
-            && (1..=0x1F).contains(&high)
-            && c >= 0x1_0000
-        {
-            let at = u64::from(c) | u64::from(high) << 32;
-            if named(1, at) {
-                m.ready(at, 1);
-            }
+    constant_addresses(constants, builds, |at| {
+        if named(1, at) {
+            m.ready(at, 1);
         }
-        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
-            let at = u64::from(c) << 8;
-            if named(1, at) {
-                m.ready(at, 1);
-            }
-        }
-    }
+    });
     let mut came = [held(m) - before, 0, 0, 0];
     section(m, 2);
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
         if builds
-            && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize)
+            && first_use(view_key(at))
             && crate::shadow::in_buffer(at, 1).is_none()
             && m.possible(at / PAGE)
         {
@@ -1539,16 +1732,18 @@ pub(crate) fn ready(
                     m.land(at);
                     m.stats.landing[0] += got.duration_since(asked).as_micros() as u64;
                     m.stats.landing[1] += got.elapsed().as_micros() as u64;
+                    // (Landing may have placed pages from the free ones.)
+                    note_top_up(m);
                 }
             });
             m.bring_up(list);
             m.stats.brought_up += 1;
         }
-        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
+        if builds && written.contains(&at) && first_use(written_key(at)) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
-                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
+                && first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
             {
                 m.small(list, start, len);
             }
@@ -1592,31 +1787,38 @@ pub(crate) fn ready(
     }
     section(m, 3);
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
+    let run = HEAPS.read().unwrap_or_else(|e| e.into_inner()).get(&key).copied();
+    let (base, made) = match run {
+        Some(run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            let Some(base) = heap.dynamic(COPIES + 1) else {
+                note_top_up(m);
+                return None;
+            };
             // Every slot of the run: a number shows no view of another kind.
             for n in 0..=COPIES {
                 heap.null_raw_uav_at(base + n);
             }
+            did.set(true);
             (base, 0)
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        did.set(true);
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    // (After the views are in the heap: a quiet call may use them.)
+    HEAPS.write().unwrap_or_else(|e| e.into_inner()).insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
     // may run after this one's (structures unpacked from zeros, and then
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
-    let first_read = list.first_use(READ);
-    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
+    let first_read = first_use(READ);
+    if first_use(copies_key(m.copies.len())) {
         m.bring_up(list);
     }
     if first_read {
@@ -1629,6 +1831,10 @@ pub(crate) fn ready(
         m.dump.walked(addresses);
     }
     section(m, 4);
+    note_top_up(m);
+    if judged_quiet && did.get() {
+        QUIET_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
@@ -1653,7 +1859,7 @@ mod trace {
         said: u32,
     }
 
-    fn on() -> bool {
+    pub(super) fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1"))
     }
@@ -1759,7 +1965,7 @@ mod dump {
         }
     }
 
-    fn folder() -> Option<&'static std::path::PathBuf> {
+    pub(super) fn folder() -> Option<&'static std::path::PathBuf> {
         static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
         FOLDER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into)).as_ref()
     }
@@ -1843,6 +2049,45 @@ mod dump {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call is quiet only when its list used every key the long way gives
+    /// it: both constant forms (the second only when it builds), the view,
+    /// written and page keys of root views above 4 GiB, the copies key for
+    /// the present count and READ.
+    #[test]
+    fn a_call_is_quiet_only_with_every_key_used() {
+        let (low, high, units) = (0x2234_0000u32, 0x3u32, 0x0200_0000u32);
+        let constants = [low, high, units];
+        let (view, other, small) = (0x5_0000_0100u64, 0x6_0000_0000u64, 0x8000u64);
+        let mut seen = Vec::new();
+        constant_addresses(&constants, true, |at| seen.push(at));
+        assert_eq!(seen, vec![0x3_2234_0000, u64::from(units) << 8]);
+        seen.clear();
+        constant_addresses(&constants, false, |at| seen.push(at));
+        assert_eq!(seen, vec![0x3_2234_0000]);
+        let every = |builds: bool| {
+            let mut keys = std::collections::HashSet::from([READ, copies_key(2), page_key(1, 0x3_2234_0000)]);
+            if builds {
+                keys.extend([page_key(1, u64::from(units) << 8), view_key(view), written_key(view), view_key(other)]);
+            }
+            keys.extend([page_key(2, view), page_key(2, other)]);
+            keys
+        };
+        let (addresses, written) = ([view, other, small], [view]);
+        for builds in [false, true] {
+            let keys = every(builds);
+            assert!(keys_used(|k| keys.contains(&k), &addresses, &written, &constants, builds, 2));
+            // A new copy numbered since: the long way brings every copy up.
+            assert!(!keys_used(|k| keys.contains(&k), &addresses, &written, &constants, builds, 3));
+            // Any key missing sends the call the long way.
+            for missing in &keys {
+                assert!(!keys_used(|k| k != *missing && keys.contains(&k), &addresses, &written, &constants, builds, 2));
+            }
+        }
+        // A reading call is not asked the builder's keys.
+        let reads = every(false);
+        assert!(!reads.contains(&view_key(view)));
+    }
 
     /// What is noted for a submission is whole pages of the copy, cut to its
     /// span, and runs of one copy that meet are joined.
