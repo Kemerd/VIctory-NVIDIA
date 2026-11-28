@@ -1,5 +1,5 @@
 @echo off
-rem One-click Unspecified Xbox Game on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
+rem One-click start of the game on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
 rem   PLAY_FRAMEGEN.cmd          menu
 rem   PLAY_FRAMEGEN.cmd 1..6     start that mode directly
 rem   PLAY_FRAMEGEN.cmd check    only show paths and what is ready

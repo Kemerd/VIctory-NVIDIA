@@ -436,7 +436,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 
 /// Runs the constrained-change routines (constrained), then the suspend
 /// routines (quiesced), as the console does when it suspends a title.
-/// Unspecified Xbox Game's suspend routine waits for a state that only its
+/// The title's suspend routine waits for a state that only its
 /// constrained routine brings about; called alone it never returns.
 fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
     for &(_, routine, context) in constrain.iter().chain(suspend) {
@@ -501,6 +501,8 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // A pad left rumbling would run on until it is switched off.
+    crate::modules::gameinput::stop_rumble();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

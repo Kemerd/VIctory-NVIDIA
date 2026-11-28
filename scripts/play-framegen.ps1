@@ -1,4 +1,4 @@
-# One-click Unspecified Xbox Game on trustno1-coder/VIctory-NVIDIA (foxhound base): DLSS Super Resolution + DLSS frame generation.
+# One-click start of the game on trustno1-coder/VIctory-NVIDIA (foxhound base): DLSS Super Resolution + DLSS frame generation.
 # PLAY_FRAMEGEN.cmd runs this. What it does, in order:
 #   1. finds the game folder (game_dir.txt in the repository folder, else a search of every drive)
 #   2. backs up the saves (%LOCALAPPDATA%\victory\data\7952987A) and checks every file by SHA-256
@@ -106,7 +106,7 @@ if ($hagsOff) { Write-Host 'Hardware-accelerated GPU scheduling is off: frame ge
 
 # 4. Start (play-foxhound.ps1 builds target\release\victory.exe the first time).
 if (-not (Test-Path $victory)) { Write-Host 'First start: building the layer, a few minutes ...' }
-Write-Host "Starting Unspecified Xbox Game: $what"
+Write-Host "Starting the game: $what"
 Write-Host 'In the game: F1 settings menu, F3 stats panel. Keep this window open while playing.'
 $env:VICTORY_GAME_DIR = $GameDir
 $ErrorActionPreference = 'Continue'
