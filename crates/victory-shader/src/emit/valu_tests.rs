@@ -2493,3 +2493,86 @@ fn typed_stores_of_some_channels_write_zero_to_the_rest() {
         }
     }
 }
+
+
+#[test]
+fn v_ldexp_f32_scales_exactly_in_every_range() {
+    // v_ldexp_f32 v0, v1, v2 (VOP3 opcode 0x362): v1 * 2^(v2 as i32).
+    let shader = build_valu_cs(&vop3(0x362, 0, vgpr(1), vgpr(2), 0));
+    let f = f32::to_bits;
+    let denorm = 0x0000_0003u32;
+    let xs = [
+        f(1.0),
+        f(-1.5),
+        f(3.0e-39),
+        f(f32::MAX),
+        f(f32::MIN_POSITIVE),
+        f(0.0),
+        f(-0.0),
+        f(f32::INFINITY),
+        f(f32::NEG_INFINITY),
+        f(1.0000001),
+        f(f32::NAN),
+        denorm,
+        0x007F_FFFF,
+    ];
+    let ns = [
+        0i32, 1, -1, 23, -23, 126, 127, 128, -126, -127, -128, -149, -150, -151, -200, 200, 254,
+        300, -300, 1000, -1000, i32::MAX, i32::MIN,
+    ];
+    // The console runs its programs with fp32 denormals flushed, in and out.
+    // The word at +0x44 of every program record (FSSM) is 0xC0 in all 2,296
+    // saved programs of every stage; as a MODE register value (FP_ROUND[3:0],
+    // FP_DENORM[7:4]) that is denorm32 = 0 (flush) and denorm16_64 = 3 (keep),
+    // the default of Mesa's ACO (`enum fp_denorm`, `struct float_mode` in
+    // aco_ir.h). So a denormal source reads as a zero of its sign and a
+    // denormal result is a zero of its sign, as the card does.
+    let flush = |x: f32| if x.is_subnormal() { 0.0f32.copysign(x) } else { x };
+    // One rounding of the exact scaled value; f64 holds it exactly.
+    let want = |x: u32, n: i32| {
+        let x = f32::from_bits(x);
+        if x.is_nan() {
+            return None;
+        }
+        let n = n.clamp(-300, 300);
+        Some(flush((flush(x) as f64 * 2.0f64.powi(n)) as f32))
+    };
+    let mut cases = Vec::new();
+    for &x in &xs {
+        for &n in &ns {
+            cases.push((x, n));
+        }
+    }
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, n)| [x, n as u32, 0, 0]).collect();
+    // The body reads v1 and v2, the copies of root constants s0 and s1.
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (x, n) = cases[i];
+        match want(x, n) {
+            Some(w) => assert_eq!(
+                got,
+                w.to_bits(),
+                "{backend}: v_ldexp_f32({:#010x}, {n}) = {got:#010x}, want {:#010x}",
+                x,
+                w.to_bits(),
+            ),
+            None => assert!(f32::from_bits(got).is_nan(), "{backend}: NaN input"),
+        }
+    });
+}
+
+#[test]
+fn scalar_pack_halves_take_the_chosen_halves() {
+    // s_pack_{ll,lh,hh}_b32_b16 s16, s0, s1 (SOP2 opcodes 0x32..0x34).
+    let inputs = [[0xAAAA_1111, 0xBBBB_2222, 0, 0], [0x1234_5678, 0x9ABC_DEF0, 0, 0]];
+    let want = |op: u8, a: u32, b: u32| match op {
+        0x32 => (a & 0xFFFF) | b << 16,
+        0x33 => (a & 0xFFFF) | (b & 0xFFFF_0000),
+        _ => (a >> 16) | (b & 0xFFFF_0000),
+    };
+    for op in [0x32u8, 0x33, 0x34] {
+        let shader = build_valu_cs(&[sop2(op, 16, 0, 1), vop1(1, 0, sgpr(16))]);
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            assert_eq!(got, want(op, inp[0], inp[1]), "{backend}: pack {op:#x} case {i}");
+        });
+    }
+}

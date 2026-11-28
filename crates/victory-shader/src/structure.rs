@@ -376,6 +376,74 @@ impl Bools {
         r
     }
 
+    /// Whether no root tells the join `id` apart in a lane of `edge` (see
+    /// [`Structured::unseen`]); `edges` are every join's (join, lanes, mask brought).
+    /// A join that takes `id` into the mask it brings on its own edge is followed: its
+    /// readers are the roots, with that mask in place of the join.
+    fn unobserved(
+        &mut self,
+        roots: &[Bool],
+        edges: &[(Value, Bool, Bool)],
+        id: Value,
+        edge: Bool,
+    ) -> bool {
+        let Some(&v) = self.ids.get(&Atom::Phi(id)) else {
+            return true;
+        };
+        let mut budget = 256;
+        self.unobserved_var(roots.to_vec(), edges.to_vec(), v, edge, &mut budget)
+    }
+
+    fn unobserved_var(
+        &mut self,
+        roots: Vec<Bool>,
+        edges: Vec<(Value, Bool, Bool)>,
+        v: u32,
+        lanes: Bool,
+        budget: &mut usize,
+    ) -> bool {
+        if !roots.iter().all(|&f| self.same_either_way(f, v, lanes)) {
+            return false;
+        }
+        for (k, &(other, e, m)) in edges.iter().enumerate() {
+            if !self.vars(m).contains(&v) {
+                continue;
+            }
+            let Some(&y) = self.ids.get(&Atom::Phi(other)) else {
+                continue;
+            };
+            if y == v || *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            let into = self.and(lanes, e);
+            let put = |b: &mut Self, f: Bool| {
+                let f0 = b.restrict(f, y, false, &mut Map::default());
+                let f1 = b.restrict(f, y, true, &mut Map::default());
+                b.ite(m, f1, f0)
+            };
+            let roots: Vec<Bool> = roots.iter().map(|&f| put(self, f)).collect();
+            let rest: Vec<_> = edges
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != k)
+                .map(|(_, &(z, ez, mz))| (z, ez, put(self, mz)))
+                .collect();
+            if !self.unobserved_var(roots, rest, v, into, budget) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `f` does not depend on the variable `v` in any lane of `lanes`.
+    fn same_either_way(&mut self, f: Bool, v: u32, lanes: Bool) -> bool {
+        let f0 = self.restrict(f, v, false, &mut Map::default());
+        let f1 = self.restrict(f, v, true, &mut Map::default());
+        let apart = self.xor(f0, f1);
+        self.and(apart, lanes) == Bool::FALSE
+    }
+
     /// `b` with each atom that `known` decides replaced by its value.
     fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
         for v in self.vars(b) {
@@ -434,6 +502,9 @@ pub struct Structured {
     /// Incoming lane boolean per predecessor edge (in block predecessor order)
     /// for each [`Atom::Phi`] id.
     pub phi_masks: HashMap<Value, Vec<Bool>>,
+    /// Per [`Atom::Phi`] id and predecessor edge: the lanes that take the edge, for forward
+    /// edges (see [`Structured::unseen`]).
+    phi_lanes: HashMap<Value, Vec<Option<Bool>>>,
     /// Blocks whose closing branch the whole wave takes together ([`structure_wide`]): its
     /// `when` is still the lane's own bit; the wave goes by all of them.
     pub wide: HashSet<usize>,
@@ -455,6 +526,31 @@ pub struct Structured {
 }
 
 impl Structured {
+    /// Whether edge `n` of the join `id` is one whose mask [`Self::unseen`] may judge.
+    pub(crate) fn phi_lanes_has(&self, id: Value, n: usize) -> bool {
+        self.phi_lanes.get(&id).is_some_and(|l| l[n].is_some())
+    }
+
+    /// Whether what the joins in `asked` (join, predecessor edge) bring on those edges cannot
+    /// be seen, whatever it is, by any lane that takes the edge, given the masks `roots` that
+    /// the program reads: wherever a root differs for the two values of the join, the lane is
+    /// not on the edge. A join that another takes in on its own edge, as it is, shows it only
+    /// where that one's value is seen. Edges back to a loop header never qualify.
+    pub(crate) fn unseen(&self, roots: &HashSet<Bool>, asked: &[(Value, usize)]) -> bool {
+        let mut b = self.bools.clone();
+        let roots: Vec<Bool> = roots.iter().copied().collect();
+        let mut edges = Vec::new();
+        for (&id, masks) in &self.phi_masks {
+            for (n, &m) in masks.iter().enumerate() {
+                // (a back edge: lanes unknown, all of them)
+                edges.push((id, self.phi_lanes[&id][n].unwrap_or(Bool::TRUE), m));
+            }
+        }
+        asked.iter().all(|&(id, n)| {
+            self.phi_lanes[&id][n].is_some_and(|e| b.unobserved(&roots, &edges, id, e))
+        })
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -805,19 +901,19 @@ impl<'a> Lanes<'a> {
     ) -> Result<Structured, ShaderError> {
         let phi_joins = std::mem::take(&mut self.phi_joins);
         let mut phi_masks = HashMap::with_capacity(phi_joins.len());
+        let mut phi_lanes = HashMap::with_capacity(phi_joins.len());
         for pj in phi_joins {
-            let incoming: Vec<Bool> = pj
-                .args
-                .into_iter()
-                .enumerate()
-                .map(|(n, a)| {
-                    let (q, taken) = self.incoming[pj.block][n];
-                    let e = self.edge(cond[q], q, taken);
-                    let m = self.mask(a).0;
-                    self.b.given(m, e)
-                })
-                .collect();
+            let mut incoming = Vec::with_capacity(pj.args.len());
+            let mut lanes = Vec::with_capacity(pj.args.len());
+            for (n, a) in pj.args.into_iter().enumerate() {
+                let (q, taken) = self.incoming[pj.block][n];
+                let e = self.edge(cond[q], q, taken);
+                let m = self.mask(a).0;
+                incoming.push(self.b.given(m, e));
+                lanes.push((self.index[q] < self.index[pj.block]).then_some(e));
+            }
             phi_masks.insert(pj.id, incoming);
+            phi_lanes.insert(pj.id, lanes);
         }
         let blocks = &self.p.blocks;
         let b = &mut self.b;
@@ -917,6 +1013,7 @@ impl<'a> Lanes<'a> {
                 .map(|(&scc, &m)| (scc, m))
                 .collect(),
             phi_masks,
+            phi_lanes,
             bools: self.b,
             exits,
             guards,

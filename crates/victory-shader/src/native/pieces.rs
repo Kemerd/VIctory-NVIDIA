@@ -94,7 +94,9 @@
 //! +0x08 u32 user SGPRs
 //! +0x0c u32 x5 by stage
 //!       compute: COMPUTE_PGM_RSRC2, thread-group size x, y, z
-//!       vertex:  parameter exports, bit per parameter read flat, elements
+//!       vertex:  parameter exports, bit per parameter read flat, elements,
+//!                bit per parameter read as 16-bit values, bit per such
+//!                parameter whose high halves are valid too
 //!       pixel:   SPI_PS_INPUT_ADDR, DB_SHADER_CONTROL, SPI_SHADER_COL_FORMAT,
 //!                the vertex program's parameter exports, interpolants
 //! +0x20 u32 size of what follows the header, u32 code size, u32 metadata
@@ -150,6 +152,8 @@ fn outside(value: u32, unhandled: u32, fields: &[(u32, Refusal)], other: Refusal
 /// (21), the two clip and cull distance vectors (22, 23) and the side bus
 /// for the miscellaneous vector (24).
 const CL_CLIP_DIST_ENA: u32 = 0xff;
+const CL_CULL_DIST_ENA: u32 = 0xff00;
+const CL_MISC_SIDE_BUS: u32 = 1 << 24;
 const CL_CCDIST0_VEC: u32 = 1 << 22;
 const CL_CCDIST1_VEC: u32 = 1 << 23;
 
@@ -160,15 +164,30 @@ const CL_CCDIST1_VEC: u32 = 1 << 23;
 /// (the first vector holds 0-3, the second 4-7: radeonsi's export order, and
 /// the order the lowering of a position export takes), each vector exported
 /// where `VS_OUT_CCDIST0_VEC_ENA` or `VS_OUT_CCDIST1_VEC_ENA` says and in
-/// the four-component format. Cull distances and the miscellaneous vector
-/// are refused: a capture has a cull distance 0 enabled beside the clip
-/// distance 0 and a single exported channel, which does not say which
-/// channel a cull distance takes.
+/// the four-component format. A cull distance enabled on exactly the channels
+/// of the clip distances is one clip distance: radv and radeonsi set
+/// `CULL_DIST_ENA` on the clip channels too (radeonsi: "for points, we need
+/// to set the cull distance bits too because the clip distance bits have no
+/// effect on them"), so the pair is how a plain clip distance is written, and
+/// D3D clips a primitive or a point whose distance is negative. A cull
+/// distance on any other channel set and the miscellaneous vector are
+/// refused. `VS_OUT_MISC_SIDE_BUS_ENA` is taken only where Mesa sets it
+/// without the miscellaneous vector: on GFX10.3 and later when there is more
+/// than one position export, here a clip distance vector.
 fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
     if pos_format & 0xf != 4 {
         return Err("SPI_SHADER_POS_FORMAT POS0_EXPORT_FORMAT other than 4COMP (4)");
     }
-    let rest = out_cntl & !(CL_CLIP_DIST_ENA | CL_CCDIST0_VEC | CL_CCDIST1_VEC);
+    let mut known = CL_CLIP_DIST_ENA | CL_CCDIST0_VEC | CL_CCDIST1_VEC;
+    // The cull enables that merely repeat the clip enables.
+    if out_cntl >> 8 & 0xff == out_cntl & CL_CLIP_DIST_ENA {
+        known |= CL_CULL_DIST_ENA;
+    }
+    // The side bus beside an extra position export that is a distance vector.
+    if out_cntl & (CL_CCDIST0_VEC | CL_CCDIST1_VEC) != 0 {
+        known |= CL_MISC_SIDE_BUS;
+    }
+    let rest = out_cntl & !known;
     if rest != 0 {
         return Err(outside(
             out_cntl,
@@ -176,7 +195,7 @@ fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
             &[
                 (
                     0xff00,
-                    "PA_CL_VS_OUT_CNTL CULL_DIST_ENA_0..7 (bits 8-15): the channel of a cull distance is not settled",
+                    "PA_CL_VS_OUT_CNTL CULL_DIST_ENA_0..7 (bits 8-15) other than the CLIP_DIST_ENA channels",
                 ),
                 (
                     0x1f_0000,
@@ -185,7 +204,7 @@ fn clip_distances(pos_format: u32, out_cntl: u32) -> Result<u8, Refusal> {
                 (1 << 21, "PA_CL_VS_OUT_CNTL VS_OUT_MISC_VEC_ENA (bit 21)"),
                 (
                     1 << 24,
-                    "PA_CL_VS_OUT_CNTL VS_OUT_MISC_SIDE_BUS_ENA (bit 24)",
+                    "PA_CL_VS_OUT_CNTL VS_OUT_MISC_SIDE_BUS_ENA (bit 24) without a clip distance vector",
                 ),
             ],
             "PA_CL_VS_OUT_CNTL bits above bit 24",
@@ -302,6 +321,14 @@ const CONSTANT_OFFSET: u32 = 0x20;
 /// program that writes memory runs for pixels the depth test rejects, and
 /// nothing in the host program carries rasteriser ordering for the third.
 const DB_HANDLED: u32 = 0x1 | 0x30 | 0x40 | 0x1000 | 0x6000 | 0x8000;
+/// `SPI_PS_INPUT_CNTL.FP16_INTERP_MODE`, `ATTR0_VALID` and `ATTR1_VALID`. Mesa
+/// sets the first two for an input read as 16-bit values from the low halves
+/// of the parameter's dwords, and all three where the high halves are read
+/// ("these must be set even if only the high 16 bits are used":
+/// `radv_ps_input_type_bits`, src/amd/vulkan/radv_shader_graphics.c).
+const FP16_INTERP_MODE: u32 = 1 << 19;
+const ATTR0_VALID: u32 = 1 << 24;
+const ATTR1_VALID: u32 = 1 << 25;
 /// The fields of `SPI_PS_INPUT_CNTL` that are not handled, by their bits.
 const INPUT_CNTL_FIELDS: [(u32, Refusal); 11] = [
     (
@@ -344,20 +371,23 @@ const S_BLOCK: usize = 0x4c;
 
 /// DXGI formats of the input elements whose fetch is known, as (bytes,
 /// channels): the 32-bit float formats, which the code loads as dwords, and
-/// `R8G8B8A8_UNORM`, which it loads through a typed format.
+/// the 8 and 16-bit ones, which it loads through a typed format.
 pub(crate) fn element_shape(format: u32) -> Option<(u32, u8)> {
     match format {
         2 => Some((16, 4)),
         6 => Some((12, 3)),
         16 => Some((8, 2)),
         41 => Some((4, 1)),
-        R8G8B8A8_UNORM => Some((4, 4)),
+        R8G8B8A8_UNORM | R8G8B8A8_UINT => Some((4, 4)),
+        R16G16B16A16_FLOAT => Some((8, 4)),
         _ => None,
     }
 }
 
-/// The one byte-wise element format among [`element_shape`]'s.
+/// The element formats of [`element_shape`] that are not 32-bit floats.
 pub(crate) const R8G8B8A8_UNORM: u32 = 28;
+pub(crate) const R8G8B8A8_UINT: u32 = 30;
+pub(crate) const R16G16B16A16_FLOAT: u32 = 10;
 
 /// A container for one stage, whole but for the two pieces the caller
 /// reads into it from title memory: `bytes[code]` and `bytes[metadata]`.
@@ -535,6 +565,8 @@ pub fn compute(packet: &[u8], code: usize, metadata: usize) -> Result<Draft, Ref
 pub struct Element {
     /// Its semantic name: letters, digits and underscores.
     pub name: String,
+    /// Its semantic index: which of the elements of one name this is.
+    pub index: u32,
     /// DXGI format.
     pub format: u32,
     /// Byte offset in the vertex.
@@ -593,6 +625,12 @@ pub struct Graphics {
 }
 
 impl Graphics {
+    /// `SPI_SHADER_COL_FORMAT` of the pixel stage: a nibble per colour
+    /// export, 0 for none (all zero without a pixel stage).
+    pub fn colour_exports(&self) -> u32 {
+        self.pixel.as_ref().map_or(0, |p| p.col_format)
+    }
+
     /// Reads a graphics packet and its state piece; `pixel` says whether
     /// the description has a pixel stage. Refuses what the layouts in the
     /// module notes do not cover, and every value whose meaning for a
@@ -695,12 +733,29 @@ impl Graphics {
                     }
                     continue;
                 }
-                // The parameter read (bits 0-4) and flat shading (bit 10).
+                // The parameter read (bits 0-4) and flat shading (bit 10), or
+                // the parameter read as 16-bit values (see FP16_INTERP_MODE).
                 // DEFAULT_VAL means nothing beside a parameter offset.
-                if c & !0x41f != 0 {
+                let half = c & FP16_INTERP_MODE != 0;
+                if half && c & ATTR0_VALID == 0 {
+                    return Err(
+                        "SPI_PS_INPUT_CNTL FP16_INTERP_MODE (bit 19) without ATTR0_VALID (bit 24)",
+                    );
+                }
+                if half && c & 0x400 != 0 {
+                    return Err(
+                        "SPI_PS_INPUT_CNTL FLAT_SHADE (bit 10) with FP16_INTERP_MODE (bit 19)",
+                    );
+                }
+                let allowed = if half {
+                    0x1f | FP16_INTERP_MODE | ATTR0_VALID | ATTR1_VALID
+                } else {
+                    0x41f
+                };
+                if c & !allowed != 0 {
                     return Err(outside(
                         c,
-                        !0x41f,
+                        !allowed,
                         &INPUT_CNTL_FIELDS,
                         "SPI_PS_INPUT_CNTL bits outside its documented fields",
                     ));
@@ -711,14 +766,20 @@ impl Graphics {
                     );
                 }
             }
-            // One parameter read both flat and interpolated has no one type.
+            // One parameter read both flat and interpolated has no one type,
+            // nor one read as 16-bit values by one input and not by another.
             let is_param = |c: &u32| c & 0x3f != CONSTANT_OFFSET;
             for a in controls.iter().filter(|c| is_param(c)) {
-                if controls
+                let other = controls
                     .iter()
                     .filter(|c| is_param(c))
-                    .any(|b| a & 0x1f == b & 0x1f && a != b)
-                {
+                    .find(|b| a & 0x1f == *b & 0x1f && a != *b);
+                if let Some(b) = other {
+                    if (a ^ b) & (FP16_INTERP_MODE | ATTR1_VALID) != 0 {
+                        return Err(
+                            "a vertex parameter read as 16-bit values by one input and not by another, or with other valid halves",
+                        );
+                    }
                     return Err("a vertex parameter read both flat and interpolated");
                 }
             }
@@ -908,10 +969,11 @@ impl Graphics {
             // Words 0, 2, 4 and 5 lie where D3D12's element description has
             // the semantic index, the slot, the class and the step rate, in
             // that order (words 1 and 3 are where it has the format and the
-            // offset). All were zero wherever seen, so that order is a
-            // guess, and each refusal names the word that carried a value.
+            // offset). Word 0 is the semantic index: a capture has COLOR
+            // twice, with 0 and 1 there and nothing else different. Words 2,
+            // 4 and 5 were zero wherever seen, so that order is a guess, and
+            // each refusal names the word that carried a value.
             for (at, why) in [
-                (0, "an input element with a value in word 0 (the semantic index, by a guess)"),
                 (2, "an input element with a value in word 2 (the slot, by a guess)"),
                 (4, "an input element with a value in word 4 (the class, by a guess)"),
                 (5, "an input element with a value in word 5 (the step rate, by a guess)"),
@@ -920,12 +982,16 @@ impl Graphics {
                     return Err(why);
                 }
             }
+            if words[0] > 31 {
+                return Err("an input element with an implausible semantic index");
+            }
             if words[3] > 0x800 {
                 return Err("an input element at an implausible byte offset");
             }
             elements.push(Element {
                 // (checked ASCII above)
                 name: String::from_utf8_lossy(name).into_owned(),
+                index: words[0],
                 format: words[1],
                 offset: words[3],
             });
@@ -1038,13 +1104,35 @@ impl Graphics {
             .fold(0, |m, &c| m | 1 << (c & 0x1f))
     }
 
+    /// Bit per vertex parameter the pixel program reads as 16-bit values,
+    /// and bit per such parameter whose high halves are valid. Such a
+    /// parameter is declared 16-bit floats on both sides, four values: the
+    /// halves of its dwords in order (the low half of dword 0, its high
+    /// half, the low half of dword 1, its high half) when the high halves
+    /// are valid, else the low half of each dword.
+    fn halves(&self) -> (u32, u32) {
+        let controls = self.pixel.iter().flat_map(|p| &p.controls);
+        controls
+            .filter(|&&c| c & 0x3f != CONSTANT_OFFSET && c & FP16_INTERP_MODE != 0)
+            .fold((0, 0), |(h, hi), &c| {
+                let bit = 1 << (c & 0x1f);
+                (h | bit, if c & ATTR1_VALID != 0 { hi | bit } else { hi })
+            })
+    }
+
     /// The row of vertex parameter `p` in both stages' signatures.
     fn param(&self, p: u32) -> Row<'static> {
         Row {
             name: "TEXCOORD",
             index: p,
             system: 0,
-            component: if self.flat() >> p & 1 != 0 { 1 } else { 3 },
+            component: if self.flat() >> p & 1 != 0 {
+                1
+            } else if self.halves().0 >> p & 1 != 0 {
+                6
+            } else {
+                3
+            },
             register: p,
             mask: 0xf,
         }
@@ -1069,7 +1157,7 @@ impl Graphics {
         for (e, to) in self.elements.iter().zip(extra.chunks_exact_mut(ELEMENT)) {
             to[..e.name.len()].copy_from_slice(e.name.as_bytes());
             // semantic index, format, slot, byte offset
-            for (i, v) in [0, e.format, 0, e.offset].into_iter().enumerate() {
+            for (i, v) in [e.index, e.format, 0, e.offset].into_iter().enumerate() {
                 to[NAME + 4 * i..NAME + 4 * i + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
@@ -1084,9 +1172,10 @@ impl Graphics {
                 let (_, channels) = element_shape(e.format)?;
                 Some(Row {
                     name: &e.name,
-                    index: 0,
+                    index: e.index,
                     system: 0,
-                    component: 3,
+                    // (the host's input assembler gives a UINT format as integers)
+                    component: if e.format == R8G8B8A8_UINT { 1 } else { 3 },
                     register: i as u32,
                     mask: (1 << channels) - 1,
                 })
@@ -1112,7 +1201,13 @@ impl Graphics {
             flags: 0,
             vgprs: self.vertex_vgprs,
             user_sgprs: self.vertex_user_sgprs,
-            words: [self.params, self.flat(), self.elements.len() as u32, 0, 0],
+            words: [
+                self.params,
+                self.flat(),
+                self.elements.len() as u32,
+                self.halves().0,
+                self.halves().1,
+            ],
         };
         Ok(draft(
             &head,
@@ -1130,8 +1225,9 @@ impl Graphics {
         };
         sizes(code, metadata, GRAPHICS_METADATA.1)?;
         // Each parameter read, once, then the system values the packet
-        // enables: the position (bits 8-11) where the vertex program has
-        // it, the front face (bit 12) after it.
+        // enables: the position (bits 8-11, or 15 for the fixed-point one,
+        // which the lowering takes from it) where the vertex program has it,
+        // the front face (bit 12) after it.
         // (an input that is a constant reads no parameter)
         let mut read: Vec<u32> = pixel
             .controls
@@ -1524,7 +1620,12 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
                 slot: u8::MAX,
             });
             let (elements, rest) = extra.as_chunks::<ELEMENT>();
-            if !rest.is_empty() || elements.len() != words[2] as usize || words[0] > 32 {
+            if !rest.is_empty()
+                || elements.len() != words[2] as usize
+                || words[0] > 32
+                || words[4] & !words[3] != 0
+                || words[3] & words[1] != 0
+            {
                 return Err(Malformed(
                     "a vertex part whose elements disagree with their count",
                 ));
@@ -1536,8 +1637,8 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
                         usage: Usage::Generic,
                         row: n,
                         param: n,
-                        fp16: false,
-                        pack2: false,
+                        fp16: words[3] >> n & 1 != 0,
+                        pack2: words[4] >> n & 1 != 0,
                     })
                     .collect(),
                 fetch: elements
@@ -1603,9 +1704,9 @@ fn read(part: &[u8]) -> Result<(NativeProgram, &[u8]), ShaderError> {
                             mask: 0xf,
                             attr: k as u8,
                             flat: c & 0x400 != 0,
-                            fp16: false,
-                            pack2: false,
-                            row2: 0,
+                            fp16: c & FP16_INTERP_MODE != 0,
+                            pack2: c & ATTR1_VALID != 0,
+                            row2: if c & FP16_INTERP_MODE != 0 { (c & 0x1f) as u8 } else { 0 },
                         }
                     })
                     .collect(),
@@ -2007,6 +2108,7 @@ mod tests {
             g.elements[1],
             Element {
                 name: "COLOR".into(),
+                index: 0,
                 format: 28,
                 offset: 12
             }
@@ -2114,6 +2216,53 @@ mod tests {
             rows(&vs_bytes, FourCC::ISG1),
             [(0, 0, 3, 0), (0, 0, 3, 1), (0, 0, 3, 2)]
         );
+    }
+
+    #[test]
+    fn the_8_and_16_bit_elements_are_vertex_inputs() {
+        let packet = graphics_packet(false, 0, &[]);
+        let elements = [("COLOR", 30, 0), ("POSITION", 10, 4), ("TEXCOORD", 28, 12)];
+        let g = Graphics::parse(&packet, &state_piece(&elements), false).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let bytes = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        let part = c.part(FourCC::ISG1).unwrap().data;
+        // (type, register, mask) of each row: integers for UINT, else floats
+        let rows: Vec<_> = (0..u32_at(part, 0).unwrap() as usize)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let word = |k: usize| u32_at(part, at + 4 * k).unwrap();
+                (word(4), word(5), word(6))
+            })
+            .collect();
+        assert_eq!(rows, [(1, 0, 0xf), (3, 1, 0xf), (3, 2, 0xf)]);
+    }
+
+    #[test]
+    fn the_fixed_point_position_declares_the_position() {
+        let mut packet = graphics_packet(true, 3, &[(0, false), (2, true), (1, false)]);
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let isg = |packet: &[u8]| {
+            let g = Graphics::parse(packet, &state_piece(&ELEMENTS), true).unwrap();
+            let bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+            let c = crate::Container::parse(&bytes).unwrap();
+            let part = c.part(FourCC::ISG1).unwrap().data;
+            // (system value, register) of each row
+            (0..u32_at(part, 0).unwrap() as usize)
+                .map(|i| {
+                    let at = 8 + 32 * i;
+                    (u32_at(part, at + 12).unwrap(), u32_at(part, at + 20).unwrap())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(isg(&packet), [(0, 0), (0, 1), (0, 2)]);
+        // POS_FIXED_PT alone: the position row after the parameters, as for POS_X.
+        put(&mut packet, G_PS_INPUT_ADDR, 0x8002);
+        assert_eq!(isg(&packet), [(0, 0), (0, 1), (0, 2), (1, 3)]);
+        put(&mut packet, G_PS_INPUT_ADDR, 0x0102);
+        assert_eq!(isg(&packet), [(0, 0), (0, 1), (0, 2), (1, 3)]);
     }
 
     #[test]
@@ -2323,6 +2472,164 @@ mod tests {
         assert!(ps.layout.iter().all(|e| e.root != RootType::Other(PIXEL_PIECES) || e.sgprs == 0));
     }
 
+    /// SPI_PS_INPUT_CNTL of the captured call 14578's third input: parameter
+    /// 2, FP16_INTERP_MODE, ATTR0_VALID and ATTR1_VALID.
+    const HALVES_BOTH: u32 = 0x308_0002;
+    /// The same with the low halves alone (Mesa's `float16_shaded_mask`).
+    const HALVES_LOW: u32 = 0x108_0002;
+
+    /// A packet whose third input is `control`, reading parameter 2 as the
+    /// captured pipeline does; the pixel stage exports 32-bit floats.
+    fn halves_packet(control: u32) -> Vec<u8> {
+        let mut p = graphics_packet(true, 3, &[(0, false), (1, true), (2, false)]);
+        put(&mut p, G_INPUT_CNTL + 8, control);
+        put(&mut p, G_COL_FORMAT, 9);
+        p
+    }
+
+    #[test]
+    fn a_pixel_input_read_as_16_bit_values_says_so_on_both_sides() {
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        for (control, pack2) in [(HALVES_BOTH, true), (HALVES_LOW, false)] {
+            let g = Graphics::parse(&halves_packet(control), &state_piece(&ELEMENTS), true).unwrap();
+            let ps_bytes = fill(g.pixel(code.len(), meta.len()).unwrap(), &code, &meta);
+            let ps = checked(&ps_bytes).unwrap();
+            let StageIo::Ps { inputs, .. } = &ps.io else {
+                panic!("{:?}", ps.io)
+            };
+            assert_eq!(
+                inputs.iter().map(|i| (i.attr, i.row, i.fp16, i.pack2)).collect::<Vec<_>>(),
+                [(0, 0, false, false), (1, 1, false, false), (2, 2, true, pack2)]
+            );
+            assert_eq!(inputs[2].row2, inputs[2].row);
+            // The parameter is four 16-bit floats in the signature, not 32-bit ones.
+            let vs_bytes = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+            let vs = checked(&vs_bytes).unwrap();
+            let StageIo::Vs { outputs, .. } = &vs.io else {
+                panic!("{:?}", vs.io)
+            };
+            assert_eq!(
+                outputs.iter().map(|o| (o.row, o.fp16, o.pack2)).collect::<Vec<_>>(),
+                [(0, false, false), (1, false, false), (2, true, pack2)]
+            );
+            for (bytes, part) in [(&ps_bytes, FourCC::ISG1), (&vs_bytes, FourCC::OSG1)] {
+                let c = crate::Container::parse(bytes).unwrap();
+                let sig = c.part(part).unwrap().data;
+                // (type, register, mask) of each parameter's row
+                let rows: Vec<_> = (0..3)
+                    .map(|k| {
+                        let at = 8 + 32 * k;
+                        (u32_at(sig, at + 16).unwrap(), u32_at(sig, at + 20).unwrap(), sig[at + 24])
+                    })
+                    .collect();
+                assert_eq!(rows, [(3, 0, 0xf), (1, 1, 0xf), (6, 2, 0xf)]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_pixel_input_read_as_16_bit_values_not_understood_is_refused() {
+        let state = state_piece(&ELEMENTS);
+        let why = |control: u32| why(&halves_packet(control), &state);
+        // The low halves are Mesa's FP16_INTERP_MODE with ATTR0_VALID: without it, no value is said to be there.
+        assert_eq!(
+            why(2 | FP16_INTERP_MODE),
+            "SPI_PS_INPUT_CNTL FP16_INTERP_MODE (bit 19) without ATTR0_VALID (bit 24)"
+        );
+        assert_eq!(
+            why(2 | FP16_INTERP_MODE | ATTR1_VALID),
+            "SPI_PS_INPUT_CNTL FP16_INTERP_MODE (bit 19) without ATTR0_VALID (bit 24)"
+        );
+        assert_eq!(
+            why(HALVES_BOTH | 1 << 10),
+            "SPI_PS_INPUT_CNTL FLAT_SHADE (bit 10) with FP16_INTERP_MODE (bit 19)"
+        );
+        assert_eq!(
+            why(HALVES_BOTH | 1 << 20),
+            "SPI_PS_INPUT_CNTL second attribute defaults (bits 20-23)"
+        );
+        assert_eq!(why(HALVES_BOTH | 1 << 12), "SPI_PS_INPUT_CNTL PRIM_ATTR (bit 12)");
+        assert_eq!(why(HALVES_BOTH | 1 << 8), "SPI_PS_INPUT_CNTL DEFAULT_VAL (bits 8-9) with a parameter offset");
+        assert_eq!(
+            why(HALVES_BOTH & !0x1f | 5),
+            "SPI_PS_INPUT_CNTL OFFSET (bits 0-5) names a parameter the vertex program does not export"
+        );
+        // The valid bits mean nothing without the mode.
+        assert_eq!(why(2 | ATTR0_VALID), "SPI_PS_INPUT_CNTL ATTR0_VALID and ATTR1_VALID (bits 24-25)");
+        // A constant is not read as 16-bit values.
+        assert_eq!(
+            why(CONSTANT_OFFSET | FP16_INTERP_MODE | ATTR0_VALID),
+            "SPI_PS_INPUT_CNTL FP16_INTERP_MODE (bit 19)"
+        );
+        // One parameter read both ways has no one type.
+        let mut both = halves_packet(HALVES_BOTH);
+        put(&mut both, G_INPUT_CNTL, 2);
+        assert_eq!(
+            Graphics::parse(&both, &state, true).unwrap_err(),
+            "a vertex parameter read as 16-bit values by one input and not by another, or with other valid halves"
+        );
+        put(&mut both, G_INPUT_CNTL, HALVES_LOW);
+        assert!(Graphics::parse(&both, &state, true).is_err());
+    }
+
+    /// The captured pixel program's reads of attribute 2 as 16-bit values
+    /// (call 14578, 0x238 to 0x268 and on), reading its x and y: the low and
+    /// high halves of dword 0, the low half of dword 1.
+    const PIXEL_HALVES: [u32; 22] = [
+        0xBEFC_0314, // s_mov_b32 m0, s20
+        0xD742_0005, 0x0002_0102, // v_interp_p1ll_f16 v5, v0, attr2.x high
+        0xD742_000A, 0x0002_0002, // v_interp_p1ll_f16 v10, v0, attr2.x
+        0xD742_0008, 0x0002_0042, // v_interp_p1ll_f16 v8, v0, attr2.y
+        0xD75A_0006, 0x0416_0302, // v_interp_p2_f16 v6, v1, attr2.x, v5 high
+        0xD75A_000B, 0x042A_0202, // v_interp_p2_f16 v11, v1, attr2.x, v10
+        0xD75A_0009, 0x0422_0242, // v_interp_p2_f16 v9, v1, attr2.y, v8
+        0xCC20_0007, 0x9A02_0D06, // v_fma_mix_f32 v7, sel_lo(v6), sel_lo(v6), -0
+        0xCC20_0007, 0x1C1E_1309, // v_fma_mix_f32 v7, sel_lo(v9), sel_lo(v9), v7
+        0xCC20_0007, 0x1C1E_170B, // v_fma_mix_f32 v7, sel_lo(v11), sel_lo(v11), v7
+        0xF800_180F, 0x0707_0707, // exp mrt0, v7, v7, v7, v7 done vm
+        END,
+    ];
+
+    /// A vertex program that exports the position and three parameters:
+    /// the last as two dwords of 16-bit values.
+    const VERTEX_HALVES: [u32; 10] = [
+        0x7E10_0D00, // v_cvt_f32_u32 v8, v0
+        0xF800_08CF, 0x0808_0808, // exp pos0, v8, v8, v8, v8 done
+        0xF800_020F, 0x0808_0808, // exp param0, v8, v8, v8, v8
+        0xF800_021F, 0x0808_0808, // exp param1, v8, v8, v8, v8
+        0xF800_0223, 0x0000_0808, // exp param2, v8, v8, off, off
+        END,
+    ];
+
+    #[test]
+    fn a_pixel_program_reading_a_parameter_as_16_bit_values_translates() {
+        // (a code piece is at least as long as the metadata header says)
+        let words = |w: &[u32]| {
+            let mut c: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+            c.resize(c.len().max(0x30), 0);
+            c
+        };
+        let (ps_code, vs_code) = (words(&PIXEL_HALVES), words(&VERTEX_HALVES));
+        let meta = metadata(GRAPHICS_METADATA, ps_code.len(), &[hash()]);
+        let vs_meta = metadata(GRAPHICS_METADATA, vs_code.len(), &[hash()]);
+        let build = |control: u32| {
+            let g = Graphics::parse(&halves_packet(control), &state_piece(&ELEMENTS), true).unwrap();
+            let ps = fill(g.pixel(ps_code.len(), meta.len()).unwrap(), &ps_code, &meta);
+            let vs = fill(g.vertex(vs_code.len(), vs_meta.len()).unwrap(), &vs_code, &vs_meta);
+            (vs, ps)
+        };
+        let (vs, ps) = build(HALVES_BOTH);
+        crate::emit::translate(&vs).unwrap();
+        crate::emit::translate(&ps).unwrap();
+        // With the high halves not valid, the read of one is a value no row holds.
+        let (_, ps) = build(HALVES_LOW);
+        assert!(matches!(
+            crate::emit::translate(&ps),
+            Err(ShaderError::Unsupported { what: "a packed input half no element holds", .. })
+        ));
+    }
+
     #[test]
     fn a_fixed_point_position_brings_the_position_row() {
         // The pixel signature names the parameter, and the position beside it when
@@ -2389,6 +2696,17 @@ mod tests {
             why(&p, &state_piece(&ELEMENTS)),
             "SPI_PS_INPUT_CNTL OFFSET (bits 0-5) of 0x21 or more"
         );
+    }
+
+    #[test]
+    fn colour_exports_are_the_pixel_stages_col_format() {
+        let mut p = graphics_packet(true, 1, &[(0, false)]);
+        put(&mut p, G_COL_FORMAT, 0x44);
+        let g = Graphics::parse(&p, &state_piece(&ELEMENTS), true).unwrap();
+        assert_eq!(g.colour_exports(), 0x44);
+        let none = graphics_packet(false, 0, &[]);
+        let g = Graphics::parse(&none, &state_piece(&ELEMENTS), false).unwrap();
+        assert_eq!(g.colour_exports(), 0);
     }
 
     #[test]
@@ -2475,18 +2793,31 @@ mod tests {
             let why = clip_distances(0x44, 1 | vec0 | bits).unwrap_err();
             assert!(why.contains(field), "{bits:#x}: {why}");
         };
-        named(1 << 8, "CULL_DIST_ENA");
+        named(1 << 9, "CULL_DIST_ENA");
         named(1 << 15, "CULL_DIST_ENA");
         named(1 << 16, "USE_VTX_POINT_SIZE");
         named(1 << 19, "VIEWPORT_INDX");
         named(1 << 21, "VS_OUT_MISC_VEC_ENA");
-        named(1 << 24, "VS_OUT_MISC_SIDE_BUS_ENA");
         named(1 << 25, "above bit 24");
         named(1 << 31, "above bit 24");
-        // The one value captured: a clip and a cull distance 0, a vector
-        // and the side bus.
-        let seen = 0x0140_0101;
-        assert!(clip_distances(0x44, seen).unwrap_err().contains("CULL_DIST_ENA"));
+        // The one value captured: clip distance 0 repeated as a cull
+        // distance, a vector and the side bus. It is one clip distance.
+        assert_eq!(clip_distances(0x44, 0x0140_0101), Ok(1));
+        // The cull enables equal to the clip enables, on more channels.
+        assert_eq!(clip_distances(0x444, 0x1f1f | vec0 | vec1), Ok(5));
+        assert_eq!(clip_distances(0x44, 0x0f0f | vec0 | (1 << 24)), Ok(4));
+        // The side bus alone beside a clip distance vector.
+        assert_eq!(clip_distances(0x44, 1 | vec0 | (1 << 24)), Ok(1));
+        // Any other pairing of cull and clip is refused.
+        let cull = |out: u32| clip_distances(0x44, out | vec0).unwrap_err();
+        assert!(cull(0x100).contains("CULL_DIST_ENA"), "a cull distance with no clip");
+        assert!(cull(0x101 | 0x200).contains("CULL_DIST_ENA"), "a cull distance beyond the clip");
+        assert!(cull(0x301).contains("CULL_DIST_ENA"), "more cull than clip");
+        assert!(cull(0x201).contains("CULL_DIST_ENA"), "cull on another channel");
+        assert!(cull(1 | 0x100 | 1 << 21).contains("VS_OUT_MISC_VEC_ENA"));
+        // The side bus without a distance vector is not the Mesa form.
+        assert!(clip_distances(4, 1 << 24).unwrap_err().contains("SIDE_BUS"));
+        assert!(clip_distances(4, 1 << 24 | 1 << 21).unwrap_err().contains("MISC_VEC_ENA"));
     }
 
     #[test]
@@ -2535,18 +2866,75 @@ mod tests {
     fn input_elements_with_values_are_refused_by_their_word() {
         let packet = graphics_packet(false, 0, &[]);
         let at = |word: usize| S_BLOCK + 17 + 4 * word;
-        for (word, field) in [(0, "word 0"), (2, "word 2"), (4, "word 4"), (5, "word 5")] {
+        for (word, field) in [(2, "word 2"), (4, "word 4"), (5, "word 5")] {
             let mut s = state_piece(&ELEMENTS);
             put(&mut s, at(word), 1);
             let reason = Graphics::parse(&packet, &s, false).unwrap_err();
             assert!(reason.contains(field), "{reason}");
         }
-        // The format and the offset are read, wherever the others stand.
+        // The index, the format and the offset are read, wherever the others stand.
         let mut s = state_piece(&ELEMENTS);
+        put(&mut s, at(0), 1);
         put(&mut s, at(1), 2);
         put(&mut s, at(3), 8);
         let g = Graphics::parse(&packet, &s, false).unwrap();
-        assert_eq!((g.elements[0].format, g.elements[0].offset), (2, 8));
+        assert_eq!((g.elements[0].index, g.elements[0].format, g.elements[0].offset), (1, 2, 8));
+    }
+
+    /// The input layout of a capture: COLOR twice, with 0 and 1 in word 0
+    /// and nothing else different, then POSITION.
+    fn two_colors() -> Vec<u8> {
+        let mut s = state_piece(&[("COLOR", 28, 0), ("COLOR", 28, 4), ("POSITION", 16, 8)]);
+        // (the count, then the first element: its length, "COLOR\0", six
+        // words; the second element's word 0 follows its length and name)
+        put(&mut s, S_BLOCK + 4 + (4 + 6 + 24) + (4 + 6), 1);
+        s
+    }
+
+    #[test]
+    fn two_elements_of_one_name_differ_by_their_semantic_index() {
+        let packet = graphics_packet(false, 0, &[]);
+        let g = Graphics::parse(&packet, &two_colors(), false).unwrap();
+        let seen: Vec<_> = g.elements.iter().map(|e| (e.name.as_str(), e.index, e.format, e.offset)).collect();
+        assert_eq!(seen, [("COLOR", 0, 28, 0), ("COLOR", 1, 28, 4), ("POSITION", 0, 16, 8)]);
+        // An index no vertex has is refused, one that does is not.
+        let mut s = two_colors();
+        put(&mut s, S_BLOCK + 4 + (4 + 6 + 24) + (4 + 6), 32);
+        let reason = Graphics::parse(&packet, &s, false).unwrap_err();
+        assert!(reason.contains("semantic index"), "{reason}");
+        put(&mut s, S_BLOCK + 4 + (4 + 6 + 24) + (4 + 6), 31);
+        assert!(Graphics::parse(&packet, &s, false).is_ok());
+    }
+
+    #[test]
+    fn the_vertex_part_and_its_signature_keep_the_semantic_index() {
+        let packet = graphics_packet(true, 1, &[(0, false)]);
+        let g = Graphics::parse(&packet, &two_colors(), true).unwrap();
+        let code = code(11);
+        let meta = metadata(GRAPHICS_METADATA, code.len(), &[hash()]);
+        let bytes = fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta);
+        let c = crate::Container::parse(&bytes).unwrap();
+        // The input signature: name, index and register of each element.
+        let part = c.part(FourCC::ISG1).unwrap().data;
+        let count = u32_at(part, 0).unwrap() as usize;
+        let rows: Vec<(&[u8], u32, u32)> = (0..count)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let word = |k: usize| u32_at(part, at + 4 * k).unwrap();
+                let name = &part[word(1) as usize..];
+                (&name[..name.iter().position(|&c| c == 0).unwrap()], word(2), word(5))
+            })
+            .collect();
+        assert_eq!(rows, [(&b"COLOR"[..], 0, 0), (&b"COLOR"[..], 1, 1), (&b"POSITION"[..], 0, 2)]);
+        // The part's own elements, whose word 0 is the index.
+        let part = checked(&fill(g.vertex(code.len(), meta.len()).unwrap(), &code, &meta)).unwrap();
+        let StageIo::Vs { fetch, .. } = &part.io else {
+            panic!("{:?}", part.io)
+        };
+        // (told apart by offset, each in the register of its place)
+        assert_eq!(fetch.iter().map(|f| (f.row, f.offset)).collect::<Vec<_>>(), [(0, 0), (1, 4), (2, 8)]);
+        let part = c.part(FourCC::PIECES).unwrap().data;
+        assert_eq!(u32_at(part, HEAD + ELEMENT + NAME), Ok(1));
     }
 
     #[test]
@@ -2596,9 +2984,9 @@ mod tests {
         );
         assert!(refused(&|s| s[S_TOPOLOGY] = 2), "lines");
         assert!(refused(&|s| put(s, S_SAMPLES, 4)), "multisampling");
-        // The element's first word after its name (index, slot, class or
-        // step rate: all must be zero).
-        assert!(refused(&|s| put(s, S_BLOCK + 8 + 9, 1)));
+        // The element's slot word after its name (the index may be set; the
+        // slot, class and step rate must be zero).
+        assert!(refused(&|s| put(s, S_BLOCK + 8 + 9 + 8, 1)));
         // An empty layout is one.
         assert!(Graphics::parse(&packet, &state_piece(&[]), false).is_ok());
     }

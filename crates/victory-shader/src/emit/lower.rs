@@ -252,6 +252,81 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// The channels a vertex program's load returns, as (row, channel) of the
+/// input signature: `name` at byte `byte` of buffer `slot` (`format` the
+/// typed load's), over the elements of the input layout `fetch`. Only what
+/// the host's input assembler gives exactly: whole dwords of 32-bit floats
+/// (which may run on into the next element, the compiler fetches
+/// neighbours together), and a typed format whose channels are those of
+/// the element (same width and numeric format), taken from the channel
+/// the byte is.
+fn vertex_fetch_channels(
+    fetch: &[crate::native::VsFetch],
+    slot: u32,
+    byte: u32,
+    name: &str,
+    format: Option<u8>,
+) -> Result<Vec<(u8, u8)>, Why> {
+    let holding = |byte: u32| {
+        fetch
+            .iter()
+            .find(|e| e.slot == slot && byte >= e.offset && byte - e.offset < e.bytes)
+            .ok_or("a vertex fetch outside the elements whose format is handled")
+    };
+    let e = holding(byte)?;
+    let within = byte - e.offset;
+    let dwords = match name {
+        "buffer_load_dword" => Some(1),
+        "buffer_load_dwordx2" => Some(2),
+        "buffer_load_dwordx3" => Some(3),
+        "buffer_load_dwordx4" => Some(4),
+        _ => None,
+    };
+    let typed = match name.strip_prefix("tbuffer_load_format_") {
+        Some("x") => Some(1),
+        Some("xy") => Some(2),
+        Some("xyz") => Some(3),
+        Some("xyzw") => Some(4),
+        _ => None,
+    };
+    // What an element's channels are in memory: the width in bits of each
+    // and their numeric format, which the host's input assembler turns
+    // into 32-bit floats or integers.
+    let shape = |e: &crate::native::VsFetch| match e.format {
+        crate::pieces::R8G8B8A8_UNORM => (8, Numeric::Unorm),
+        crate::pieces::R8G8B8A8_UINT => (8, Numeric::Uint),
+        crate::pieces::R16G16B16A16_FLOAT => (16, Numeric::Float),
+        _ => (32, Numeric::Float),
+    };
+    match (dwords, typed, format.and_then(buffer_format)) {
+        (Some(n), None, None) => (0..n)
+            .map(|k| {
+                let at = byte + 4 * k;
+                let e = holding(at).map_err(|_| "a vertex fetch past its element")?;
+                let within = at - e.offset;
+                if shape(e) != (32, Numeric::Float) || !within.is_multiple_of(4) {
+                    return Err("a vertex fetch of a form or format that is not handled");
+                }
+                Ok((e.row, (within / 4) as u8))
+            })
+            .collect(),
+        (None, Some(n), Some((bits, numeric)))
+            if bits.iter().all(|&b| b == shape(e).0)
+                && numeric == shape(e).1
+                && n <= bits.len() as u32
+                && within.is_multiple_of(shape(e).0 / 8) =>
+        {
+            let first = within / (shape(e).0 / 8);
+            let channels = crate::pieces::element_shape(e.format).map_or(0, |s| u32::from(s.1));
+            if first + n > channels {
+                return Err("a vertex fetch past its element");
+            }
+            Ok((first..first + n).map(|c| (e.row, c as u8)).collect())
+        }
+        _ => Err("a vertex fetch of a form or format that is not handled"),
+    }
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -273,6 +348,8 @@ struct Lower<'a> {
     block: Vec<Option<usize>>,
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
+    /// The masks the program asked for (not the parts of them, nor what joins bring in).
+    mask_roots: HashSet<Bool>,
     lane_bits: HashMap<Value, V>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
@@ -2030,6 +2107,7 @@ impl<'a> Lower<'a> {
             block: vec![None; p.blocks.len()],
             cur: 0,
             bools: HashMap::new(),
+            mask_roots: HashSet::new(),
             lane_bits: HashMap::new(),
             phi_at,
             mask_phis: HashMap::new(),
@@ -4441,6 +4519,11 @@ impl<'a> Lower<'a> {
     // ---- lane booleans ----
 
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
+        self.mask_roots.insert(b);
+        self.boolean_in(b, at)
+    }
+
+    fn boolean_in(&mut self, b: Bool, at: usize) -> Result<V, Why> {
         if b == Bool::TRUE || b == Bool::FALSE {
             return Ok(self.s.m.bool(b == Bool::TRUE));
         }
@@ -4457,16 +4540,16 @@ impl<'a> Lower<'a> {
                 m.bin(at, Bin::Xor, a, t)
             }
             (Bool::FALSE, h) => {
-                let h = self.boolean(h, at)?;
+                let h = self.boolean_in(h, at)?;
                 self.s.m.bin(at, Bin::And, a, h)
             }
             (l, Bool::TRUE) => {
-                let l = self.boolean(l, at)?;
+                let l = self.boolean_in(l, at)?;
                 self.s.m.bin(at, Bin::Or, a, l)
             }
             (l, h) => {
-                let l = self.boolean(l, at)?;
-                let h = self.boolean(h, at)?;
+                let l = self.boolean_in(l, at)?;
+                let h = self.boolean_in(h, at)?;
                 self.s.m.select(at, a, h, l)
             }
         };
@@ -4482,7 +4565,7 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
-            Atom::Uniform(v) => match self.get(v)? {
+            Atom::Uniform(v) => match self.scc_value(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
                     let z = self.s.m.i32(0);
@@ -4899,7 +4982,13 @@ impl<'a> Lower<'a> {
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
         // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        // (and with host lanes, "some lane" is the host wave's: the console's where both have
+        // 32 lanes, which is what a count above zero asks too)
+        let host = self.mask_data == MaskData::Host
+            && !self.console_lanes
+            && !self.x.native.wave64
+            && host_max_wave() == 32;
+        if !(self.console_lanes || host) || self.local || self.exchange.is_none() && self.halves.is_some() {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -6790,6 +6879,24 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
                 (self.s.m.bin(c, Bin::Add, t, b), None)
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                // D = {S1 half, S0 half}: the low half is S0[15:0] (ll, lh) or
+                // S0[31:16] (hh); the high half is S1[15:0] (ll) or S1[31:16].
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, ffff) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                let lo = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, ffff)
+                };
+                let hi = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let ffff0000 = self.s.m.i32(0xFFFF_0000);
+                    self.s.m.bin(c, Bin::And, b, ffff0000)
+                };
+                (self.s.m.bin(c, Bin::Or, lo, hi), None)
+            }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
@@ -6800,6 +6907,15 @@ impl<'a> Lower<'a> {
                 };
                 let t = self.s.m.cmp(c, p, a, b);
                 (self.s.m.select(c, t, a, b), None)
+            }
+            // |S0 - S1| of the wrapped difference (0x80000000, 1 gives 0x7fffffff); SCC is D != 0
+            "s_absdiff_i32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let a = self.s.m.bin(c, Bin::Sub, a, b);
+                let z = self.s.m.i32(0);
+                let neg = self.s.m.cmp(c, pred::SLT, a, z);
+                let n = self.s.m.bin(c, Bin::Sub, z, a);
+                (self.s.m.select(c, neg, n, a), None)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -6856,6 +6972,9 @@ impl<'a> Lower<'a> {
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
+                        | "s_pack_ll_b32_b16"
+                        | "s_pack_lh_b32_b16"
+                        | "s_pack_hh_b32_b16"
                 ) =>
                 {
                     return Ok(());
@@ -6923,19 +7042,26 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        match self.scc_value(v)? {
+            Val::Bit(x) => Ok(x),
+            _ => Err("SCC without a value"),
+        }
+    }
+
+    /// An SCC value as data: of a mask operation, whether some lane is left.
+    fn scc_value(&mut self, v: Value) -> Result<Val, Why> {
         if self.x.st.scc_some.contains_key(&v)
             && matches!(self.vals.get(&v), None | Some(Val::Missing(_)))
         {
             let x = self.scc_some(v)?;
             self.vals.insert(v, Val::Bit(x));
-            return Ok(x);
+            return Ok(Val::Bit(x));
         }
         match self.get(v) {
-            Ok(Val::Bit(x)) => Ok(x),
-            Ok(_) => Err("SCC without a value"),
+            Ok(val) => Ok(val),
             // Of a mask operation whose result lies within EXEC: whether
             // some lane is left.
-            Err(LANE_MASK) if self.within_exec(v) => self.scc_some(v),
+            Err(LANE_MASK) if self.within_exec(v) => self.scc_some(v).map(Val::Bit),
             Err(why) => Err(why),
         }
     }
@@ -8637,10 +8763,23 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            let r = match v.dpp {
+                // src0 read from another lane, as for the other VALU operations. The types
+                // that take their sources by `fsrc` and `src`; a lane the row or bank mask
+                // (or the row's edge) leaves out has no defined bit to give.
+                Some(d) if rest.ends_with("_f32") || rest.ends_with("_u32") || rest.ends_with("_i32") => {
+                    self.dpp(inst, d).and_then(|(x, enable)| {
+                        if enable.is_some() || matches!(d, Dpp::Row { row_mask, bank_mask, .. } if row_mask != 0xF || bank_mask != 0xF) {
+                            return Err("a compare with DPP lanes left out");
+                        }
+                        self.src0 = Some(x);
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        r
+                    })
+                }
+                Some(_) => Err("a compare with DPP"),
+                None => self.compare(inst, rest),
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
@@ -9320,6 +9459,50 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
+            }
+            "v_ldexp_f32" => {
+                // D = S0 * 2^S1 with S1 a signed integer. One multiply by 2^n
+                // overflows its own scale for |n| > 127, so the exponent is
+                // clamped (the result is then inf or zero anyway) and applied
+                // in steps. Down-steps of 2^-102 keep the last multiply exact
+                // above the denormal range, so a denormal result is rounded
+                // once, as the hardware does (the musl scalbnf scheme).
+                let mut y = f(self, 0)?;
+                let n = s(self, 1)?;
+                let (lo, hi) = (self.s.m.i32((-300i32) as u32), self.s.m.i32(300));
+                let t = self.s.m.cmp(c, pred::SGT, n, lo);
+                let n = self.s.m.select(c, t, n, lo);
+                let t = self.s.m.cmp(c, pred::SLT, n, hi);
+                let mut n = self.s.m.select(c, t, n, hi);
+                let (k127, km126, zero) = (
+                    self.s.m.i32(127),
+                    self.s.m.i32((-126i32) as u32),
+                    self.s.m.i32(0),
+                );
+                let (up, down, one) = (
+                    self.s.m.f32(0x7F00_0000),
+                    self.s.m.f32(0x0C80_0000),
+                    self.s.m.f32(1.0f32.to_bits()),
+                );
+                for _ in 0..2 {
+                    let big = self.s.m.cmp(c, pred::SGT, n, k127);
+                    let small = self.s.m.cmp(c, pred::SLT, n, km126);
+                    let sd = self.s.m.select(c, small, down, one);
+                    let scale = self.s.m.select(c, big, up, sd);
+                    y = self.s.m.bin(c, Bin::Mul, y, scale);
+                    let (k102, km127) = (self.s.m.i32(102), self.s.m.i32((-127i32) as u32));
+                    let ds = self.s.m.select(c, small, k102, zero);
+                    let step = self.s.m.select(c, big, km127, ds);
+                    n = self.s.m.bin(c, Bin::Add, n, step);
+                }
+                // n is now in [-126, 127] (n <= 300 and 300 - 254 = 46).
+                let k127 = self.s.m.i32(127);
+                let k23 = self.s.m.i32(23);
+                let e = self.s.m.bin(c, Bin::Add, n, k127);
+                let bits = self.s.m.bin(c, Bin::Shl, e, k23);
+                let scale = self.as_float(bits);
+                let r = self.s.m.bin(c, Bin::Mul, y, scale);
+                float(self, r)
             }
             "v_cvt_f32_f64" => {
                 let (lo, hi) = self.f64_pair(inst, 0)?;
@@ -11558,14 +11741,13 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the program reads attribute row `row` per vertex (an
-    /// interpolation with computed barycentrics, or P10 or P20): then its
-    /// element is declared constant and read with `attributeAtVertex`.
+    /// interpolation with computed barycentrics, or P10 or P20, or P0 beside
+    /// an interpolation: one element has one mode): then its element is
+    /// declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
         self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
-            Interp::Vertex { attribute, vertex } => {
-                attribute.row == row && vertex != 2 && self.interpolated(row)
-            }
+            Interp::Vertex { attribute, .. } => attribute.row == row && self.interpolated(row),
             Interp::Interpolated { .. } => false,
         })
     }
@@ -13174,10 +13356,9 @@ impl<'a> Lower<'a> {
     /// becomes a read of the input signature, so the host's input assembler
     /// fetches (and adds the base vertex, as the code does with s2).
     ///
-    /// Only the forms seen are taken: whole dwords of a 32-bit float
-    /// element, and an `R8G8B8A8_UNORM` element through a typed load of
-    /// that format or of one of its bytes. Anything else is refused: a
-    /// fetch that reads what the element does not hold would draw wrong.
+    /// Only the forms of [`vertex_fetch_channels`] are taken. Anything else
+    /// is refused: a fetch that reads what the element does not hold would
+    /// draw wrong.
     fn vertex_fetch(&mut self, inst: &Inst, entry: u32, guard: Option<V>) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -13225,47 +13406,13 @@ impl<'a> Lower<'a> {
         let StageIo::Vs { fetch, .. } = &self.x.native.io else {
             return Err("a vertex fetch outside a vertex program");
         };
-        let (slot, byte) = (entry / 16, u32::from(*offset));
-        let e = fetch
-            .iter()
-            .find(|e| e.slot == slot && byte >= e.offset && byte - e.offset < e.bytes)
-            .ok_or("a vertex fetch outside the elements whose format is handled")?;
-        let within = byte - e.offset;
-        let channels = crate::pieces::element_shape(e.format).map_or(0, |s| u32::from(s.1));
-        // The first channel read and how many, by the load and the format.
-        let dwords = match name {
-            "buffer_load_dword" => Some(1),
-            "buffer_load_dwordx2" => Some(2),
-            "buffer_load_dwordx3" => Some(3),
-            "buffer_load_dwordx4" => Some(4),
-            _ => None,
-        };
-        let typed = match name.strip_prefix("tbuffer_load_format_") {
-            Some("x") => Some(1),
-            Some("xy") => Some(2),
-            Some("xyz") => Some(3),
-            Some("xyzw") => Some(4),
-            _ => None,
-        };
-        let bytes = e.format == crate::pieces::R8G8B8A8_UNORM;
-        let (first, count) = match (dwords, typed, format.and_then(|f| buffer_format(f))) {
-            // Whole dwords of a float element.
-            (Some(n), None, None) if !bytes && within.is_multiple_of(4) => (within / 4, n),
-            // All four bytes as normalized values, or some of the first.
-            (None, Some(n), Some((&[8, 8, 8, 8], Numeric::Unorm))) if bytes && within == 0 => (0, n),
-            // One byte as a normalized value.
-            (None, Some(1), Some((&[8], Numeric::Unorm))) if bytes => (within, 1),
-            _ => return Err("a vertex fetch of a form or format that is not handled"),
-        };
-        if first + count > channels {
-            return Err("a vertex fetch past its element");
-        }
+        let picked = vertex_fetch_channels(fetch, entry / 16, u32::from(*offset), name, *format)?;
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
         };
-        for k in 0..count {
+        for (k, &(row, channel)) in picked.iter().enumerate() {
             let (id, col) = self
-                .find_input(e.row, (first + k) as u8)
+                .find_input(row, channel)
                 .ok_or("a vertex input the signature lacks")?;
             // (float elements arrive as their bits, normalized ones as the
             // float the typed load gives)
@@ -13833,6 +13980,7 @@ impl<'a> Lower<'a> {
         // of masks and of numbers): each edge's mask as the structure
         // tracked it, a constant or a scalar-built one included.
         let st = self.x.st;
+        let mut blind = Vec::new();
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
@@ -13844,7 +13992,17 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
+                // What a join brings is not itself a root: it is seen where the join is read.
+                let x = match self.boolean_in(args[n], qb) {
+                    Ok(x) => x,
+                    // Not a mask in this lowering; fine if no lane that takes the edge can
+                    // tell (checked below, once everything the program asks for is known).
+                    Err(w) if st.phi_lanes_has(phi.value, n) => {
+                        blind.push(((phi.value, n), offset, w));
+                        self.s.m.bool(false)
+                    }
+                    Err(w) => return Err(unsupported(offset, w)),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
@@ -13970,6 +14128,12 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        if let Some(&(_, offset, why)) = blind.first() {
+            let asked: Vec<_> = blind.iter().map(|b| b.0).collect();
+            if !st.unseen(&self.mask_roots, &asked) {
+                return Err(unsupported(offset, why));
+            }
+        }
         Ok(())
     }
 }
@@ -13990,7 +14154,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, vertex_fetch_channels};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -14251,6 +14415,47 @@ mod tests {
             vec![buffer],
         )
         .map(|_| ())
+    }
+
+    /// A mask register that holds a number (s0, a root constant) on the edge a branch takes when
+    /// no lane is left, and a compare on the other: where the join is only read with the EXEC
+    /// those lanes had, no lane can tell what it held there.
+    #[test]
+    fn a_number_where_a_mask_joins_on_an_edge_no_lane_reads_lowers() {
+        let body = |read: u32, after_restore: bool| {
+            let mut w = vec![
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE94_0300, // s_mov_b32 s20, s0
+                0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+                0xBF88_0002, // s_cbranch_execz -> join
+                0xD4C2_0014,
+                0x0002_0080, // v_cmp_eq_u32 s20, 0, v0
+            ];
+            if after_restore {
+                w.push(0x887E_157E); // s_or_b32 exec_lo, exec_lo, s21
+            }
+            // v_cndmask_b32 v0, v1, v2, s<read>
+            w.extend([0xD501_0000, 257 | 258 << 9 | read << 18]);
+            w
+        };
+        // The join read through `s_and s22, s20, exec_lo`, before EXEC is restored.
+        let mut masked = body(22, false);
+        masked.splice(6..6, [0x8716_7E14]); // s_and_b32 s22, s20, exec_lo
+        lowers_valu(&masked).expect("a read masked by the EXEC of the skipped lanes");
+        // The join read as it is once EXEC is back: the skipped lanes see it.
+        let raw = body(20, true);
+        let refusal = lowers_valu(&raw).expect_err("a read the skipped lanes make").to_string();
+        assert!(refusal.contains("an opaque lane mask"), "{refusal}");
+    }
+
+    #[test]
+    fn the_absolute_difference_of_two_scalars_lowers() {
+        lowers_valu(&[
+            0x9614_0100, // s_absdiff_i32 s20, s0, s1
+            0xBF85_0001, // s_cbranch_scc1 +1 (reads its SCC)
+            0x7E00_0214, // v_mov_b32 v0, s20
+        ])
+        .expect("s_absdiff_i32");
     }
 
     #[test]
@@ -14557,6 +14762,48 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn vertex_fetches_by_their_elements() {
+        use crate::native::VsFetch;
+        let el = |row, offset, bytes, format| VsFetch { row, slot: 0, offset, bytes, format };
+        // R8G8B8A8_UNORM, two R32G32_FLOAT, R8G8B8A8_UINT, R16G16B16A16_FLOAT
+        let fetch = [
+            el(0, 0, 4, 28),
+            el(1, 4, 8, 16),
+            el(2, 12, 8, 16),
+            el(3, 20, 4, 30),
+            el(4, 24, 8, 10),
+        ];
+        let by = |byte, name, format| vertex_fetch_channels(&fetch, 0, byte, name, format);
+        // two neighbouring float pairs in one load
+        assert_eq!(
+            by(4, "buffer_load_dwordx4", None),
+            Ok(vec![(1, 0), (1, 1), (2, 0), (2, 1)])
+        );
+        // the last dword of the pair and the first of the next
+        assert_eq!(by(8, "buffer_load_dwordx2", None), Ok(vec![(1, 1), (2, 0)]));
+        // dwords that leave the elements, or read 8 or 16-bit ones
+        assert!(by(12, "buffer_load_dwordx4", None).is_err());
+        assert!(by(0, "buffer_load_dword", None).is_err());
+        assert!(by(24, "buffer_load_dword", None).is_err());
+        // 8_8_8_8_UNORM, all four, or 8_8_UNORM of the last two (z, w)
+        assert_eq!(by(0, "tbuffer_load_format_xyzw", Some(56)).unwrap().len(), 4);
+        assert_eq!(by(2, "tbuffer_load_format_xy", Some(14)), Ok(vec![(0, 2), (0, 3)]));
+        // 8_UINT of the uint element, not of the unorm one
+        assert_eq!(by(20, "tbuffer_load_format_x", Some(5)), Ok(vec![(3, 0)]));
+        assert!(by(0, "tbuffer_load_format_x", Some(5)).is_err());
+        // 16_16_16_16_FLOAT: xyz, or the second pair as 16_16_FLOAT
+        assert_eq!(
+            by(24, "tbuffer_load_format_xyz", Some(71)),
+            Ok(vec![(4, 0), (4, 1), (4, 2)])
+        );
+        assert_eq!(by(28, "tbuffer_load_format_xy", Some(29)), Ok(vec![(4, 2), (4, 3)]));
+        // a format of other channel widths or more channels than it has
+        assert!(by(24, "tbuffer_load_format_xy", Some(63)).is_err());
+        assert!(by(0, "tbuffer_load_format_xyzw", Some(14)).is_err());
+        assert!(by(2, "tbuffer_load_format_xyzw", Some(56)).is_err());
     }
 
     #[test]
